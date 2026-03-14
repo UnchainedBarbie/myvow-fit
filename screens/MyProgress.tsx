@@ -17,8 +17,9 @@ import {
   ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
+  Alert,
 } from 'react-native';
-import { useFocusEffect } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useTheme } from '../context/ThemeContext';
 import { LineChart } from 'react-native-chart-kit';
@@ -71,19 +72,38 @@ function formatDateYMD(dateStr: string): string {
   return m && day ? `${Number(m)}/${Number(day)}` : d;
 }
 
-const chartConfig = (labelColor: string) => ({
-  backgroundColor: 'transparent',
-  backgroundGradientFrom: 'transparent',
-  backgroundGradientTo: 'transparent',
+function getThisWeekRange(): { weekStart: string; weekEnd: string } {
+  const d = new Date();
+  const day = d.getDay();
+  const mondayOffset = day === 0 ? -6 : 1 - day;
+  const monday = new Date(d);
+  monday.setDate(d.getDate() + mondayOffset);
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  return {
+    weekStart: monday.toISOString().slice(0, 10),
+    weekEnd: sunday.toISOString().slice(0, 10),
+  };
+}
+
+const chartConfig = (theme: { background: string; text: string; border: string }) => ({
+  backgroundColor: theme.background,
+  backgroundGradientFrom: theme.background,
+  backgroundGradientTo: theme.background,
   decimalPlaces: 1,
   color: () => SAGE,
-  labelColor: () => labelColor,
+  labelColor: () => theme.text,
   style: { paddingRight: 0 },
   propsForLabels: { fontFamily: 'Jost_400Regular' },
+  propsForBackgroundLines: {
+    stroke: theme.border,
+    strokeOpacity: 0.5,
+  },
 });
 
 export default function MyProgress() {
   const db = useSQLiteContext();
+  const navigation = useNavigation<any>();
   const { theme } = useTheme();
   const { width } = useWindowDimensions();
   const chartWidth = Math.max(width - 48, 280);
@@ -91,6 +111,7 @@ export default function MyProgress() {
   const [activeTab, setActiveTab] = useState<'body' | 'strength'>('body');
   const [latestBody, setLatestBody] = useState<BodyMetricRow | null>(null);
   const [bodyHistory, setBodyHistory] = useState<BodyMetricRow[]>([]);
+  const [bodyHistoryThisWeek, setBodyHistoryThisWeek] = useState<BodyMetricRow[]>([]);
   const [bodyLoading, setBodyLoading] = useState(true);
   const [bodySeries, setBodySeries] = useState<'weight' | 'muscle' | 'fat' | 'water'>('weight');
   const [bodyRange, setBodyRange] = useState<30 | 90 | 365>(30);
@@ -99,6 +120,8 @@ export default function MyProgress() {
   const [startingDate, setStartingDate] = useState<string>('');
 
   const [logModalVisible, setLogModalVisible] = useState(false);
+  const [logEntryDate, setLogEntryDate] = useState<string>(''); // captured when user taps "Log Today"
+  const [editingBodyLog, setEditingBodyLog] = useState<BodyMetricRow | null>(null);
   const [logWeight, setLogWeight] = useState('');
   const [logMuscle, setLogMuscle] = useState('');
   const [logBone, setLogBone] = useState('');
@@ -106,6 +129,14 @@ export default function MyProgress() {
   const [logFat, setLogFat] = useState('');
   const [logNotes, setLogNotes] = useState('');
   const [userHeightInches, setUserHeightInches] = useState<string>('');
+
+  // Editable card values (synced from latestBody, saved on blur)
+  const [cardWeight, setCardWeight] = useState('');
+  const [cardMuscle, setCardMuscle] = useState('');
+  const [cardBone, setCardBone] = useState('');
+  const [cardWater, setCardWater] = useState('');
+  const [cardFat, setCardFat] = useState('');
+  const [cardBmi, setCardBmi] = useState('');
 
   const [strengthExercises, setStrengthExercises] = useState<
     { exercise_name: string; bestWeight: number; bestReps: number; oneRM: number; isPR: boolean }[]
@@ -135,6 +166,13 @@ export default function MyProgress() {
         'SELECT * FROM BodyMetrics ORDER BY log_date DESC LIMIT 1;'
       );
       setLatestBody(latest ?? null);
+      const l = latest ?? null;
+      setCardWeight(l?.weight != null ? String(l.weight) : '');
+      setCardMuscle(l?.muscle_mass != null ? String(l.muscle_mass) : '');
+      setCardBone(l?.bone_mass != null ? String(l.bone_mass) : '');
+      setCardWater(l?.body_water != null ? String(l.body_water) : '');
+      setCardFat(l?.body_fat != null ? String(l.body_fat) : '');
+      setCardBmi(l?.bmi != null ? String(l.bmi) : '');
 
       const cut = new Date();
       cut.setDate(cut.getDate() - bodyRange);
@@ -144,6 +182,13 @@ export default function MyProgress() {
         [cutStr]
       );
       setBodyHistory(rows);
+
+      const { weekStart, weekEnd } = getThisWeekRange();
+      const weekRows = await db.getAllAsync<BodyMetricRow>(
+        'SELECT * FROM BodyMetrics WHERE log_date >= ? AND log_date <= ? ORDER BY log_date DESC;',
+        [weekStart, weekEnd]
+      );
+      setBodyHistoryThisWeek(weekRows);
     } catch (e) {
       console.error('Load body metrics:', e);
     } finally {
@@ -319,6 +364,7 @@ export default function MyProgress() {
   );
 
   const openLogModal = async () => {
+    setLogEntryDate(new Date().toISOString().slice(0, 10));
     setLogWeight('');
     setLogMuscle('');
     setLogBone('');
@@ -331,7 +377,7 @@ export default function MyProgress() {
   };
 
   const saveBodyLog = async () => {
-    const date = new Date().toISOString().slice(0, 10);
+    const date = logEntryDate || new Date().toISOString().slice(0, 10);
     const weight = logWeight ? parseFloat(logWeight) : null;
     const muscle = logMuscle ? parseFloat(logMuscle) : null;
     const bone = logBone ? parseFloat(logBone) : null;
@@ -353,6 +399,89 @@ export default function MyProgress() {
     } catch (e) {
       console.error('Save body log:', e);
     }
+  };
+
+  const saveCardMetrics = async () => {
+    const date = new Date().toISOString().slice(0, 10);
+    const weight = cardWeight.trim() ? parseFloat(cardWeight) : null;
+    const muscle = cardMuscle.trim() ? parseFloat(cardMuscle) : null;
+    const bone = cardBone.trim() ? parseFloat(cardBone) : null;
+    const water = cardWater.trim() ? parseFloat(cardWater) : null;
+    const fat = cardFat.trim() ? parseFloat(cardFat) : null;
+    const bmi = cardBmi.trim() ? parseFloat(cardBmi) : null;
+    if (weight == null && muscle == null && bone == null && water == null && fat == null && bmi == null) return;
+    try {
+      await db.runAsync(
+        `INSERT INTO BodyMetrics (log_date, weight, muscle_mass, bone_mass, body_water, body_fat, bmi, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
+        [date, weight, muscle, bone, water, fat, bmi, latestBody?.notes ?? null]
+      );
+      loadBody();
+    } catch (e) {
+      console.error('Save card metrics:', e);
+    }
+  };
+
+  const openEditBodyLog = async (row: BodyMetricRow) => {
+    setEditingBodyLog(row);
+    setLogWeight(row.weight != null ? String(row.weight) : '');
+    setLogMuscle(row.muscle_mass != null ? String(row.muscle_mass) : '');
+    setLogBone(row.bone_mass != null ? String(row.bone_mass) : '');
+    setLogWater(row.body_water != null ? String(row.body_water) : '');
+    setLogFat(row.body_fat != null ? String(row.body_fat) : '');
+    setLogNotes(row.notes ?? '');
+    setLogEntryDate(row.log_date);
+    const h = await AsyncStorage.getItem(USER_HEIGHT_KEY);
+    if (h) setUserHeightInches(h);
+  };
+
+  const updateBodyLog = async () => {
+    if (!editingBodyLog) return;
+    const weight = logWeight.trim() ? parseFloat(logWeight) : null;
+    const muscle = logMuscle.trim() ? parseFloat(logMuscle) : null;
+    const bone = logBone.trim() ? parseFloat(logBone) : null;
+    const water = logWater.trim() ? parseFloat(logWater) : null;
+    const fat = logFat.trim() ? parseFloat(logFat) : null;
+    let bmi: number | null = null;
+    if (weight != null && userHeightInches) {
+      const hi = parseFloat(userHeightInches);
+      if (hi > 0) bmi = (weight / (hi * hi)) * 703;
+    } else if (editingBodyLog.bmi != null) {
+      bmi = editingBodyLog.bmi;
+    }
+    try {
+      await db.runAsync(
+        `UPDATE BodyMetrics SET weight = ?, muscle_mass = ?, bone_mass = ?, body_water = ?, body_fat = ?, bmi = ?, notes = ? WHERE metric_id = ?`,
+        [weight, muscle, bone, water, fat, bmi, logNotes.trim() || null, editingBodyLog.metric_id]
+      );
+      setEditingBodyLog(null);
+      loadBody();
+    } catch (e) {
+      console.error('Update body log:', e);
+    }
+  };
+
+  const deleteBodyLog = (row: BodyMetricRow) => {
+    Alert.alert(
+      'Delete weight log?',
+      `This will permanently delete the log for ${new Date(row.log_date + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await db.runAsync('DELETE FROM BodyMetrics WHERE metric_id = ?', [row.metric_id]);
+              setEditingBodyLog(null);
+              loadBody();
+            } catch (e) {
+              console.error('Delete body log:', e);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const bodyChartData = (() => {
@@ -466,12 +595,12 @@ export default function MyProgress() {
           ) : (
             <View style={styles.cardGrid}>
               {[
-                { label: 'Weight (lbs)', value: latestBody?.weight },
-                { label: 'Muscle Mass (lbs)', value: latestBody?.muscle_mass },
-                { label: 'Bone Mass (lbs)', value: latestBody?.bone_mass },
-                { label: 'Body Water (%)', value: latestBody?.body_water },
-                { label: 'Body Fat (%)', value: latestBody?.body_fat },
-                { label: 'BMI', value: latestBody?.bmi != null ? latestBody.bmi.toFixed(1) : null },
+                { label: 'Weight (lbs)', value: cardWeight, setValue: setCardWeight },
+                { label: 'Muscle Mass (lbs)', value: cardMuscle, setValue: setCardMuscle },
+                { label: 'Bone Mass (lbs)', value: cardBone, setValue: setCardBone },
+                { label: 'Body Water (%)', value: cardWater, setValue: setCardWater },
+                { label: 'Body Fat (%)', value: cardFat, setValue: setCardFat },
+                { label: 'BMI', value: cardBmi, setValue: setCardBmi },
               ].map((item, i) => (
                 <View
                   key={i}
@@ -481,9 +610,17 @@ export default function MyProgress() {
                   ]}
                 >
                   <Text style={[styles.statLabel, { color: theme.textSecondary }]}>{item.label}</Text>
-                  <Text style={[styles.statValue, { color: theme.text }]}>
-                    {item.value != null ? String(item.value) : '—'}
-                  </Text>
+                  <TextInput
+                    style={[styles.statValue, styles.statInput, { color: theme.text }]}
+                    value={item.value}
+                    onChangeText={item.setValue}
+                    onBlur={saveCardMetrics}
+                    placeholder="—"
+                    placeholderTextColor={theme.textSecondary}
+                    keyboardType="decimal-pad"
+                    selectTextOnFocus
+                    underlineColorAndroid="transparent"
+                  />
                 </View>
               ))}
             </View>
@@ -510,6 +647,46 @@ export default function MyProgress() {
             onPress={openLogModal}
           >
             <Text style={styles.primaryButtonText}>Log Today</Text>
+          </TouchableOpacity>
+
+          <Text style={[styles.sectionHeader, { color: SAGE, marginTop: 24 }]}>MY BODY · THIS WEEK</Text>
+          {bodyHistoryThisWeek.length > 0 ? (
+            <View style={[styles.logList, { borderColor: theme.border }]}>
+              {bodyHistoryThisWeek.map((row) => (
+                <View key={row.metric_id} style={[styles.logRow, { borderBottomColor: theme.border }]}>
+                  <View style={styles.logRowMain}>
+                    <Text style={[styles.logRowDate, { color: theme.text }]}>
+                      {new Date(row.log_date + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
+                    </Text>
+                    <Text style={[styles.logRowSummary, { color: theme.textSecondary }]}>
+                      {[
+                        row.weight != null && `${row.weight} lbs`,
+                        row.body_fat != null && `${row.body_fat}% fat`,
+                        row.muscle_mass != null && `${row.muscle_mass} muscle`,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ') || '—'}
+                    </Text>
+                  </View>
+                  <View style={styles.logRowActions}>
+                    <TouchableOpacity onPress={() => openEditBodyLog(row)} style={[styles.logRowBtn, { borderColor: theme.border }]}>
+                      <Text style={[styles.logRowBtnText, { color: theme.text }]}>Edit</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => deleteBodyLog(row)} style={[styles.logRowBtn, styles.logRowBtnDanger]}>
+                      <Text style={styles.logRowBtnTextDanger}>Delete</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              ))}
+            </View>
+          ) : (
+            <Text style={[styles.emptyChart, { color: theme.textSecondary, marginTop: 4 }]}>No entries this week.</Text>
+          )}
+          <TouchableOpacity
+            style={[styles.linkButton, { marginTop: 12 }]}
+            onPress={() => navigation.navigate('BodyWeightLogs')}
+          >
+            <Text style={[styles.linkButtonText, { color: SAGE }]}>View all weight logs →</Text>
           </TouchableOpacity>
 
           <Text style={[styles.sectionHeader, { color: SAGE, marginTop: 24 }]}>MY BODY · TREND</Text>
@@ -554,11 +731,11 @@ export default function MyProgress() {
               data={bodyChartData}
               width={chartWidth}
               height={220}
-              chartConfig={chartConfig(theme.text)}
+              chartConfig={chartConfig(theme)}
               bezier
-              style={styles.chart}
-              withInnerLines={false}
-              withOuterLines={false}
+              style={[styles.chart, { backgroundColor: theme.background }]}
+              withInnerLines={true}
+              withOuterLines={true}
               fromZero
               segments={4}
             />
@@ -601,11 +778,11 @@ export default function MyProgress() {
                   }}
                   width={chartWidth}
                   height={220}
-                  chartConfig={chartConfig(theme.text)}
+                  chartConfig={chartConfig(theme)}
                   bezier
-                  style={styles.chart}
-                  withInnerLines={false}
-                  withOuterLines={false}
+                  style={[styles.chart, { backgroundColor: theme.background }]}
+                  withInnerLines={true}
+                  withOuterLines={true}
                   fromZero
                 />
               ) : (
@@ -677,7 +854,9 @@ export default function MyProgress() {
           >
             <Text style={[styles.modalTitle, { color: theme.text }]}>Log MyBody metrics</Text>
             <Text style={[styles.modalHint, { color: theme.textSecondary }]}>
-              Enter what your scale shows. Not all fields required.
+              {logEntryDate
+                ? `Logging for ${new Date(logEntryDate + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}. Enter what your scale shows — no date input needed.`
+                : 'Enter what your scale shows. Not all fields required.'}
             </Text>
             <TextInput
               style={[styles.input, { borderColor: theme.border, color: theme.text }]}
@@ -736,6 +915,83 @@ export default function MyProgress() {
               <TouchableOpacity
                 style={[styles.modalButton, { backgroundColor: SAGE }]}
                 onPress={saveBodyLog}
+              >
+                <Text style={styles.modalButtonTextWhite}>Save</Text>
+              </TouchableOpacity>
+            </View>
+          </KeyboardAvoidingView>
+        </View>
+      </Modal>
+
+      <Modal visible={editingBodyLog != null} animationType="slide" transparent>
+        <View style={styles.modalOverlay}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={[styles.modalBox, { backgroundColor: '#FFFFFF' }]}
+          >
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Edit weight log</Text>
+            <Text style={[styles.modalHint, { color: theme.textSecondary }]}>
+              {editingBodyLog
+                ? `Log from ${new Date(editingBodyLog.log_date + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}`
+                : ''}
+            </Text>
+            <TextInput
+              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+              placeholder="Weight (lbs)"
+              placeholderTextColor={theme.textSecondary}
+              value={logWeight}
+              onChangeText={setLogWeight}
+              keyboardType="decimal-pad"
+            />
+            <TextInput
+              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+              placeholder="Muscle mass (lbs)"
+              placeholderTextColor={theme.textSecondary}
+              value={logMuscle}
+              onChangeText={setLogMuscle}
+              keyboardType="decimal-pad"
+            />
+            <TextInput
+              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+              placeholder="Bone mass (lbs)"
+              placeholderTextColor={theme.textSecondary}
+              value={logBone}
+              onChangeText={setLogBone}
+              keyboardType="decimal-pad"
+            />
+            <TextInput
+              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+              placeholder="Body water (%)"
+              placeholderTextColor={theme.textSecondary}
+              value={logWater}
+              onChangeText={setLogWater}
+              keyboardType="decimal-pad"
+            />
+            <TextInput
+              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+              placeholder="Body fat (%)"
+              placeholderTextColor={theme.textSecondary}
+              value={logFat}
+              onChangeText={setLogFat}
+              keyboardType="decimal-pad"
+            />
+            <TextInput
+              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+              placeholder="Notes"
+              placeholderTextColor={theme.textSecondary}
+              value={logNotes}
+              onChangeText={setLogNotes}
+            />
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={[styles.modalButton, { borderColor: theme.border }]}
+                onPress={() => setEditingBodyLog(null)}
+              >
+                <Text style={[styles.modalButtonText, { color: theme.text }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalButton, { backgroundColor: SAGE }]}
+                onPress={updateBodyLog}
               >
                 <Text style={styles.modalButtonTextWhite}>Save</Text>
               </TouchableOpacity>
@@ -864,6 +1120,12 @@ const styles = StyleSheet.create({
     fontFamily: 'CormorantGaramond-SemiBold',
     fontSize: 18,
   },
+  statInput: {
+    padding: 0,
+    margin: 0,
+    borderWidth: 0,
+    minHeight: 24,
+  },
   startingRow: {
     padding: 14,
     borderRadius: 10,
@@ -880,6 +1142,42 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginTop: 4,
   },
+  logList: {
+    borderWidth: 1,
+    borderRadius: 10,
+    marginTop: 8,
+    overflow: 'hidden',
+  },
+  logRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderBottomWidth: 1,
+  },
+  logRowMain: { flex: 1 },
+  logRowDate: {
+    fontFamily: 'Jost_600SemiBold',
+    fontSize: 14,
+  },
+  logRowSummary: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  logRowActions: { flexDirection: 'row', gap: 8 },
+  logRowBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  logRowBtnText: { fontFamily: 'Jost_500Medium', fontSize: 13 },
+  logRowBtnDanger: { borderColor: '#C0392B' },
+  logRowBtnTextDanger: { fontFamily: 'Jost_500Medium', fontSize: 13, color: '#C0392B' },
+  linkButton: { paddingVertical: 8, paddingHorizontal: 4, alignSelf: 'flex-start' },
+  linkButtonText: { fontFamily: 'Jost_500Medium', fontSize: 15 },
   primaryButton: {
     paddingVertical: 14,
     borderRadius: 10,
@@ -1012,6 +1310,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 12,
     marginTop: 8,
+    paddingHorizontal: 16,
   },
   modalButton: {
     flex: 1,
