@@ -3,7 +3,7 @@
  * MyBody: 2x3 stat cards, starting weight comparison, Log Today modal, line chart (Weight|Muscle|Fat|Water, 30/90/365).
  * MyStrength: exercise list from Weight_Log + StrengthRecords, detail with chart and Log MyStrength PR.
  */
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -24,6 +24,7 @@ import { useSQLiteContext } from 'expo-sqlite';
 import { useTheme } from '../context/ThemeContext';
 import { LineChart } from 'react-native-chart-kit';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Swipeable, RectButton } from 'react-native-gesture-handler';
 
 const SAGE = '#7C9A7E';
 const CREAM = '#FDF8F0';
@@ -84,6 +85,55 @@ function getThisWeekRange(): { weekStart: string; weekEnd: string } {
     weekStart: monday.toISOString().slice(0, 10),
     weekEnd: sunday.toISOString().slice(0, 10),
   };
+}
+
+function BodyLogSwipeRow({
+  row,
+  theme,
+  onEdit,
+  onDelete,
+}: {
+  row: BodyMetricRow;
+  theme: { background: string; text: string; textSecondary: string; border: string };
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const swipeRef = useRef<Swipeable | null>(null);
+  const renderLeftActions = () => (
+    <RectButton style={styles.swipeEditBtn} onPress={() => { swipeRef.current?.close(); onEdit(); }}>
+      <Text style={styles.swipeBtnText}>Edit</Text>
+    </RectButton>
+  );
+  const renderRightActions = () => (
+    <RectButton style={styles.swipeDeleteBtn} onPress={() => { swipeRef.current?.close(); onDelete(); }}>
+      <Text style={styles.swipeBtnText}>Delete</Text>
+    </RectButton>
+  );
+  return (
+    <Swipeable
+      ref={(r) => { swipeRef.current = r; }}
+      renderLeftActions={renderLeftActions}
+      renderRightActions={renderRightActions}
+      friction={2}
+    >
+      <View style={[styles.logRow, { borderBottomColor: theme.border, backgroundColor: theme.background }]}>
+        <View style={styles.logRowMain}>
+          <Text style={[styles.logRowDate, { color: theme.text }]}>
+            {new Date(row.log_date + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
+          </Text>
+          <Text style={[styles.logRowSummary, { color: theme.textSecondary }]}>
+            {[
+              row.weight != null && `${row.weight} lbs`,
+              row.body_fat != null && `${row.body_fat}% fat`,
+              row.muscle_mass != null && `${row.muscle_mass} muscle`,
+            ]
+              .filter(Boolean)
+              .join(' · ') || '—'}
+          </Text>
+        </View>
+      </View>
+    </Swipeable>
+  );
 }
 
 const chartConfig = (theme: { background: string; text: string; border: string }) => ({
@@ -653,30 +703,13 @@ export default function MyProgress() {
           {bodyHistoryThisWeek.length > 0 ? (
             <View style={[styles.logList, { borderColor: theme.border }]}>
               {bodyHistoryThisWeek.map((row) => (
-                <View key={row.metric_id} style={[styles.logRow, { borderBottomColor: theme.border }]}>
-                  <View style={styles.logRowMain}>
-                    <Text style={[styles.logRowDate, { color: theme.text }]}>
-                      {new Date(row.log_date + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
-                    </Text>
-                    <Text style={[styles.logRowSummary, { color: theme.textSecondary }]}>
-                      {[
-                        row.weight != null && `${row.weight} lbs`,
-                        row.body_fat != null && `${row.body_fat}% fat`,
-                        row.muscle_mass != null && `${row.muscle_mass} muscle`,
-                      ]
-                        .filter(Boolean)
-                        .join(' · ') || '—'}
-                    </Text>
-                  </View>
-                  <View style={styles.logRowActions}>
-                    <TouchableOpacity onPress={() => openEditBodyLog(row)} style={[styles.logRowBtn, { borderColor: theme.border }]}>
-                      <Text style={[styles.logRowBtnText, { color: theme.text }]}>Edit</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity onPress={() => deleteBodyLog(row)} style={[styles.logRowBtn, styles.logRowBtnDanger]}>
-                      <Text style={styles.logRowBtnTextDanger}>Delete</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
+                <BodyLogSwipeRow
+                  key={row.metric_id}
+                  row={row}
+                  theme={theme}
+                  onEdit={() => openEditBodyLog(row)}
+                  onDelete={() => deleteBodyLog(row)}
+                />
               ))}
             </View>
           ) : (
@@ -1176,6 +1209,9 @@ const styles = StyleSheet.create({
   logRowBtnText: { fontFamily: 'Jost_500Medium', fontSize: 13 },
   logRowBtnDanger: { borderColor: '#C0392B' },
   logRowBtnTextDanger: { fontFamily: 'Jost_500Medium', fontSize: 13, color: '#C0392B' },
+  swipeEditBtn: { backgroundColor: '#E67E22', justifyContent: 'center', alignItems: 'center', width: 72 },
+  swipeDeleteBtn: { backgroundColor: '#C0392B', justifyContent: 'center', alignItems: 'center', width: 72 },
+  swipeBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
   linkButton: { paddingVertical: 8, paddingHorizontal: 4, alignSelf: 'flex-start' },
   linkButtonText: { fontFamily: 'Jost_500Medium', fontSize: 15 },
   primaryButton: {
