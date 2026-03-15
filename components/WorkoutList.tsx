@@ -4,6 +4,7 @@ import { WorkoutStackParamList } from '../App';
 import { Workout } from '../utils/types';
 import React from 'react';
 import { TouchableOpacity, Text, StyleSheet, ScrollView, View } from 'react-native';
+import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { useTheme } from '../context/ThemeContext'; // Adjust the path to your ThemeContext
 import { useTranslation } from 'react-i18next';
@@ -63,60 +64,73 @@ export default function WorkoutList({
       </View>
 
       {/* Workout List */}
-      {sortedWorkouts.map((workout) => (
-        <TouchableOpacity
-          key={workout.workout_id}
-          style={[
-            styles.workoutCard,
-            {
-              backgroundColor: theme.card,
-              borderColor: theme.border,
-            },
-          ]}
-          activeOpacity={0.7}
-          onLongPress={() =>
-            deleteWorkout(workout.workout_id, workout.workout_name)
-          }
-          onPress={() =>
-            navigation.navigate('WorkoutDetails', {
-              workout_id: workout.workout_id,
-            })
-          }
-        >
-          <View style={styles.workoutNameWrapper}>
-            <Text style={[styles.workoutText, { color: theme.text }]}>
-              {workout.workout_name}
-            </Text>
+      {sortedWorkouts.map((workout) => {
+        let swipeRef: Swipeable | null = null;
+        const renderRightActions = () => (
+          <RectButton
+            style={[styles.deleteButton, { backgroundColor: '#c62828' }]}
+            onPress={() => {
+              swipeRef?.close();
+              deleteWorkout(workout.workout_id, workout.workout_name);
+            }}
+          >
+            <Text style={styles.swipeBtnText}>{t('delete') || 'Delete'}</Text>
+          </RectButton>
+        );
+        return (
+          <Swipeable
+            key={workout.workout_id}
+            ref={(r) => { swipeRef = r; }}
+            renderRightActions={renderRightActions}
+            friction={2}
+          >
             <TouchableOpacity
-              onPress={(e) => {
-                e?.stopPropagation?.();
-                (navigation.getParent?.() ?? navigation).navigate('My Calendar', {
-                  preselectedWorkoutId: workout.workout_id,
-                  preselectedWorkoutName: workout.workout_name,
-                });
-              }}
-              style={styles.scheduleButton}
+              style={[
+                styles.workoutCard,
+                {
+                  backgroundColor: theme.card,
+                  borderColor: theme.border,
+                },
+              ]}
+              activeOpacity={0.7}
+              onPress={() =>
+                navigation.navigate('WorkoutDetails', {
+                  workout_id: workout.workout_id,
+                })
+              }
             >
-              <Text style={[styles.scheduleButtonText, { color: theme.primary || '#7C9A7E' }]}>Add to Schedule</Text>
+              <View style={styles.workoutNameWrapper}>
+                <Text style={[styles.workoutText, { color: theme.text }]}>
+                  {workout.workout_name}
+                </Text>
+                <TouchableOpacity
+                  onPress={(e) => {
+                    e?.stopPropagation?.();
+                    (navigation.getParent?.() ?? navigation).navigate('My Calendar', {
+                      preselectedWorkoutId: workout.workout_id,
+                      preselectedWorkoutName: workout.workout_name,
+                    });
+                  }}
+                  style={styles.scheduleButton}
+                >
+                  <Text style={[styles.scheduleButtonText, { color: theme.primary || '#7C9A7E' }]}>Add to Schedule</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => handleExportWorkout(workout.workout_id)}
+                >
+                  <Ionicons
+                    name="share-outline"
+                    size={24}
+                    color={theme.text}
+                    style={styles.shareIcon}
+                  />
+                </TouchableOpacity>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={theme.text} />
             </TouchableOpacity>
-            <TouchableOpacity
-              onPress={() => handleExportWorkout(workout.workout_id)}
-            >
-              <Ionicons
-                name="share-outline"
-                size={24}
-                color={theme.text}
-                style={styles.shareIcon}
-              />
-            </TouchableOpacity>
-          </View>
-          <Ionicons name="chevron-forward" size={20} color={theme.text} />
-        </TouchableOpacity>
-      ))}
-      {/* Tip Text at the Bottom */}
-      <Text style={[styles.tipText, { color: theme.text }]}>
-        {t('WorkoutListTip')}
-      </Text>
+          </Swipeable>
+        );
+      })}
     </ScrollView>
   );
 }
@@ -128,12 +142,6 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: 16,
     paddingTop: 24,
-  },
-  tipText: {
-    marginTop: 20, // Space above the text
-    textAlign: 'center', // Center align
-    fontSize: 14, // Smaller font size
-    fontStyle: 'italic', // Italic for emphasis
   },
   actionButtonsContainer: {
     flexDirection: 'row',
@@ -195,6 +203,18 @@ const styles = StyleSheet.create({
   scheduleButtonText: { fontSize: 13, fontWeight: '600' },
   shareIcon: {
     marginLeft: 10,
+  },
+  deleteButton: {
+    justifyContent: 'center',
+    alignItems: 'center',
+    width: 80,
+    borderRadius: 10,
+    marginBottom: 16,
+  },
+  swipeBtnText: {
+    color: '#fff',
+    fontSize: 16,
+    fontFamily: 'Jost_500Medium',
   },
 });
 

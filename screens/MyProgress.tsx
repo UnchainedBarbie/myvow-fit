@@ -125,7 +125,8 @@ function BodyLogSwipeRow({
             {[
               row.weight != null && `${row.weight} lbs`,
               row.body_fat != null && `${row.body_fat}% fat`,
-              row.muscle_mass != null && `${row.muscle_mass} muscle`,
+              row.muscle_mass != null && `${row.muscle_mass}% muscle`,
+              row.bone_mass != null && `${row.bone_mass}% bone`,
             ]
               .filter(Boolean)
               .join(' · ') || '—'}
@@ -646,8 +647,8 @@ export default function MyProgress() {
             <View style={styles.cardGrid}>
               {[
                 { label: 'Weight (lbs)', value: cardWeight, setValue: setCardWeight },
-                { label: 'Muscle Mass (lbs)', value: cardMuscle, setValue: setCardMuscle },
-                { label: 'Bone Mass (lbs)', value: cardBone, setValue: setCardBone },
+                { label: 'Muscle Mass (%)', value: cardMuscle, setValue: setCardMuscle },
+                { label: 'Bone Mass (%)', value: cardBone, setValue: setCardBone },
                 { label: 'Body Water (%)', value: cardWater, setValue: setCardWater },
                 { label: 'Body Fat (%)', value: cardFat, setValue: setCardFat },
                 { label: 'BMI', value: cardBmi, setValue: setCardBmi },
@@ -909,7 +910,7 @@ export default function MyProgress() {
             />
             <TextInput
               style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Bone mass (lbs)"
+              placeholder="Bone mass (%)"
               placeholderTextColor={theme.textSecondary}
               value={logBone}
               onChangeText={setLogBone}
@@ -986,7 +987,7 @@ export default function MyProgress() {
             />
             <TextInput
               style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Bone mass (lbs)"
+              placeholder="Bone mass (%)"
               placeholderTextColor={theme.textSecondary}
               value={logBone}
               onChangeText={setLogBone}
