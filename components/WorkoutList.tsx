@@ -100,7 +100,7 @@ export default function WorkoutList({
               }
             >
               <View style={styles.workoutNameWrapper}>
-                <Text style={[styles.workoutText, { color: theme.text }]}>
+                <Text style={[styles.workoutText, { color: theme.text }]} numberOfLines={1} ellipsizeMode="tail">
                   {workout.workout_name}
                 </Text>
                 <TouchableOpacity
@@ -192,11 +192,14 @@ const styles = StyleSheet.create({
   workoutText: {
     fontSize: 20,
     fontFamily: 'Jost_400Regular',
+    flex: 1,
+    minWidth: 0,
   },
   workoutNameWrapper: {
     flexDirection: 'row',
     alignItems: 'center',
-    flexWrap: 'wrap',
+    flex: 1,
+    minWidth: 0,
     gap: 8,
   },
   scheduleButton: { paddingVertical: 4, paddingHorizontal: 8 },

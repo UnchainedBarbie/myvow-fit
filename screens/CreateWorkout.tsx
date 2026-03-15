@@ -79,37 +79,55 @@ export default function CreateWorkout() {
   const { t } = useTranslation(); // Initialize translations
   const [workoutName, setWorkoutName] = useState('');
   const [days, setDays] = useState<
-    { dayName: string; exercises: { exerciseName: string; sets: string; reps: string; muscle_group: string | null; restSeconds: string }[] }[]
+    { dayName: string; exercises: { exerciseName: string; sets: string; reps: string; muscle_groups: string[]; restSeconds: string }[] }[]
   >([]);
   const navigation = useNavigation<WorkoutListNavigationProp>();
 
-  const muscleGroupData = [
-    { label: t('Unspecified'), value: null },
-    { label: t('Chest'), value: 'chest' },
-    { label: t('Back'), value: 'back' },
-    { label: t('Shoulders'), value: 'shoulders' },
-    { label: t('Biceps'), value: 'biceps' },
-    { label: t('Triceps'), value: 'triceps' },
-    { label: t('Forearms'), value: 'forearms' },
-    { label: t('Abs'), value: 'abs' },
-    { label: t('Legs'), value: 'legs' },
-    { label: t('Glutes'), value: 'glutes' },
-    { label: t('Hamstrings'), value: 'hamstrings' },
-    { label: t('Calves'), value: 'calves' },
-    { label: t('Quads'), value: 'quads' },
+  const muscleGroups = [
+    { label: 'Chest', value: 'chest' },
+    { label: 'Back', value: 'back' },
+    { label: 'Shoulders', value: 'shoulders' },
+    { label: 'Arms', value: 'arms' },
+    { label: 'Legs', value: 'legs' },
+    { label: 'Glutes', value: 'glutes' },
+    { label: 'Core', value: 'core' },
+    { label: 'Full Body', value: 'full_body' },
   ];
 
   const addDay = () => {
     setDays((prev) => [
       ...prev,
-      { dayName: '', exercises: [{ exerciseName: '', sets: '', reps: '', muscle_group: null, restSeconds: '' }] },
+      { dayName: '', exercises: [{ exerciseName: '', sets: '', reps: '', muscle_groups: [], restSeconds: '' }] },
     ]);
   };
 
   const addExercise = (dayIndex: number) => {
     setDays((prev) => {
       const updatedDays = [...prev];
-      updatedDays[dayIndex].exercises.push({ exerciseName: '', sets: '', reps: '', muscle_group: null, restSeconds: '' });
+      updatedDays[dayIndex].exercises.push({ exerciseName: '', sets: '', reps: '', muscle_groups: [], restSeconds: '' });
+      return updatedDays;
+    });
+  };
+
+  const toggleMuscleGroup = (dayIndex: number, exerciseIndex: number, value: string) => {
+    setDays((prev) => {
+      const updatedDays = prev.map((d, di) =>
+        di !== dayIndex
+          ? d
+          : {
+              ...d,
+              exercises: d.exercises.map((ex, ei) =>
+                ei !== exerciseIndex
+                  ? ex
+                  : {
+                      ...ex,
+                      muscle_groups: ex.muscle_groups.includes(value)
+                        ? ex.muscle_groups.filter((v) => v !== value)
+                        : [...ex.muscle_groups, value],
+                    }
+              ),
+            }
+      );
       return updatedDays;
     });
   };
@@ -184,13 +202,14 @@ export default function CreateWorkout() {
     }
 
     const formattedDays = days.map((day) => ({
-      ...day,
+      dayName: day.dayName,
       exercises: day.exercises.map((exercise) => {
         const restSec = exercise.restSeconds.trim();
         return {
-          ...exercise,
+          exerciseName: exercise.exerciseName,
           sets: parseInt(exercise.sets),
           reps: parseInt(exercise.reps),
+          muscle_group: exercise.muscle_groups[0] ?? null,
           rest_seconds: restSec ? parseInt(restSec, 10) : null,
         };
       }),
@@ -262,7 +281,7 @@ export default function CreateWorkout() {
               <TextInput
                 style={[
                   styles.dayInput,
-                  { color: theme.text },
+                  { color: theme.text, borderWidth: 1, borderColor: theme.border, borderRadius: 10, padding: 14 },
                 ]}
                 placeholder={t('dayNamePlaceholder')}
                 placeholderTextColor={theme.text}
@@ -276,16 +295,15 @@ export default function CreateWorkout() {
 
               {item.exercises.map((exercise, exerciseIndex) => (
                 <View key={exerciseIndex}>
-                  <TouchableOpacity
-                    activeOpacity={0.8}
-                    style={styles.exerciseRow}
-                  >
+                  <View style={styles.exerciseRow}>
                     <TextInput
                       style={[
                         styles.exerciseInput,
                         {
                           backgroundColor: theme.card,
                           color: theme.text,
+                          borderWidth: 1,
+                          borderColor: theme.border,
                         },
                       ]}
                       placeholder={t('exerciseNamePlaceholder')}
@@ -304,6 +322,8 @@ export default function CreateWorkout() {
                         {
                           backgroundColor: theme.card,
                           color: theme.text,
+                          borderWidth: 1,
+                          borderColor: theme.border,
                         },
                       ]}
                       placeholder={t('setsPlaceholder') + " (> 0)"}
@@ -325,6 +345,8 @@ export default function CreateWorkout() {
                         {
                           backgroundColor: theme.card,
                           color: theme.text,
+                          borderWidth: 1,
+                          borderColor: theme.border,
                         },
                       ]}
                       placeholder={t('repsPlaceholder') + " (> 0)"}
@@ -345,6 +367,8 @@ export default function CreateWorkout() {
                           backgroundColor: theme.card,
                           color: theme.text,
                           minWidth: 56,
+                          borderWidth: 1,
+                          borderColor: theme.border,
                         },
                       ]}
                       placeholder={t('restSecondsPlaceholder') || 'Rest (s)'}
@@ -358,37 +382,47 @@ export default function CreateWorkout() {
                         setDays(updatedDays);
                       }}
                     />
-                  </TouchableOpacity>
-                  <FlatList
-                    data={muscleGroupData}
-                    horizontal
-                    showsHorizontalScrollIndicator={false}
-                    keyExtractor={(item) => item.label}
-                    style={{ marginVertical: 10 }}
-                    renderItem={({ item: muscleGroupItem }) => {
-                      const isSelected = exercise.muscle_group === muscleGroupItem.value;
+                    <TouchableOpacity
+                      onPress={() => deleteExercise(index, exerciseIndex)}
+                      style={[styles.deleteExerciseButton, { borderColor: theme.border }]}
+                      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                    >
+                      <Ionicons name="trash-outline" size={22} color={theme.textSecondary || '#666'} />
+                    </TouchableOpacity>
+                  </View>
+                  <Text style={[styles.muscleGroupLabel, { color: theme.text }]}>{t('muscleGroup') || 'Muscle Groups'}</Text>
+                  <View style={styles.muscleGroupChipGrid}>
+                    {muscleGroups.map((mg) => {
+                      const isSelected = exercise.muscle_groups.includes(mg.value);
                       return (
                         <TouchableOpacity
+                          key={mg.value}
                           style={[
-                            styles.muscleGroupButton,
-                            { 
-                              backgroundColor: isSelected ? theme.buttonBackground : theme.card,
+                            styles.muscleGroupChip,
+                            {
+                              backgroundColor: isSelected ? (theme.primary || '#7C9A7E') : theme.card,
                               borderColor: theme.border,
-                            }
+                            },
                           ]}
-                          onPress={() => {
-                            const updatedDays = [...days];
-                            updatedDays[index].exercises[exerciseIndex].muscle_group = muscleGroupItem.value;
-                            setDays(updatedDays);
-                          }}
+                          onPress={() => toggleMuscleGroup(index, exerciseIndex, mg.value)}
+                          activeOpacity={0.7}
                         >
-                          <Text style={{ color: isSelected ? theme.buttonText : theme.text }}>
-                            {t(muscleGroupItem.label)}
+                          <Text
+                            style={[
+                              styles.muscleGroupChipText,
+                              { color: isSelected ? '#fff' : theme.text },
+                              isSelected && styles.muscleGroupChipTextSelected,
+                            ]}
+                          >
+                            {mg.label}
                           </Text>
+                          {isSelected && (
+                            <Ionicons name="checkmark" size={16} color="#fff" style={styles.muscleGroupChipCheck} />
+                          )}
                         </TouchableOpacity>
                       );
-                    }}
-                  />
+                    })}
+                  </View>
                 </View>
               ))}
 
@@ -496,6 +530,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 12,
   },
+  deleteExerciseButton: {
+    padding: 10,
+    marginLeft: 8,
+    borderWidth: 1,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
   exerciseInput: {
     flex: 2,
     marginRight: 10,
@@ -543,17 +585,34 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     fontSize: 18,
   },
-  muscleGroupButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 20,
-    height: 40,
-    elevation: 1,
-    shadowOpacity: 0,
-    borderWidth: 1,
-    marginRight: 10,
-    marginBottom: 25,
-    justifyContent: 'center',
+  muscleGroupLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    marginTop: 12,
+    marginBottom: 8,
+  },
+  muscleGroupChipGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 16,
+  },
+  muscleGroupChip: {
+    flexDirection: 'row',
     alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+    borderWidth: 1,
+  },
+  muscleGroupChipText: {
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  muscleGroupChipTextSelected: {
+    fontWeight: '600',
+  },
+  muscleGroupChipCheck: {
+    marginLeft: 6,
   },
 });

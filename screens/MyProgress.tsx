@@ -3,7 +3,7 @@
  * MyBody: 2x3 stat cards, starting weight comparison, Log Today modal, line chart (Weight|Muscle|Fat|Water, 30/90/365).
  * MyStrength: exercise list from Weight_Log + StrengthRecords, detail with chart and Log MyStrength PR.
  */
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -22,6 +22,7 @@ import {
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useTheme } from '../context/ThemeContext';
+import { useProfile } from '../context/ProfileContext';
 import { LineChart } from 'react-native-chart-kit';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Swipeable, RectButton } from 'react-native-gesture-handler';
@@ -60,6 +61,15 @@ type WeightLogRow = {
   weight_logged: number;
   reps_logged: number;
   workout_date: number;
+};
+
+/** One record per workout (per exercise per date). */
+type WorkoutSummary = {
+  date: string;
+  dateLabel: string;
+  heaviestWeight: number;
+  totalVolume: number;
+  estimated1RM: number;
 };
 
 function calc1RM(weight: number, reps: number): number {
@@ -156,8 +166,11 @@ export default function MyProgress() {
   const db = useSQLiteContext();
   const navigation = useNavigation<any>();
   const { theme } = useTheme();
+  const { profileSavedTrigger } = useProfile();
   const { width } = useWindowDimensions();
   const chartWidth = Math.max(width - 48, 280);
+  /** Chart width inside metric detail modal: overlay padding 24*2 + box padding 20*2 */
+  const chartWidthModal = Math.max(width - 88, 260);
 
   const [activeTab, setActiveTab] = useState<'body' | 'strength'>('body');
   const [latestBody, setLatestBody] = useState<BodyMetricRow | null>(null);
@@ -190,16 +203,16 @@ export default function MyProgress() {
   const [cardBmi, setCardBmi] = useState('');
 
   const [strengthExercises, setStrengthExercises] = useState<
-    { exercise_name: string; bestWeight: number; bestReps: number; oneRM: number; isPR: boolean }[]
+    { exercise_name: string; maxWeight: number; oneRM: number }[]
   >([]);
   const [strengthLoading, setStrengthLoading] = useState(true);
   const [selectedExercise, setSelectedExercise] = useState<string | null>(null);
-  const [exerciseDetailData, setExerciseDetailData] = useState<{ date: string; weight: number; label: string }[]>([]);
-  const [exerciseHistory, setExerciseHistory] = useState<{ log_date: string; weight: number; reps: number; sets: number; one_rep_max: number }[]>([]);
-  const [logPRModalVisible, setLogPRModalVisible] = useState(false);
-  const [prWeight, setPRWeight] = useState('');
-  const [prReps, setPRReps] = useState('');
-  const [prSets, setPRSets] = useState('');
+  /** Per-workout aggregates (one point per date) for the selected exercise. */
+  const [workoutSummaries, setWorkoutSummaries] = useState<WorkoutSummary[]>([]);
+  /** StrengthRecords rows for selected exercise (for history list in Log PR flow). */
+  const [exerciseHistory, setExerciseHistory] = useState<{ log_date: string; weight: number; reps: number; one_rep_max: number }[]>([]);
+  /** Which metric tile detail is open: chart + history for that metric. */
+  const [metricDetailModal, setMetricDetailModal] = useState<'heaviest' | 'volume' | 'estimated1RM' | null>(null);
 
   const loadStarting = useCallback(async () => {
     const [sw, sd] = await Promise.all([
@@ -209,6 +222,10 @@ export default function MyProgress() {
     setStartingWeight(sw ?? '');
     setStartingDate(sd ?? '');
   }, []);
+
+  useEffect(() => {
+    loadStarting();
+  }, [profileSavedTrigger, loadStarting]);
 
   const loadBody = useCallback(async () => {
     setBodyLoading(true);
@@ -272,20 +289,15 @@ export default function MyProgress() {
       const records = await db.getAllAsync<StrengthRecordRow>(
         'SELECT * FROM StrengthRecords ORDER BY exercise_name, one_rep_max DESC;'
       );
-      type Best = { weight: number; reps: number; orm: number; fromRecord: boolean };
-      const bestByExercise = new Map<string, Best>();
+      const maxWeightByExercise = new Map<string, number>();
+      const maxORMByExercise = new Map<string, number>();
       for (const r of records) {
         if (r.weight != null && r.reps != null && r.one_rep_max != null) {
           const key = r.exercise_name;
-          const current = bestByExercise.get(key);
-          if (!current || r.one_rep_max > current.orm) {
-            bestByExercise.set(key, {
-              weight: r.weight,
-              reps: r.reps,
-              orm: r.one_rep_max,
-              fromRecord: true,
-            });
-          }
+          const w = maxWeightByExercise.get(key);
+          if (w == null || r.weight > w) maxWeightByExercise.set(key, r.weight);
+          const o = maxORMByExercise.get(key);
+          if (o == null || r.one_rep_max > o) maxORMByExercise.set(key, r.one_rep_max);
         }
       }
 
@@ -295,40 +307,20 @@ export default function MyProgress() {
          INNER JOIN Workout_Log w ON wl.workout_log_id = w.workout_log_id
          WHERE wl.weight_logged IS NOT NULL AND wl.reps_logged IS NOT NULL;`
       );
-
       for (const row of weightLogs) {
-        const orm = calc1RM(row.weight_logged, row.reps_logged);
         const key = row.exercise_name;
-        const existing = bestByExercise.get(key);
-        if (!existing || orm > existing.orm) {
-          bestByExercise.set(key, {
-            weight: row.weight_logged,
-            reps: row.reps_logged,
-            orm,
-            fromRecord: false,
-          });
-        }
+        const w = maxWeightByExercise.get(key);
+        if (w == null || row.weight_logged > w) maxWeightByExercise.set(key, row.weight_logged);
+        const orm = calc1RM(row.weight_logged, row.reps_logged);
+        const o = maxORMByExercise.get(key);
+        if (o == null || orm > o) maxORMByExercise.set(key, orm);
       }
 
-      const list = names.map((n) => {
-        const best = bestByExercise.get(n.exercise_name);
-        if (!best) {
-          return {
-            exercise_name: n.exercise_name,
-            bestWeight: 0,
-            bestReps: 0,
-            oneRM: 0,
-            isPR: false,
-          };
-        }
-        return {
-          exercise_name: n.exercise_name,
-          bestWeight: best.weight,
-          bestReps: best.reps,
-          oneRM: best.orm,
-          isPR: best.fromRecord,
-        };
-      });
+      const list = names.map((n) => ({
+        exercise_name: n.exercise_name,
+        maxWeight: maxWeightByExercise.get(n.exercise_name) ?? 0,
+        oneRM: maxORMByExercise.get(n.exercise_name) ?? 0,
+      }));
       setStrengthExercises(list);
     } catch (e) {
       console.error('Load strength:', e);
@@ -346,54 +338,85 @@ export default function MyProgress() {
   const loadExerciseDetail = useCallback(
     async (exerciseName: string) => {
       try {
-        const fromWL = await db.getAllAsync<{ workout_date: number; weight_logged: number }>(
-          `SELECT w.workout_date as workout_date, wl.weight_logged as weight_logged
+        const fromWL = await db.getAllAsync<{ workout_date: number; weight_logged: number; reps_logged: number }>(
+          `SELECT w.workout_date as workout_date, wl.weight_logged as weight_logged, wl.reps_logged as reps_logged
            FROM Weight_Log wl
            INNER JOIN Workout_Log w ON wl.workout_log_id = w.workout_log_id
-           WHERE wl.exercise_name = ? AND wl.weight_logged IS NOT NULL
+           WHERE wl.exercise_name = ? AND wl.weight_logged IS NOT NULL AND wl.reps_logged IS NOT NULL
            ORDER BY w.workout_date ASC;`,
           [exerciseName]
         );
-        const fromSR = await db.getAllAsync<{ log_date: string; weight: number | null }>(
-          'SELECT log_date, weight FROM StrengthRecords WHERE exercise_name = ? AND weight IS NOT NULL ORDER BY log_date ASC;',
+        const fromSR = await db.getAllAsync<{ log_date: string; weight: number | null; reps: number | null; one_rep_max: number | null }>(
+          'SELECT log_date, weight, reps, one_rep_max FROM StrengthRecords WHERE exercise_name = ? AND weight IS NOT NULL ORDER BY log_date ASC;',
           [exerciseName]
         );
-        const points: { ts: number; weight: number; label: string }[] = [];
-        fromWL.forEach((r) => {
-          points.push({
-            ts: r.workout_date * 1000,
-            weight: r.weight_logged,
-            label: new Date(r.workout_date * 1000).toLocaleDateString(undefined, {
-              month: 'short',
-              day: 'numeric',
-            }),
+
+        // Aggregate Weight_Log by workout_date: one summary per workout
+        const byDateWL = new Map<number, { heaviest: number; volume: number; max1RM: number }>();
+        for (const r of fromWL) {
+          const ts = r.workout_date;
+          const existing = byDateWL.get(ts);
+          const weight = r.weight_logged;
+          const reps = r.reps_logged;
+          const vol = weight * reps;
+          const oneRM = calc1RM(weight, reps);
+          if (!existing) {
+            byDateWL.set(ts, { heaviest: weight, volume: vol, max1RM: oneRM });
+          } else {
+            byDateWL.set(ts, {
+              heaviest: Math.max(existing.heaviest, weight),
+              volume: existing.volume + vol,
+              max1RM: Math.max(existing.max1RM, oneRM),
+            });
+          }
+        }
+
+        const byDate = new Map<string, WorkoutSummary>();
+        byDateWL.forEach((agg, ts) => {
+          const dateStr = new Date(ts * 1000).toISOString().slice(0, 10);
+          byDate.set(dateStr, {
+            date: dateStr,
+            dateLabel: new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+            heaviestWeight: agg.heaviest,
+            totalVolume: Math.round(agg.volume),
+            estimated1RM: Math.round(agg.max1RM),
           });
         });
+        // StrengthRecords: merge into same date or add new date
         fromSR.forEach((r) => {
-          if (r.weight == null) return;
-          const ts = new Date(r.log_date).getTime();
-          points.push({
-            ts,
-            weight: r.weight,
-            label: new Date(r.log_date).toLocaleDateString(undefined, {
-              month: 'short',
-              day: 'numeric',
-            }),
-          });
+          if (r.weight == null || r.reps == null) return;
+          const dateStr = r.log_date;
+          const oneRM = r.one_rep_max ?? calc1RM(r.weight, r.reps);
+          const dateLabel = new Date(dateStr + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+          const existing = byDate.get(dateStr);
+          if (existing) {
+            byDate.set(dateStr, {
+              date: dateStr,
+              dateLabel: existing.dateLabel,
+              heaviestWeight: Math.max(existing.heaviestWeight, r.weight),
+              totalVolume: existing.totalVolume + r.weight * r.reps,
+              estimated1RM: Math.max(existing.estimated1RM, Math.round(oneRM)),
+            });
+          } else {
+            byDate.set(dateStr, {
+              date: dateStr,
+              dateLabel,
+              heaviestWeight: r.weight,
+              totalVolume: r.weight * r.reps,
+              estimated1RM: Math.round(oneRM),
+            });
+          }
         });
-        points.sort((a, b) => a.ts - b.ts);
-        setExerciseDetailData(
-          points.map((p) => ({ date: String(p.ts), weight: p.weight, label: p.label }))
-        );
+        const merged = Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
+        setWorkoutSummaries(merged);
 
         const historyRows = await db.getAllAsync<{
           log_date: string;
           weight: number | null;
           reps: number | null;
-          sets: number | null;
           one_rep_max: number | null;
         }>(
-          'SELECT log_date, weight, reps, sets, one_rep_max FROM StrengthRecords WHERE exercise_name = ? ORDER BY log_date DESC;',
+          'SELECT log_date, weight, reps, one_rep_max FROM StrengthRecords WHERE exercise_name = ? ORDER BY log_date DESC;',
           [exerciseName]
         );
         setExerciseHistory(
@@ -403,7 +426,6 @@ export default function MyProgress() {
               log_date: r.log_date,
               weight: r.weight!,
               reps: r.reps!,
-              sets: r.sets ?? 1,
               one_rep_max: r.one_rep_max ?? calc1RM(r.weight!, r.reps!),
             }))
         );
@@ -555,35 +577,6 @@ export default function MyProgress() {
       datasets: [{ data: pairs.map((p) => p.value) }],
     };
   })();
-
-  const openPRModal = () => {
-    setPRWeight('');
-    setPRReps('');
-    setPRSets('1');
-    setLogPRModalVisible(true);
-  };
-
-  const savePR = async () => {
-    if (!selectedExercise) return;
-    const weight = parseFloat(prWeight);
-    const reps = parseInt(prReps, 10);
-    const sets = parseInt(prSets, 10) || 1;
-    if (isNaN(weight) || isNaN(reps) || reps < 1) return;
-    const oneRM = calc1RM(weight, reps);
-    const date = new Date().toISOString().slice(0, 10);
-    try {
-      await db.runAsync(
-        `INSERT INTO StrengthRecords (exercise_name, log_date, weight, reps, sets, one_rep_max)
-         VALUES (?, ?, ?, ?, ?, ?);`,
-        [selectedExercise, date, weight, reps, sets, oneRM]
-      );
-      setLogPRModalVisible(false);
-      loadStrength();
-      if (selectedExercise) loadExerciseDetail(selectedExercise);
-    } catch (e) {
-      console.error('Save PR:', e);
-    }
-  };
 
   const openExerciseDetail = (name: string) => {
     setSelectedExercise(name);
@@ -798,47 +791,78 @@ export default function MyProgress() {
               <Text style={[styles.sectionHeader, { color: SAGE }]}>
                 {selectedExercise.toUpperCase()}
               </Text>
-              <TouchableOpacity
-                style={[styles.primaryButton, { backgroundColor: SAGE }]}
-                onPress={openPRModal}
-              >
-                <Text style={styles.primaryButtonText}>Log PR</Text>
-              </TouchableOpacity>
-              {exerciseDetailData.length > 0 ? (
-                <LineChart
-                  data={{
-                    labels: exerciseDetailData.map((p) => p.label),
-                    datasets: [{ data: exerciseDetailData.map((p) => p.weight) }],
-                  }}
-                  width={chartWidth}
-                  height={220}
-                  chartConfig={chartConfig(theme)}
-                  bezier
-                  style={[styles.chart, { backgroundColor: theme.background }]}
-                  withInnerLines={true}
-                  withOuterLines={true}
-                  fromZero
-                />
-              ) : (
-                <Text style={[styles.emptyChart, { color: theme.textSecondary }]}>
-                  No weight history. Log a PR or complete a workout with this exercise.
-                </Text>
-              )}
-              <Text style={[styles.sectionHeader, { color: SAGE, marginTop: 16 }]}>MY STRENGTH · HISTORY</Text>
-              {exerciseHistory.length === 0 ? (
-                <Text style={[styles.emptyChart, { color: theme.textSecondary }]}>No logged sets yet.</Text>
-              ) : (
-                exerciseHistory.map((h, i) => (
-                  <View
-                    key={i}
-                    style={[styles.historyRow, { backgroundColor: '#FFFFFF', borderLeftColor: SAGE }]}
-                  >
-                    <Text style={[styles.historyDate, { color: theme.text }]}>{h.log_date}</Text>
-                    <Text style={[styles.historyDetail, { color: theme.text }]}>
-                      {h.weight} × {h.reps} × {h.sets} — Est. 1RM: {h.one_rep_max.toFixed(0)}
-                    </Text>
+              {(() => {
+                const len = workoutSummaries.length;
+                const heaviest = len === 0 ? null : workoutSummaries.reduce((best, w) => (w.heaviestWeight > best.heaviestWeight ? w : best), workoutSummaries[0]!);
+                const latest = len === 0 ? null : workoutSummaries[len - 1]!;
+                const estimatedMax = len === 0 ? null : workoutSummaries.reduce((best, w) => (w.estimated1RM > best.estimated1RM ? w : best), workoutSummaries[0]!);
+                return (
+                  <View style={styles.metricTilesRow}>
+                    <TouchableOpacity
+                      style={[styles.metricTile, { backgroundColor: theme.card ?? '#FFF', borderColor: theme.border }]}
+                      onPress={() => setMetricDetailModal('heaviest')}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={[styles.metricTileTitle, { color: theme.textSecondary }]}>Heaviest Weight</Text>
+                      <Text style={[styles.metricTileValue, { color: theme.text }]}>
+                        {heaviest != null ? `${heaviest.heaviestWeight} lb` : '—'}
+                      </Text>
+                      <Text style={[styles.metricTileSub, { color: theme.textSecondary }]}>
+                        {heaviest != null ? `Last: ${heaviest.dateLabel}` : 'No data'}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.metricTile, { backgroundColor: theme.card ?? '#FFF', borderColor: theme.border }]}
+                      onPress={() => setMetricDetailModal('volume')}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={[styles.metricTileTitle, { color: theme.textSecondary }]}>Total Volume</Text>
+                      <Text style={[styles.metricTileValue, { color: theme.text }]}>
+                        {latest != null ? `${latest.totalVolume.toLocaleString()} lb` : '—'}
+                      </Text>
+                      <Text style={[styles.metricTileSub, { color: theme.textSecondary }]}>
+                        {latest != null ? `Last: ${latest.dateLabel}` : 'No data'}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.metricTile, { backgroundColor: theme.card ?? '#FFF', borderColor: theme.border }]}
+                      onPress={() => setMetricDetailModal('estimated1RM')}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={[styles.metricTileTitle, { color: theme.textSecondary }]}>Estimated Max</Text>
+                      <Text style={[styles.metricTileValue, { color: theme.text }]}>
+                        {estimatedMax != null ? `${estimatedMax.estimated1RM} lb` : '—'}
+                      </Text>
+                      <Text style={[styles.metricTileSub, { color: theme.textSecondary }]}>
+                        {estimatedMax != null ? `Last: ${estimatedMax.dateLabel}` : 'No data'}
+                      </Text>
+                    </TouchableOpacity>
                   </View>
-                ))
+                );
+              })()}
+              <Text style={[styles.sectionHeader, { color: SAGE, marginTop: 16 }]}>PR History</Text>
+              {exerciseHistory.length === 0 ? (
+                <Text style={[styles.emptyChart, { color: theme.textSecondary }]}>PRs are recorded from your logged workouts.</Text>
+              ) : (
+                <>
+                  {(() => {
+                    const currentPR = exerciseHistory.reduce((best, h) => (h.one_rep_max > best.one_rep_max ? h : best), exerciseHistory[0]!);
+                    return (
+                      <View style={[styles.historyRow, { backgroundColor: theme.card ?? '#FFF', borderLeftColor: SAGE }]}>
+                        <Text style={[styles.historyDate, { color: theme.text }]}>Current PR</Text>
+                        <Text style={[styles.historyDetail, { color: theme.text }]}>
+                          {currentPR.weight} × {currentPR.reps} — Est. 1RM: {currentPR.one_rep_max.toFixed(0)}
+                        </Text>
+                      </View>
+                    );
+                  })()}
+                  <TouchableOpacity
+                    onPress={() => selectedExercise && navigation.navigate('WeightLogDetail', { workoutName: selectedExercise })}
+                    style={styles.viewLogHistoryLink}
+                  >
+                    <Text style={[styles.viewLogHistoryText, { color: SAGE }]}>View log history</Text>
+                  </TouchableOpacity>
+                </>
               )}
             </ScrollView>
           ) : (
@@ -859,10 +883,11 @@ export default function MyProgress() {
                       <View style={styles.strengthCardLeft}>
                         <Text style={[styles.strengthName, { color: theme.text }]} numberOfLines={1}>
                           {item.exercise_name}
-                          {item.isPR ? ' ✦' : ''}
                         </Text>
                         <Text style={[styles.strengthSub, { color: theme.textSecondary }]}>
-                          Best: {item.bestWeight} × {item.bestReps} · Est. 1RM: {item.oneRM.toFixed(0)}
+                          {item.maxWeight === 0 && item.oneRM === 0
+                            ? 'No data yet'
+                            : `Heaviest: ${item.maxWeight} lb · Est. Max: ${item.oneRM} lb`}
                         </Text>
                       </View>
                       <Text style={[styles.chevron, { color: theme.textSecondary }]}>›</Text>
@@ -902,7 +927,7 @@ export default function MyProgress() {
             />
             <TextInput
               style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Muscle mass (lbs)"
+              placeholder="Muscle mass (%)"
               placeholderTextColor={theme.textSecondary}
               value={logMuscle}
               onChangeText={setLogMuscle}
@@ -979,7 +1004,7 @@ export default function MyProgress() {
             />
             <TextInput
               style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Muscle mass (lbs)"
+              placeholder="Muscle mass (%)"
               placeholderTextColor={theme.textSecondary}
               value={logMuscle}
               onChangeText={setLogMuscle}
@@ -1034,53 +1059,71 @@ export default function MyProgress() {
         </View>
       </Modal>
 
-      <Modal visible={logPRModalVisible} animationType="slide" transparent>
+      {/* Metric detail: chart + history for Heaviest / Volume / Estimated Max */}
+      <Modal visible={metricDetailModal != null} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
-          <View style={[styles.modalBox, { backgroundColor: '#FFFFFF' }]}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>
-              Log MyStrength PR — {selectedExercise}
-            </Text>
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Weight (lbs)"
-              placeholderTextColor={theme.textSecondary}
-              value={prWeight}
-              onChangeText={setPRWeight}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Reps"
-              placeholderTextColor={theme.textSecondary}
-              value={prReps}
-              onChangeText={setPRReps}
-              keyboardType="number-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Sets (optional)"
-              placeholderTextColor={theme.textSecondary}
-              value={prSets}
-              onChangeText={setPRSets}
-              keyboardType="number-pad"
-            />
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={[styles.modalButton, { borderColor: theme.border }]}
-                onPress={() => setLogPRModalVisible(false)}
-              >
-                <Text style={[styles.modalButtonText, { color: theme.text }]}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalButton, { backgroundColor: SAGE }]}
-                onPress={savePR}
-              >
-                <Text style={styles.modalButtonTextWhite}>Save</Text>
+          <View style={[styles.modalBox, styles.metricDetailBox, { backgroundColor: theme.background }]}>
+            <View style={styles.metricDetailHeader}>
+              <Text style={[styles.modalTitle, { color: theme.text }]}>
+                {metricDetailModal === 'heaviest' ? 'Heaviest Weight' : metricDetailModal === 'volume' ? 'Total Volume' : 'Estimated Max'}
+              </Text>
+              <TouchableOpacity onPress={() => setMetricDetailModal(null)} hitSlop={12}>
+                <Text style={[styles.modalTitle, { color: SAGE }]}>Done</Text>
               </TouchableOpacity>
             </View>
+            {workoutSummaries.length > 0 && metricDetailModal != null && (
+              <>
+                <View style={styles.chartWrapModal}>
+                  <LineChart
+                    data={{
+                      labels: workoutSummaries.map((w) => w.dateLabel),
+                      datasets: [{
+                        data: metricDetailModal === 'heaviest'
+                          ? workoutSummaries.map((w) => w.heaviestWeight)
+                          : metricDetailModal === 'volume'
+                            ? workoutSummaries.map((w) => w.totalVolume)
+                            : workoutSummaries.map((w) => w.estimated1RM),
+                      }],
+                    }}
+                    width={chartWidthModal}
+                    height={200}
+                    chartConfig={chartConfig(theme)}
+                    bezier
+                    style={[styles.chart, { backgroundColor: theme.background }]}
+                    withInnerLines={true}
+                    withOuterLines={true}
+                    fromZero
+                  />
+                </View>
+                <Text style={[styles.sectionHeader, { color: SAGE, marginTop: 12, marginBottom: 8 }]}>History</Text>
+                <ScrollView style={styles.metricDetailHistory} showsVerticalScrollIndicator={false}>
+                  {(metricDetailModal === 'heaviest'
+                    ? [...workoutSummaries].reverse()
+                    : metricDetailModal === 'volume'
+                      ? [...workoutSummaries].reverse()
+                      : [...workoutSummaries].reverse()
+                  ).map((w, i) => (
+                    <View key={`${w.date}-${i}`} style={[styles.historyRow, { backgroundColor: theme.card ?? '#FFF', borderLeftColor: SAGE }]}>
+                      <Text style={[styles.historyDate, { color: theme.text }]}>{w.dateLabel}</Text>
+                      <Text style={[styles.historyDetail, { color: theme.text }]}>
+                        {metricDetailModal === 'heaviest'
+                          ? `${w.heaviestWeight} lb`
+                          : metricDetailModal === 'volume'
+                            ? `${w.totalVolume.toLocaleString()} lb`
+                            : `${w.estimated1RM} lb`}
+                      </Text>
+                    </View>
+                  ))}
+                </ScrollView>
+              </>
+            )}
+            {workoutSummaries.length === 0 && (
+              <Text style={[styles.emptyChart, { color: theme.textSecondary }]}>No workout data yet.</Text>
+            )}
           </View>
         </View>
       </Modal>
+
     </View>
   );
 }
@@ -1297,6 +1340,53 @@ const styles = StyleSheet.create({
     fontFamily: 'Jost_500Medium',
     fontSize: 15,
   },
+  metricTilesRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+    marginTop: 16,
+  },
+  metricTile: {
+    flex: 1,
+    minWidth: '30%',
+    padding: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  metricTileTitle: {
+    fontFamily: 'Jost_500Medium',
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  metricTileValue: {
+    fontFamily: 'Jost_600SemiBold',
+    fontSize: 18,
+  },
+  metricTileSub: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 11,
+    marginTop: 4,
+  },
+  metricDetailBox: {
+    maxHeight: '85%',
+    padding: 20,
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  chartWrapModal: {
+    overflow: 'hidden',
+    marginVertical: 8,
+    borderRadius: 12,
+  },
+  metricDetailHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  metricDetailHistory: {
+    maxHeight: 240,
+  },
   historyRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1313,6 +1403,15 @@ const styles = StyleSheet.create({
   historyDetail: {
     fontFamily: 'Jost_500Medium',
     fontSize: 13,
+  },
+  viewLogHistoryLink: {
+    paddingVertical: 10,
+    paddingHorizontal: 4,
+    marginTop: 4,
+  },
+  viewLogHistoryText: {
+    fontFamily: 'Jost_500Medium',
+    fontSize: 15,
   },
   modalOverlay: {
     flex: 1,
