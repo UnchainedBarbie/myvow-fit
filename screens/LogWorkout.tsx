@@ -1,0 +1,589 @@
+import React, {useCallback, useState, useMemo } from 'react';
+
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  FlatList,
+  Alert,
+} from 'react-native';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { useSQLiteContext } from 'expo-sqlite';
+import { useFocusEffect, useNavigation, useRoute, RouteProp } from '@react-navigation/native';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import { useSettings } from '../context/SettingsContext';
+import { useTheme } from '../context/ThemeContext';
+import { useTranslation } from 'react-i18next';
+import { useNotifications } from '../utils/useNotifications';
+import { WorkoutLogStackParamList } from '../App';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { StackNavigationProp } from '@react-navigation/stack';
+
+const NOTIFICATION_TIME_KEY = '@last_notification_time';
+
+type LogWorkoutNavigationProp = StackNavigationProp<WorkoutLogStackParamList, 'LogWorkout'>;
+
+export default function LogWorkout() {
+  const route = useRoute<RouteProp<WorkoutLogStackParamList, 'LogWorkout'>>();
+  const db = useSQLiteContext();
+  const navigation = useNavigation<LogWorkoutNavigationProp>();
+  const { theme } = useTheme(); 
+  const { t } = useTranslation(); // Initialize translations
+  const { notificationPermissionGranted, scheduleNotification } = useNotifications();
+  const { dateFormat, timeFormat } = useSettings();
+  
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [selectedDate, setSelectedDate] = useState<Date | null>(() => {
+    return route.params?.selectedDate ? new Date(route.params.selectedDate) : null;
+  });
+  const [workouts, setWorkouts] = useState<{ workout_id: number; workout_name: string }[]>([]);
+  const [selectedWorkout, setSelectedWorkout] = useState<number | null>(null);
+  const [days, setDays] = useState<{ day_id: number; day_name: string }[]>([]);
+  const [selectedDay, setSelectedDay] = useState<number | null>(null);
+  
+  // Notification related states
+  const [notifyMe, setNotifyMe] = useState(false);
+  const [showTimePicker, setShowTimePicker] = useState(false);
+  const [notificationTime, setNotificationTime] = useState<Date>(() => {
+    const defaultTime = new Date();
+    defaultTime.setHours(8, 0, 0, 0); // Default to 8:00 AM
+    return defaultTime;
+  });
+
+  const listData = useMemo(() => {
+    const data: any[] = [];
+
+    // Title and Date Picker
+    data.push({ key: 'title', type: 'TITLE', title: t('selectDate') });
+    data.push({ key: 'date-picker', type: 'DATE_PICKER' });
+
+    // Workout Selection Section
+    if (workouts.length > 0) {
+      data.push({ key: 'workout-title', type: 'SECTION_TITLE', title: t('selectWorkout') });
+      workouts.forEach((item) => data.push({ type: 'WORKOUT_ITEM', item, key: `workout-${item.workout_id}` }));
+    } else {
+      // If no workouts, display a message.
+      data.push({ key: 'empty-workouts', type: 'EMPTY', text: t('emptyWorkoutLog') });
+    }
+
+    // Days Section
+    if (selectedWorkout) {
+      data.push({ key: 'day-title', type: 'SECTION_TITLE', title: t('selectDay') });
+      if (days.length > 0) {
+        days.forEach((item) => data.push({ type: 'DAY_ITEM', item, key: `day-${item.day_id}` }));
+      } else {
+        data.push({ key: 'empty-days', type: 'EMPTY', text: t('noDaysAvailable') });
+      }
+    }
+
+    // Notification Section
+    if (selectedDay) {
+      data.push({ key: 'notify-title', type: 'SECTION_TITLE', title: t('notifications') });
+      const notifyOptions = [
+        { id: 'yes', label: t('enableNotifications'), value: true },
+        { id: 'no', label: t('notificationsDisableTitle'), value: false },
+      ];
+      notifyOptions.forEach((item) => data.push({ type: 'NOTIFY_ITEM', item, key: `notify-${item.id}` }));
+    }
+
+    // Time Picker Section
+    if (selectedDay && notifyMe && notificationPermissionGranted) {
+      data.push({ key: 'time-picker-title', type: 'SECTION_TITLE', title: t('notificationTime') });
+      data.push({ key: 'time-picker', type: 'TIME_PICKER' });
+    }
+
+    // Save Button
+    data.push({ key: 'save-button', type: 'SAVE_BUTTON' });
+
+    return data;
+  }, [workouts, selectedWorkout, days, selectedDay, notifyMe, notificationPermissionGranted, selectedDate, notificationTime, theme.text, t]);
+
+  useFocusEffect(
+    useCallback(() => {
+      const setup = async () => {
+        // Load saved notification time
+        try {
+          const savedTime = await AsyncStorage.getItem(NOTIFICATION_TIME_KEY);
+          if (savedTime) {
+            setNotificationTime(new Date(JSON.parse(savedTime)));
+          }
+        } catch (error) {
+          console.error('Failed to load notification time', error);
+        }
+        await fetchWorkouts();
+      };
+      
+      setup();
+      
+      return () => {
+        // Cleanup function if needed
+      };
+    }, [])
+  );
+
+  // Fetch the list of available workouts
+  const fetchWorkouts = async () => {
+    try {
+      const result = await db.getAllAsync<{ workout_id: number; workout_name: string }>(
+        'SELECT * FROM Workouts;'
+      );
+      setWorkouts(result);
+
+      if (result.length === 0) {
+        setSelectedWorkout(null);
+        setSelectedDay(null);
+        setDays([]);
+      }
+    } catch (error) {
+      console.error('Error fetching workouts:', error);
+    }
+  };
+
+  // Fetch the days associated with the selected workout
+  const fetchDays = async (workout_id: number) => {
+    try {
+      const result = await db.getAllAsync<{ day_id: number; day_name: string }>(
+        'SELECT * FROM Days WHERE workout_id = ? ORDER BY day_id ASC;',
+        [workout_id]
+      );
+      setDays(result);
+    } catch (error) {
+      console.error('Error fetching days:', error);
+    }
+  };
+
+  // Normalize the date to midnight
+  const normalizeDate = (date: Date): number => {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime() / 1000; // Midnight timestamp
+  };
+
+  const handleWorkoutSelection = (workoutId: number) => {
+    setSelectedWorkout(workoutId);
+    setSelectedDay(null); // Reset day selection when workout changes.
+    fetchDays(workoutId);
+  };
+
+  // Format time for display based on user settings
+  const formatTime = (date: Date): string => {
+    if (timeFormat === 'AM/PM') {
+      return date.toLocaleString('en-US', {
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: true,
+      });
+    }
+    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  };
+
+  // Log the workout and prevent duplication
+  const logWorkout = async () => {
+    if (!selectedDate) {
+      Alert.alert(t('errorTitle'), t('noDatePicked'));
+      return;
+    }
+    if (!selectedWorkout) {
+      Alert.alert(t('errorTitle'), t('selectAWorkout'));
+      return;
+    }
+    if (!selectedDay) {
+      Alert.alert(t('errorTitle'), t('selectADay'));
+      return;
+    }
+
+    try {
+      // Normalize the selected date to midnight
+      const workoutDate = normalizeDate(selectedDate);
+
+      // Find the day name of the selected day
+      const selectedDayName = days.find((day) => day.day_id === selectedDay)?.day_name;
+
+      if (!selectedDayName) {
+        Alert.alert(t('errorTitle'), 'Failed to find the selected day.');
+        return;
+      }
+
+      // Check for existing duplicate entries
+      const existingLog = await db.getAllAsync<{ workout_log_id: number }>(
+        `SELECT workout_log_id 
+         FROM Workout_Log 
+         WHERE workout_date = ? 
+           AND day_name = ? 
+           AND workout_name = (
+             SELECT workout_name FROM Workouts WHERE workout_id = ?
+           );`,
+        [workoutDate, selectedDayName, selectedWorkout]
+      );
+
+      if (existingLog.length > 0) {
+        Alert.alert(
+          t('duplicateLogTitle'),
+          t('duplicateLogMessage'),
+        );
+        return;
+      }
+
+      // Fetch the workout name from the database
+      const [workoutResult] = await db.getAllAsync<{ workout_name: string }>(
+        'SELECT workout_name FROM Workouts WHERE workout_id = ?;',
+        [selectedWorkout]
+      );
+
+      if (!workoutResult) {
+        throw new Error('Failed to fetch workout details.');
+      }
+
+      const { workout_name } = workoutResult;
+
+      // Schedule notification if selected
+      let notificationId = null;
+      if (notifyMe && notificationPermissionGranted) {
+        notificationId = await scheduleNotification({
+          workoutName: workout_name,
+          dayName: selectedDayName,
+          scheduledDate: new Date(workoutDate * 1000),
+          notificationTime: notificationTime
+        });
+      }
+
+      // Insert the workout log into the database with notification_id if available
+      const { lastInsertRowId: workoutLogId } = await db.runAsync(
+        'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id) VALUES (?, ?, ?, ?);',
+        [workoutDate, selectedDayName, workout_name, notificationId]
+      );
+
+      // Fetch all exercises associated with the selected day
+      const exercises = await db.getAllAsync<{ exercise_name: string; sets: number; reps: number; web_link: string | null; muscle_group: string | null; exercise_notes: string | null; rest_seconds: number | null }>(
+        'SELECT exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds FROM Exercises WHERE day_id = ?;',
+        [selectedDay]
+      );
+
+      // Insert exercises into the Logged_Exercises table
+      const insertExercisePromises = exercises.map((exercise) =>
+        db.runAsync(
+          'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+          [workoutLogId, exercise.exercise_name, exercise.sets, exercise.reps, exercise.web_link, exercise.muscle_group, exercise.exercise_notes, exercise.rest_seconds ?? null]
+        )
+      );
+
+      await Promise.all(insertExercisePromises);
+
+      // New navigation logic based on the selected date
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const workoutDateOnly = new Date(selectedDate);
+      workoutDateOnly.setHours(0, 0, 0, 0);
+
+      if (workoutDateOnly.getTime() < today.getTime()) {
+        // Past: Navigate to LogWeights to log the workout
+        navigation.navigate('LogWeights', { workout_log_id: workoutLogId });
+      } else if (workoutDateOnly.getTime() === today.getTime()) {
+        // Today: Navigate to StartedWorkoutInterface to start the workout
+        navigation.navigate('StartedWorkoutInterface', { workout_log_id: workoutLogId });
+      } else {
+        // Future: Navigate back to the calendar to see the scheduled workout
+        navigation.navigate('MyCalendar', { refresh: true });
+      }
+    } catch (error) {
+      console.error('Error logging workout:', error);
+      Alert.alert(t('errorTitle'), 'Failed to log workout.');
+    }
+  };
+
+  const formatDate = (timestamp: number): string => {
+    const date = new Date(timestamp * 1000); // Convert timestamp to Date object
+    const today = new Date();
+    const yesterday = new Date();
+    const tomorrow = new Date();
+  
+    yesterday.setDate(today.getDate() - 1); // Yesterday's date
+    tomorrow.setDate(today.getDate() + 1); // Tomorrow's date
+  
+    // Helper to compare dates without time
+    const isSameDay = (d1: Date, d2: Date) =>
+      d1.getDate() === d2.getDate() &&
+      d1.getMonth() === d2.getMonth() &&
+      d1.getFullYear() === d2.getFullYear();
+  
+    // Check if the date matches today, yesterday, or tomorrow
+    if (isSameDay(date, today)) {
+      return t('Today');
+    } else if (isSameDay(date, yesterday)) {
+      return t('Yesterday');
+    } else if (isSameDay(date, tomorrow)) {
+      return t('Tomorrow');
+    }
+  
+    // Default date formatting based on user-selected format
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const year = date.getFullYear();
+  
+    return dateFormat === 'mm-dd-yyyy'
+      ? `${month}-${day}-${year}`
+      : `${day}-${month}-${year}`;
+  };
+  
+  const renderItem = ({ item }: { item: any }) => {
+    switch (item.type) {
+      case 'TITLE':
+        return <Text style={[styles.Title, { color: theme.text }]}>{item.title}</Text>;
+      case 'DATE_PICKER':
+        return (
+          <TouchableOpacity style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border }]} onPress={() => setShowDatePicker(true)}>
+            <Text style={[styles.inputText, { color: theme.text }]}>
+              {selectedDate ? formatDate(normalizeDate(selectedDate)) : t('selectADate')}
+            </Text>
+          </TouchableOpacity>
+        );
+      case 'SECTION_TITLE':
+        return <Text style={[styles.sectionTitle, { color: theme.text }]}>{item.title}</Text>;
+      case 'WORKOUT_ITEM':
+        return (
+          <TouchableOpacity
+            style={[
+              styles.listItem,
+              { backgroundColor: theme.card, borderColor: theme.border },
+              selectedWorkout === item.item.workout_id && { backgroundColor: theme.buttonBackground },
+            ]}
+            onPress={() => handleWorkoutSelection(item.item.workout_id)}
+          >
+            <Text
+              style={[
+                styles.listItemText,
+                { color: theme.text },
+                selectedWorkout === item.item.workout_id && { color: theme.buttonText },
+              ]}
+            >
+              {item.item.workout_name}
+            </Text>
+          </TouchableOpacity>
+        );
+      case 'DAY_ITEM':
+        return (
+          <TouchableOpacity
+            style={[
+              styles.listItem,
+              { backgroundColor: theme.card, borderColor: theme.border },
+              selectedDay === item.item.day_id && { backgroundColor: theme.buttonBackground },
+            ]}
+            onPress={() => setSelectedDay(item.item.day_id)}
+          >
+            <Text
+              style={[
+                styles.listItemText,
+                { color: theme.text },
+                selectedDay === item.item.day_id && { color: theme.buttonText },
+              ]}
+            >
+              {item.item.day_name}
+            </Text>
+          </TouchableOpacity>
+        );
+      case 'NOTIFY_ITEM':
+        return (
+          <TouchableOpacity
+            style={[
+              styles.listItem,
+              { backgroundColor: theme.card, borderColor: theme.border },
+              notifyMe === item.item.value && { backgroundColor: theme.buttonBackground },
+            ]}
+            onPress={() => {
+              if (item.item.value && !notificationPermissionGranted) {
+                Alert.alert(
+                  'Notifications Disabled',
+                  'You need to enable notifications in Settings first.',
+                  [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Go to Settings', onPress: () => navigation.navigate('Settings' as never) },
+                  ]
+                );
+              } else {
+                setNotifyMe(item.item.value);
+              }
+            }}
+          >
+            <Text
+              style={[
+                styles.listItemText,
+                { color: theme.text },
+                notifyMe === item.item.value && { color: theme.buttonText },
+              ]}
+            >
+              {item.item.label}
+            </Text>
+          </TouchableOpacity>
+        );
+      case 'TIME_PICKER':
+        return (
+          <TouchableOpacity
+            style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border }]}
+            onPress={() => setShowTimePicker(true)}
+          >
+            <Text style={[styles.inputText, { color: theme.text }]}>
+              {formatTime(notificationTime)}
+            </Text>
+          </TouchableOpacity>
+        );
+      case 'EMPTY':
+        return <Text style={[styles.emptyText, { color: theme.text }]}>{item.text}</Text>;
+      case 'SAVE_BUTTON':
+        return (
+          <TouchableOpacity
+            style={[styles.saveButton, { backgroundColor: theme.buttonBackground }]}
+            onPress={logWorkout}
+          >
+            <Text style={[styles.saveButtonText, { color: theme.buttonText }]}>{t('scheduleWorkoutLog')}</Text>
+          </TouchableOpacity>
+        );
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <View style={{ flex: 1, backgroundColor: theme.background }}>
+      <FlatList
+        data={listData}
+        renderItem={renderItem}
+        keyExtractor={(item) => item.key}
+        contentContainerStyle={styles.container}
+        showsVerticalScrollIndicator={false}
+        ListHeaderComponent={
+          <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
+            <Ionicons name="arrow-back" size={24} color={theme.text} />
+          </TouchableOpacity>
+        }
+      />
+      
+      {showDatePicker && (
+        <DateTimePicker
+          value={selectedDate || new Date()}
+          mode="date"
+          display="default"
+          onChange={(event, date) => {
+            setShowDatePicker(false);
+            if (date) {
+              setSelectedDate(date);
+            }
+          }}
+        />
+      )}
+      
+      {showTimePicker && (
+        <DateTimePicker
+          value={notificationTime}
+          mode="time"
+          is24Hour={timeFormat === '24h'}
+          display="default"
+          onChange={(event, date) => {
+            setShowTimePicker(false);
+            if (date) {
+              setNotificationTime(date);
+              AsyncStorage.setItem(NOTIFICATION_TIME_KEY, JSON.stringify(date))
+                .catch(error => console.error('Failed to save notification time:', error));
+            }
+          }}
+        />
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    paddingHorizontal: 20,
+    paddingBottom: 40,
+  },
+  backButton: {
+    padding: 8,
+    marginTop: 40,
+    alignSelf: 'flex-start',
+    // No background color to make it unobtrusive
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.2)',
+    borderRadius: 10,
+    paddingVertical: 18,
+    paddingHorizontal: 20,
+    marginBottom: 20,
+    backgroundColor: '#F7F7F7',
+    elevation: 2,
+  },
+  inputText: {
+    fontSize: 18,
+    color: '#000000',
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  sectionTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    marginVertical: 15,
+    color: '#000000',
+    textAlign: 'left',
+  },
+  Title: {
+    fontSize: 22,
+    fontWeight: '800',
+    marginVertical: 15,
+    color: '#000000',
+    textAlign: 'center',
+  },
+  listItem: {
+    padding: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.2)',
+    borderRadius: 12,
+    marginBottom: 12,
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 5,
+    elevation: 3,
+  },
+  listItemText: {
+    fontSize: 18,
+    color: '#000000',
+    fontWeight: '700',
+  },
+  selectedItem: {
+    backgroundColor: '#000000', // Black background for selected item
+    borderColor: '#000000',
+  },
+  selectedItemText: {
+    color: '#FFFFFF', // White text for selected item
+  },
+  emptyText: {
+    fontSize: 16,
+    color: 'rgba(0, 0, 0, 0.5)',
+    textAlign: 'center',
+    marginTop: 10,
+  },
+  saveButton: {
+    backgroundColor: '#000000',
+    borderRadius: 12,
+    paddingVertical: 20,
+    alignItems: 'center',
+    marginTop: 30,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 5,
+    elevation: 5,
+  },
+  saveButtonText: {
+    fontSize: 20,
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+  },
+  buttonGroup: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 15,
+  },
+});
+  
