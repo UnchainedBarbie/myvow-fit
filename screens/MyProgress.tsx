@@ -18,6 +18,8 @@ import {
   KeyboardAvoidingView,
   Platform,
   Alert,
+  Keyboard,
+  TouchableWithoutFeedback,
 } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useSQLiteContext } from 'expo-sqlite';
@@ -26,6 +28,9 @@ import { useProfile } from '../context/ProfileContext';
 import { LineChart } from 'react-native-chart-kit';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Swipeable, RectButton } from 'react-native-gesture-handler';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import { showCelebrationNotification } from '../utils/notificationUtils';
 
 const SAGE = '#7C9A7E';
 const CREAM = '#FDF8F0';
@@ -95,6 +100,26 @@ function getThisWeekRange(): { weekStart: string; weekEnd: string } {
     weekStart: monday.toISOString().slice(0, 10),
     weekEnd: sunday.toISOString().slice(0, 10),
   };
+}
+
+/** If the two most recent body logs show weight loss, show a congrats notification. */
+async function checkWeightLossCelebration(
+  db: { getAllAsync: (sql: string) => Promise<{ weight: number | null; log_date: string }[]> }
+) {
+  try {
+    const rows = await db.getAllAsync<{ weight: number | null; log_date: string }>(
+      'SELECT weight, log_date FROM BodyMetrics ORDER BY log_date DESC LIMIT 2;'
+    );
+    if (rows.length < 2 || rows[0].weight == null || rows[1].weight == null) return;
+    const current = rows[0].weight;
+    const previous = rows[1].weight;
+    if (current >= previous) return;
+    const diff = previous - current;
+    const lbs = diff.toFixed(1);
+    await showCelebrationNotification('Congrats!', `You lost ${lbs} lbs!`);
+  } catch (e) {
+    console.warn('Weight loss celebration check:', e);
+  }
 }
 
 function BodyLogSwipeRow({
@@ -186,6 +211,8 @@ export default function MyProgress() {
   const [logModalVisible, setLogModalVisible] = useState(false);
   const [logEntryDate, setLogEntryDate] = useState<string>(''); // captured when user taps "Log Today"
   const [editingBodyLog, setEditingBodyLog] = useState<BodyMetricRow | null>(null);
+  const [editLogDate, setEditLogDate] = useState<string>('');
+  const [showEditDatePicker, setShowEditDatePicker] = useState(false);
   const [logWeight, setLogWeight] = useState('');
   const [logMuscle, setLogMuscle] = useState('');
   const [logBone, setLogBone] = useState('');
@@ -469,6 +496,7 @@ export default function MyProgress() {
       );
       setLogModalVisible(false);
       loadBody();
+      await checkWeightLossCelebration(db);
     } catch (e) {
       console.error('Save body log:', e);
     }
@@ -490,6 +518,7 @@ export default function MyProgress() {
         [date, weight, muscle, bone, water, fat, bmi, latestBody?.notes ?? null]
       );
       loadBody();
+      await checkWeightLossCelebration(db);
     } catch (e) {
       console.error('Save card metrics:', e);
     }
@@ -497,6 +526,7 @@ export default function MyProgress() {
 
   const openEditBodyLog = async (row: BodyMetricRow) => {
     setEditingBodyLog(row);
+    setEditLogDate(row.log_date);
     setLogWeight(row.weight != null ? String(row.weight) : '');
     setLogMuscle(row.muscle_mass != null ? String(row.muscle_mass) : '');
     setLogBone(row.bone_mass != null ? String(row.bone_mass) : '');
@@ -523,9 +553,10 @@ export default function MyProgress() {
       bmi = editingBodyLog.bmi;
     }
     try {
+      const dateToSave = editLogDate || editingBodyLog.log_date;
       await db.runAsync(
-        `UPDATE BodyMetrics SET weight = ?, muscle_mass = ?, bone_mass = ?, body_water = ?, body_fat = ?, bmi = ?, notes = ? WHERE metric_id = ?`,
-        [weight, muscle, bone, water, fat, bmi, logNotes.trim() || null, editingBodyLog.metric_id]
+        `UPDATE BodyMetrics SET log_date = ?, weight = ?, muscle_mass = ?, bone_mass = ?, body_water = ?, body_fat = ?, bmi = ?, notes = ? WHERE metric_id = ?`,
+        [dateToSave, weight, muscle, bone, water, fat, bmi, logNotes.trim() || null, editingBodyLog.metric_id]
       );
       setEditingBodyLog(null);
       loadBody();
@@ -650,7 +681,7 @@ export default function MyProgress() {
                   key={i}
                   style={[
                     styles.statCard,
-                    { backgroundColor: '#FFFFFF', borderLeftColor: SAGE },
+                    { backgroundColor: theme.card, borderLeftColor: SAGE },
                   ]}
                 >
                   <Text style={[styles.statLabel, { color: theme.textSecondary }]}>{item.label}</Text>
@@ -671,7 +702,7 @@ export default function MyProgress() {
           )}
 
           {(startingWeight || startingDate || currentWeight != null) && (
-            <View style={[styles.startingRow, { backgroundColor: '#FFFFFF', borderColor: theme.border }]}>
+            <View style={[styles.startingRow, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <Text style={[styles.startingText, { color: theme.text }]}>
                 Started: {startWeightNum != null ? `${startWeightNum} lbs` : '—'} on {startingDate || '—'}
               </Text>
@@ -799,7 +830,7 @@ export default function MyProgress() {
                 return (
                   <View style={styles.metricTilesRow}>
                     <TouchableOpacity
-                      style={[styles.metricTile, { backgroundColor: theme.card ?? '#FFF', borderColor: theme.border }]}
+                      style={[styles.metricTile, { backgroundColor: theme.card, borderColor: theme.border }]}
                       onPress={() => setMetricDetailModal('heaviest')}
                       activeOpacity={0.7}
                     >
@@ -812,7 +843,7 @@ export default function MyProgress() {
                       </Text>
                     </TouchableOpacity>
                     <TouchableOpacity
-                      style={[styles.metricTile, { backgroundColor: theme.card ?? '#FFF', borderColor: theme.border }]}
+                      style={[styles.metricTile, { backgroundColor: theme.card, borderColor: theme.border }]}
                       onPress={() => setMetricDetailModal('volume')}
                       activeOpacity={0.7}
                     >
@@ -825,7 +856,7 @@ export default function MyProgress() {
                       </Text>
                     </TouchableOpacity>
                     <TouchableOpacity
-                      style={[styles.metricTile, { backgroundColor: theme.card ?? '#FFF', borderColor: theme.border }]}
+                      style={[styles.metricTile, { backgroundColor: theme.card, borderColor: theme.border }]}
                       onPress={() => setMetricDetailModal('estimated1RM')}
                       activeOpacity={0.7}
                     >
@@ -848,7 +879,7 @@ export default function MyProgress() {
                   {(() => {
                     const currentPR = exerciseHistory.reduce((best, h) => (h.one_rep_max > best.one_rep_max ? h : best), exerciseHistory[0]!);
                     return (
-                      <View style={[styles.historyRow, { backgroundColor: theme.card ?? '#FFF', borderLeftColor: SAGE }]}>
+                      <View style={[styles.historyRow, { backgroundColor: theme.card, borderLeftColor: SAGE }]}>
                         <Text style={[styles.historyDate, { color: theme.text }]}>Current PR</Text>
                         <Text style={[styles.historyDetail, { color: theme.text }]}>
                           {currentPR.weight} × {currentPR.reps} — Est. 1RM: {currentPR.one_rep_max.toFixed(0)}
@@ -876,7 +907,7 @@ export default function MyProgress() {
                   contentContainerStyle={styles.listContent}
                   renderItem={({ item }) => (
                     <TouchableOpacity
-                      style={[styles.strengthCard, { backgroundColor: '#FFFFFF', borderLeftColor: SAGE }]}
+                      style={[styles.strengthCard, { backgroundColor: theme.card, borderLeftColor: SAGE }]}
                       onPress={() => openExerciseDetail(item.exercise_name)}
                       activeOpacity={0.7}
                     >
@@ -909,7 +940,7 @@ export default function MyProgress() {
         <View style={styles.modalOverlay}>
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            style={[styles.modalBox, { backgroundColor: '#FFFFFF' }]}
+            style={[styles.modalBox, { backgroundColor: theme.card }]}
           >
             <Text style={[styles.modalTitle, { color: theme.text }]}>Log MyBody metrics</Text>
             <Text style={[styles.modalHint, { color: theme.textSecondary }]}>
@@ -984,16 +1015,57 @@ export default function MyProgress() {
 
       <Modal visible={editingBodyLog != null} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+            <View style={StyleSheet.absoluteFill} />
+          </TouchableWithoutFeedback>
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            style={[styles.modalBox, { backgroundColor: '#FFFFFF' }]}
+            style={[styles.modalBox, { backgroundColor: theme.card }]}
           >
             <Text style={[styles.modalTitle, { color: theme.text }]}>Edit weight log</Text>
-            <Text style={[styles.modalHint, { color: theme.textSecondary }]}>
-              {editingBodyLog
-                ? `Log from ${new Date(editingBodyLog.log_date + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}`
-                : ''}
-            </Text>
+            <TouchableOpacity
+              style={[styles.input, { borderColor: theme.border, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }]}
+              onPress={() => setShowEditDatePicker(true)}
+            >
+              <Text style={[styles.modalHint, { color: theme.text, marginBottom: 0 }]}>
+                {editLogDate
+                  ? new Date(editLogDate + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
+                  : 'Tap to pick date'}
+              </Text>
+              <Ionicons name="calendar-outline" size={20} color={theme.textSecondary} />
+            </TouchableOpacity>
+            {showEditDatePicker && Platform.OS === 'ios' && (
+              <Modal visible transparent animationType="slide">
+                <TouchableOpacity style={{ flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' }} activeOpacity={1} onPress={() => setShowEditDatePicker(false)}>
+                  <View style={[styles.modalBox, { backgroundColor: theme.card, paddingBottom: 24 }]} onStartShouldSetResponder={() => true}>
+                    <TouchableOpacity onPress={() => setShowEditDatePicker(false)} style={{ alignSelf: 'flex-end', padding: 16 }}>
+                      <Text style={{ color: SAGE, fontWeight: '600' }}>Done</Text>
+                    </TouchableOpacity>
+                    <DateTimePicker
+                      value={editLogDate ? new Date(editLogDate + 'T12:00:00') : new Date()}
+                      mode="date"
+                      display="spinner"
+                      onChange={(_, date) => {
+                        if (date) setEditLogDate(date.toISOString().slice(0, 10));
+                      }}
+                      maximumDate={new Date()}
+                    />
+                  </View>
+                </TouchableOpacity>
+              </Modal>
+            )}
+            {showEditDatePicker && Platform.OS === 'android' && (
+              <DateTimePicker
+                value={editLogDate ? new Date(editLogDate + 'T12:00:00') : new Date()}
+                mode="date"
+                display="default"
+                onChange={(_, date) => {
+                  if (date) setEditLogDate(date.toISOString().slice(0, 10));
+                  setShowEditDatePicker(false);
+                }}
+                maximumDate={new Date()}
+              />
+            )}
             <TextInput
               style={[styles.input, { borderColor: theme.border, color: theme.text }]}
               placeholder="Weight (lbs)"
@@ -1103,7 +1175,7 @@ export default function MyProgress() {
                       ? [...workoutSummaries].reverse()
                       : [...workoutSummaries].reverse()
                   ).map((w, i) => (
-                    <View key={`${w.date}-${i}`} style={[styles.historyRow, { backgroundColor: theme.card ?? '#FFF', borderLeftColor: SAGE }]}>
+                    <View key={`${w.date}-${i}`} style={[styles.historyRow, { backgroundColor: theme.card, borderLeftColor: SAGE }]}>
                       <Text style={[styles.historyDate, { color: theme.text }]}>{w.dateLabel}</Text>
                       <Text style={[styles.historyDetail, { color: theme.text }]}>
                         {metricDetailModal === 'heaviest'
