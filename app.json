@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "simplefitnessapp-54",
-    "slug": "simplefitnessapp-54",
+    "name": "MyVow Fit",
+    "slug": "myvow-fit",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -9,7 +9,12 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.anarcobarbie.myvowfit",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSSpeechRecognitionUsageDescription": "MyVow Fit uses speech recognition so you can talk to Sage, your AI coach, hands-free."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -38,11 +43,21 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "expo-sqlite",
+      "expo-localization",
+      "@react-native-community/datetimepicker",
+      "expo-font"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "c7954b04-db1a-4830-8ad6-ce7353f1c34a"
+      }
     }
   }
 }
