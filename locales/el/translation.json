@@ -1,0 +1,487 @@
+{
+    
+  
+   "_comment_global": "These are global strings",
+
+
+    "alertCancel" : "ΑΚΥΡΩΣΗ",
+    "alertDelete": "ΔΙΑΓΡΑΦΗ",
+    "errorTitle": "Σφάλμα",
+    "Cancel":"Ακύρωση",
+    "Delete":"Διαγραφή",
+    "Save":"Αποθήκευση",
+    "Sets":"Σετ",
+    "Reps":"Επαναλήψεις",
+    "Today":"Σήμερα",
+    "Tomorrow":"Αύριο",
+    "Yesterday":"Εχθές",
+    "set": "Σετ",
+
+    "_comment_calendar": "These are calendar-related strings.",
+    "locale": "el",
+    "Mon": "Δευ",
+    "Tue": "Τρι",
+    "Wed": "Τετ",
+    "Thu": "Πέμ",
+    "Fri": "Παρ",
+    "Sat": "Σάβ",
+    "Sun": "Κυρ",
+    
+    "January": "Ιανουάριος",
+    "February": "Φεβρουάριος",
+    "March": "Μάρτιος",
+    "April": "Απρίλιος",
+    "May": "Μάϊος",
+    "June": "Ιούνιος",
+    "July": "Ιούλιος",
+    "August": "Αύγουστος",
+    "September": "Σεπτέμβριος",
+    "October": "Οκτώβριος",
+    "November": "Νοέμβριος",
+    "December": "Δεκέμβριος",
+
+    "Untracked": "Μη Καταχωρημένο",
+    "Missed": "Απούσες",
+    "Upcoming": "Επερχόμενο",
+    "Logged": "Καταχωρημένο",
+    "logWeightsManually": "Καταγραφή βαρών χειροκίνητα",
+    "View Logs": "Προβολή καταχωρήσεων",
+    "Logs": "Καταχωρήσεις",
+    "Graph Type": "Τύπος γραφήματος",
+    "Metric": "Μετρικό",
+    "Select Exercise": "Επιλογή άσκησης",
+    "Exercise Stats": "Στατιστικά άσκησης",
+    
+
+    "workoutNameErrorMessage": "Παρακαλώ εισάγετε όνομα προπόνησης.",
+    "provideDayNamesErrorMessage": "Παρακαλώ δώστε ονόματα για όλες τις ημέρες.",
+    "fillExercisesErrorMessage": "Παρακαλώ συμπληρώστε όλες τις ασκήσεις με έγκυρα δεδομένα.",
+    "failedToCreateWorkoutErrorMessage": "Αποτυχία δημιουργίας προπόνησης. Παρακαλώ δοκιμάστε ξανά.",
+
+
+    "workoutNamePlaceholder": "Όνομα Προπόνησης",
+    "dayNamePlaceholder": "Όνομα ημέρας",
+    "exerciseNamePlaceholder": "Όνομα Άσκησης",
+
+    "setsPlaceholder": "Σετ",
+    "repsPlaceholder": "Επαναλήψεις",
+
+
+    "_comment_settings": "These are settings-related strings.",
+  
+
+
+    "settingsTitle": "Ρυθμίσεις",
+    "settingsLanguage": "Γλώσσα",
+    "settingsDateFormat": "Μορφοποίηση Ημερομηνίας",
+    "settingsWeightFormat": "Μορφοποίηση Βάρους",
+    "settingsTheme": "Θέμα Φόντου",
+    "settingsSwitchDark": "Αλλαγή σε Σκωτεινό",
+    "settingsSwitchLight": "Αλλαγή σε Φωτεινό",
+
+
+
+
+
+    "_comment_homepage": "These are homepage-related strings.",
+
+
+    "homeCreateWorkout": "Δημιούργησε μια\nπροπόνηση.",
+    "homeGotoWorkouts": "Πήγαινε στις Προπονήσεις μου",
+    "homeScheduleWorkouts": "Προγραμμάτισε\nτην\nπροπόνησή σου.",
+    "homeGotoCalendar": "Πήγαινε στο Ημερολόγιό μου",
+    "homeTrackProgress": "Παρακολούθησε\nτην\nπρόοδό σου.",
+    "homeGotoProgress": "Πήγαινε στην Πρόοδό μου",
+
+
+    "_comment_workoutlist": "These are workoutlist-related strings.",
+
+    "MyWorkouts": "Οι προπονήσεις μου",
+    "CreateAWorkout": "Νέα\nΠροπόνηση",
+    "CreateAWorkoutButton": "Δημιούργησε νέα προπόνηση",
+    "WorkoutListTip": "Συμβουλή: Μπορείς να διαγράψεις τα περισσότερα πράγματα πατώντας παρατεταμένα. Δοκίμασέ το όταν έχεις την ευκαιρία!",
+
+
+    "_comment_myworkoutspage": "These are myworkoutspage-related strings.",
+
+    "deleteWorkoutTitle": "Διαγραφή του {{workoutName}}",
+    "deleteWorkoutMessage": "Είσαι σίγουρος ότι θέλεις να διαγράψεις το \"{{workoutName}}\"; Αυτή η ενέργεια δεν θα επηρεάσει τις υπάρχουσες καταχωρήσεις.",
+
+
+    "_comment_createWorkout": "These are create-workout-related strings.",
+
+    "deleteDayTitle": "Διαγραφή ημέρας",
+    "deleteDayMessage": "Είσαι σίγουρος ότι θέλεις να διαγράψεις αυτή την ημέρα;",
+
+    "deleteExerciseTitle": "Διαγραφή άσκησης",
+    "deleteExerciseMessage": "Είσαι σίγουρος ότι θέλεις να διαγράψεις αυτή την άσκηση;",
+    "addExercise": "+ Προσθήκη άσκησης",
+    "addDay": "+ Προσθήκη ημέρας",
+    "saveWorkout": "Αποθήκευση προπόνησης",
+
+
+
+    "_comment_workoutDetails": "These are workot-details-related strings.",
+
+    "noExercises": "Δεν υπάρχουν ασκήσεις για αυτή την ημέρα",
+    "addExerciseFromDetails": "Προσθήκη άσκησης",
+    "addDayFromDetails": "Προσθήκη ημέρας",
+    "emptyWorkoutDetails": "Δεν υπάρχουν διαθέσιμες ημέρες ή ασκήσεις για αυτή την προπόνηση.",
+
+    "deleteDayTitleDetails": "Διαγραφή ημέρας",
+    "deleteDayMessageDetails": "Είσαι σίγουρος ότι θέλεις να διαγράψεις αυτή την ημέρα; Αυτή η ενέργεια θα διαγράψει επίσης τις ημέρες από τις επερχόμενες προγραμματισμένες προπονήσεις",
+    "deleteExerciseTitleDetails": "Διαγραφή άσκησης",
+    "deleteExerciseMessageDetails": "Είσαι σίγουρος ότι θέλεις να διαγράψεις αυτή την άσκηση; Αυτή η ενέργεια θα διαγράψει επίσης την άσκηση από τις επερχόμενες προγραμματισμένες προπονήσεις",
+
+    "repsValidationError": "Οι επαναλήψεις πρέπει να είναι αριθμός μεγαλύτερος του 0.",
+    "setsValidationError": "Τα σετ πρέπει να είναι αριθμός μεγαλύτερος του 0.",
+    "exerciseNameValidationError": "Το όνομα της άσκησης δεν μπορεί να είναι κενό.",
+    "dayNameValidationError": "Το όνομα της ημέρας δεν μπορεί να είναι κενό.",
+
+
+
+    "_comment_editWorkout": "These are edit-workout-related strings.",
+    
+    "fetchWorkoutDetailsError": "Αποτυχία ενημέρωσης των λεπτομερειών της προπόνησης.",
+    "isSaving": "Αποθήκευση...",
+    "saveChanges": "Αποθήκευση αλλαγών",
+    "daysAndExercises": "Ημέρες και ασκήσεις",
+    "editWorkout": "Επεξεργασία προπόνησης",
+
+
+    "_comment_myCalendar": "These are my-calendar-related strings.",
+
+  
+"scheduleTip": "Συμβουλή: Μπορείς να παρακολουθείς, να προγραμματίζεις, να καταγράφεις και να ακυρώνεις τις προπονήσεις σου στο ημερολόγιο. Όλα τακτοποιημένα, σε ένα μέρος!",
+   "noUpcomingWorkouts": "Δεν υπάρχουν προγραμματισμένες επερχόμενες προπονήσεις.",
+    "upcomingWorkouts": "Επερχόμενες προπονήσεις",
+    "noUntrackedWorkouts": "Δεν βρέθηκαν μη καταχωρημένες προπονήσεις.",
+    "untrackedWorkouts": "Μη καταχωρημένες προπονήσεις",
+    "noWorkoutToday": "Δεν έχει προγραμματιστεί προπόνηση για σήμερα.",
+    "todaysWorkout": "Η σημερινή προπόνηση",
+    "scheduleWorkout": "Προγραμμάτισε προπόνηση",
+    "myCalendar": "Το ημερολόγιό μου",
+    "noExerciseLogged": "Δεν έχουν καταχωρηθεί ασκήσεις.",
+    "failedToDeleteWorkoutLog": "Αποτυχία διαγραφής καταχωρημένης προπόνησης.",
+    "noWorkoutsScheduledForDate": "Δεν υπάρχουν προπονήσεις προγραμματισμένες για αυτή την ημερομηνία.",
+
+
+    "_comment_LogWorkouts": "These are Log-Workouts-related strings.",
+    
+    
+    "noDatePicked": "Παρακαλώ επίλεξε ημερομηνία.",
+    "selectAWorkout": "Παρακαλώ επίλεξε προπόνηση.",
+    "selectADay": "Παρακαλώ επίλεξε ημέρα.",
+    "duplicateLogTitle": "Διπλή καταχώρηση",
+    "duplicateLogMessage": "Υπάρχει ήδη καταχώρηση για αυτή την προπόνηση στην επιλεγμένη ημερομηνία.",
+    "selectDate": "Επίλεξε ημερομηνία",
+    "selectADate": "Επίλεξε μία ημερομηνία",
+    "selectWorkout": "Επίλεξε προπόνηση",
+    "selectDay": "Επίλεξε ημέρα",
+    "emptyWorkoutLog":"Create a workout to track!",
+    "noDaysAvailable": "Αυτή η προπόνηση δεν έχει διαθέσιμες ημέρες!",
+    "scheduleWorkoutLog": "Προγραμμάτισε προπόνηση",
+
+
+    "_comment_MyProgress": "These are My-Progress-related strings.",
+
+    "deleteLogsTitle": "Διαγραφή Καταχωρήσεων",
+    "deleteLogsMessage": "Είστε σίγουροι ότι θέλετε να διαγράψετε όλες τις καταχωρήσεις που σχετίζονται με αυτή την προπόνηση;",
+    "failedToDeleteDays": "Αποτυχία διαγραφής των σχετικών ημερών.",
+    "myProgress": "Η Πρόοδός Μου",
+    "trackAWorkout": "Καταγραφή Προπόνησης",
+    "notTracking": "Δεν παρακολουθείτε καμία προπόνηση.",
+    "myProgressTip": "Συμβουλή: Μπορείτε να καταγράφετε τις ασκήσεις στις προπονήσεις που έχετε κάνει. Μέχρι και την παραμικρή λεπτομέρεια!",
+    "allTracks": "Όλες οι Καταχωρήσεις",
+
+
+    "_comment_LogWeights": "These are Log-Weights-related strings.",
+
+    "failedToLogWeights": "Αποτυχία καταγραφής βαρών.",
+    "Set": "Σετ",
+    "Weight": "Βάρος",
+    "noWorkoutScheduled": "Πρέπει να προγραμματίσετε μια προπόνηση για να την παρακολουθήσετε!",
+    "trackWeights":"Παρακολούθηση Βάρους",
+
+
+
+    "_comment_WeightLogDetails": "These are Weight-Log-Details-related strings.",
+
+    "deleteWeightLog": "Είστε σίγουροι ότι θέλετε να διαγράψετε όλες τις καταχωρήσεις για αυτή την ημέρα σε αυτή την ημερομηνία;",
+    "weightLog": "καταχωρήσεις",
+    "dateFrom": "Από Ημερομηνία:",
+    "pickStartDate": "Επιλέξτε ημερομηνία έναρξης",
+    "dateTo": "Έως Ημερομηνία:",
+    "pickEndDate": "Επιλέξτε ημερομηνία λήξης",
+    "clearSelection": "Απαλοιφή Επιλογής",
+    "noLog": "Δεν υπάρχουν καταχωρήσεις μεταξύ των επιλεγμένων ημερομηνιών.",
+
+
+
+    "navigateToDifficulty": "Προτεινόμενες Προπονήσεις",
+    "Difficulty": "Δυσκολία Προπόνησης",
+    "Beginner": "Αρχάριος",
+    "Intermediate": "Ερασιτέχνης",
+    "Advanced": "Προχωρημένος",
+    "featuredWorkouts":"Προτεινόμενες Προπονήσεις",
+    "templateListTip":"Συμβουλή: Μπορείτε να προσαρμόσετε τις προτεινόμενες προπονήσεις αφού τις προσθέσετε στη λίστα σας.",
+    "addTemplate":"Προσθήκη στις Προπονήσεις Μου",
+
+
+    "recurringWorkouts":"Επαναλαμβανόμενες Προπονήσεις",
+
+    "_comment_recurringWorkouts": "These are Recurring Workouts-related strings.",
+
+    "createRecurringWorkout": "Δημιουργία Επαναλαμβανόμενης Προπόνησης",
+    "manageRecurringWorkouts": "Διαχείριση Επαναλαμβανόμενων Προπονήσεων",
+    "recurringWorkoutsExplanation": "Δημιουργήστε προπονήσεις που προγραμματίζονται αυτόματα στο ημερολόγιό σας σε τακτά χρονικά διαστήματα.",
+    "everyXDays": "Κάθε",
+    "everyday": "Κάθε μέρα",
+    "weekly": "Εβδομαδιαία",
+    "every": "Κάθε",
+    "days": "ημέρες",
+    "Monday": "Δευτέρα",
+    "Tuesday": "Τρίτη",
+    "Wednesday": "Τετάρτη",
+    "Thursday": "Πέμπτη",
+    "Friday": "Παρασκευή",
+    "Saturday": "Σάββατο",
+    "Sunday": "Κυριακή",
+    "deleteRecurringWorkout": "Διαγραφή Επαναλαμβανόμενης Προπόνησης",
+    "deleteRecurringWorkoutMessage": "Είστε σίγουροι ότι θέλετε να διαγράψετε την επαναλαμβανόμενη προπόνηση για \"{{workout}}\" την \"{{day}}\";",
+    "failedToDeleteRecurringWorkout": "Αποτυχία διαγραφής επαναλαμβανόμενης προπόνησης.",
+    "noRecurringWorkoutsFound": "Δεν βρέθηκαν επαναλαμβανόμενες προπονήσεις.",
+    "createRecurringWorkoutToSeeHere": "Δημιουργήστε μια επαναλαμβανόμενη προπόνηση για να εμφανιστεί εδώ.",
+    "workoutDetails": "Λεπτομέρειες Προπόνησης",
+    "workout": "Προπόνηση",
+    "day": "Ημέρα",
+    "recurringInterval": "Επαναλαμβανόμενο Διάστημα",
+    "selectDaysOfWeek": "Επιλέξτε Ημέρες της Εβδομάδας",
+    "selectedDays": "Επιλεγμένες Ημέρες",
+    "notifications": "Ειδοποιήσεις",
+    "enableNotifications": "Ενεργοποίηση Ειδοποιήσεων",
+    "notificationTime": "Ώρα Ειδοποίησης",
+    "notificationPermissions": "Άδειες Ειδοποιήσεων",
+    "notificationPermissionsRequired": "Απαιτείται άδεια ειδοποιήσεων για την ενεργοποίηση των ειδοποιήσεων. Παρακαλώ ενεργοποιήστε τις στις Ρυθμίσεις.",
+    "goToSettings": "Μετάβαση στις Ρυθμίσεις",
+    "creating": "Δημιουργία...",
+    "saving": "Αποθήκευση...",
+    "done": "Έτοιμο",
+    "editRecurringWorkout": "Επεξεργασία Επαναλαμβανόμενης Προπόνησης",
+    "recurringWorkoutNotFound": "Δεν βρέθηκε η επαναλαμβανόμενη προπόνηση.",
+    "errorLoadingRecurringWorkout": "Σφάλμα κατά τη φόρτωση της επαναλαμβανόμενης προπόνησης.",
+    "failedToUpdateRecurringWorkout": "Αποτυχία ενημέρωσης επαναλαμβανόμενης προπόνησης.",
+    "anErrorOccurred": "Παρουσιάστηκε σφάλμα.",
+    "workoutNotFound": "Δεν βρέθηκε η προπόνηση.",
+    "goBack": "Επιστροφή",
+    "specificDaysOfWeek": "Συγκεκριμένες ημέρες της εβδομάδας",
+    "confirm": "Επιβεβαίωση",
+    "recurringWorkoutDetails": "Λεπτομέρειες Επαναλαμβανόμενης Προπόνησης",
+    "Notifications enabled": "Οι ειδοποιήσεις είναι ενεργοποιημένες",
+    "Notificationsdisabled": "Οι ειδοποιήσεις είναι απενεργοποιημένες",
+    "confirmDelete": "Επιβεβαίωση Διαγραφής",
+    "confirmDeleteRecurringWorkout": "Είστε σίγουροι ότι θέλετε να διαγράψετε αυτή την επαναλαμβανόμενη προπόνηση;",
+    "edit": "Επεξεργασία",
+    "errorLoadingWorkout": "Σφάλμα κατά τη φόρτωση της προπόνησης.",
+
+    "_comment_startWorkout": "These are Start Workout-related strings.",
+
+    "startWorkout": "Έναρξη Προπόνησης",
+    "invalidRestTime": "Μη έγκυρος χρόνος ξεκούρασης",
+    "pleaseEnterValidSeconds": "Παρακαλώ εισάγετε έναν έγκυρο αριθμό δευτερολέπτων.",
+    "missingInformation": "Λείπουν πληροφορίες",
+    "enterRepsAndWeight": "Παρακαλώ εισάγετε επαναλήψεις και βάρος πριν συνεχίσετε.",
+    "exitWorkout": "Έξοδος από την προπόνηση;",
+    "exitWorkoutMessage": "Είστε σίγουροι ότι θέλετε να εξέλθετε; Η πρόοδός σας θα χαθεί.",
+    "exit": "Έξοδος",
+    "workoutCompleted": "Η προπόνηση ολοκληρώθηκε!",
+    "totalTime": "Συνολικός Χρόνος",
+    "setsCompleted": "Ολοκληρωμένα Σετ",
+    "completeWorkout": "Ολοκλήρωση Προπόνησης",
+    "workoutTime": "Χρόνος Προπόνησης",
+    "restTime": "Χρόνος Ξεκούρασης",
+    "sec": "δευτ.",
+    "addTime": "+15δ",
+    "takeBreath": "Πάρτε μια ανάσα και ετοιμαστείτε για το επόμενο σετ",
+    "upNext": "Επόμενο",
+    "skipRest": "Παράλειψη Ξεκούρασης",
+    "goal": "Στόχος",
+    "repsDone": "Επαναλήψεις που έγιναν",
+    "weightKgLbs": "Βάρος (κιλά/λίβρες)",
+    "finishWorkout": "Τέλος Προπόνησης",
+    "completeSetRest": "Ολοκλήρωση Σετ & Ξεκούραση",
+    "completeSet": "Ολοκλήρωση Σετ",
+    "upcomingSet": "Επερχόμενο Σετ",
+    "OK": "OK",
+    "workoutSaved": "Η προπόνηση αποθηκεύτηκε",
+    "workoutSavedMessage": "Η προπόνησή σας καταχωρήθηκε με επιτυχία!",
+    "loadingWorkout": "Φόρτωση προπόνησης...",
+    "exercises": "Ασκήσεις",
+    "totalSets": "Συνολικά Σετ",
+    "restTimeBetweenSets": "Χρόνος ξεκούρασης μεταξύ σετ (δευτερόλεπτα)",
+    "restTimeBetweenExercises": "Χρόνος ξεκούρασης μεταξύ ασκήσεων (δευτερόλεπτα)",
+
+    "workoutSettings": "Ρυθμίσεις Προπόνησης",
+    "vibration": "Δόνηση",
+
+    "_comment_settings1": "These are Settings-related strings.",
+
+    "dataManagement": "Διαχείριση Δεδομένων",
+    "exportData": "Εξαγωγή Δεδομένων",
+    "importData": "Εισαγωγή Δεδομένων",
+    "notificationsDisableTitle": "Απενεργοποίηση Ειδοποιήσεων",
+    "notificationsDisableMessage": "Η απενεργοποίηση των ειδοποιήσεων θα ακυρώσει όλες τις προγραμματισμένες υπενθυμίσεις προπόνησης. Είστε σίγουροι;",
+    "exportFailedTitle": "Αποτυχία Εξαγωγής",
+    "databaseNotFound": "Το αρχείο της βάσης δεδομένων δεν βρέθηκε",
+    "sharingNotAvailable": "Η κοινή χρήση δεν είναι διαθέσιμη σε αυτή τη συσκευή",
+    "exportDatabaseTitle": "Εξαγωγή Βάσης Δεδομένων Προπονήσεων",
+    "exportErrorMessage": "Αποτυχία εξαγωγής της βάσης δεδομένων",
+    "importConfirmTitle": "Εισαγωγή Βάσης Δεδομένων",
+    "importConfirmMessage": "Η εισαγωγή μιας βάσης δεδομένων θα αντικαταστήσει τα τρέχοντα δεδομένα σας. Αυτή η ενέργεια δεν μπορεί να αναιρεθεί. Συνέχεια;",
+    "importSuccessTitle": "Επιτυχής Εισαγωγή",
+    "importSuccessMessage": "Η βάση δεδομένων εισήχθη με επιτυχία. Παρακαλώ επανεκκινήστε την εφαρμογή για να εφαρμοστούν οι αλλαγές.",
+    "importFailedTitle": "Αποτυχία Εισαγωγής",
+    "importErrorMessage": "Αποτυχία εισαγωγής της βάσης δεδομένων",
+    "remindScheduledWorkouts": "Ειδοποίησέ με για προγραμματισμένες προπονήσεις",
+    "dayInterval": "Διάστημα Ημερών:",
+    "settingsTimeFormat": "Μορφή Ώρας",
+
+
+    "_comment_Graphs": "These are Graphs-related strings.",
+
+    "Graphs": "Γραφήματα",
+    "SelectWorkoutforGraph": "Επιλέξτε Προπόνηση για Γραφήματα",
+    "forCommit": "Αυτό αφορά μία καταχώρηση",
+   
+    "No data available for the selected criteria": "Δεν υπάρχουν διαθέσιμα δεδομένα για τα επιλεγμένα κριτήρια",
+    "Combined Effort Score": "Combined Effort Score",
+    "About CES": "Σχετικά με το CES",
+    "About 1RM": "Σχετικά με το 1RM",
+    "CESExplanation": "Το CES (Combined Effort Score) μετρά τον συνολικό όγκο της προπόνησής σας λαμβάνοντας υπόψη το βάρος, τις επαναλήψεις και την ένταση.",
+    "1RMExplanation": "Το 1RM (One Rep Max) εκτιμά το μέγιστο βάρος που μπορείτε να σηκώσετε για μία επανάληψη βάσει της απόδοσής σας.\n(Αυτό δεν είναι το πραγματικό σας 1RM, ο προγραμματιστής της εφαρμογής δεν φέρει ευθύνη για τυχόν τραυματισμούς αν χρησιμοποιήσετε αυτή την εκτίμηση ως το 1RM σας)",
+    "Time Frame": "Χρονικό Διάστημα",
+    "Estimated 1RM": "Εκτιμώμενο 1RM",
+    "Week": "Εβδομάδα",
+    "Month": "Μήνας",
+    "Year": "Έτος",
+    "All Time": "Όλο το Διάστημα",
+    "Select an exercise": "Επιλέξτε άσκηση",
+    "No exercises available": "Δεν υπάρχουν διαθέσιμες ασκήσεις",
+    "Track a workout first to see your progress": "Καταγράψτε πρώτα μια προπόνηση για να δείτε την πρόοδό σας",
+    "No workout data available for graphs": "Δεν υπάρχουν δεδομένα προπόνησης για γραφήματα",
+    "workoutReminderTitle": "Υπενθύμιση Προπόνησης: {{workoutName}}",
+    "workoutReminderBody": "Ώρα για την προπόνηση {{dayName}}!",
+    "Workout in Progress": "Προπόνηση σε Εξέλιξη",
+    "Workout in Progress Message": "Μην ξεχάσετε να ολοκληρώσετε την προπόνησή σας!",
+
+
+    "_comment_GraphsWorkoutDetails": "These are Graphs-Workout-Details-related strings.",
+
+    "setGraph": "Σετ",
+    "Time": "Χρόνος",
+    "completionTime": "Χρόνος Ολοκλήρωσης",
+    "horizontalScrollHint": "Σύρετε οριζόντια για να δείτε περισσότερα δεδομένα",
+    "weightProgressionBySets": "Εξέλιξη Βάρους ανά Σετ",
+    "About Sets Progression": "Σχετικά με το Γράφημα Σετ",
+    "About Completion Time": "Σχετικά με το Γράφημα Χρόνου",
+    "SetsGraph": "Γράφημα Σετ",
+    "TimeGraph": "Γράφημα Χρόνου",
+    "timeGraphExplanation": "Αυτό το γράφημα δείχνει πόσο χρόνο χρειάζεστε για να ολοκληρώσετε τις προπονήσεις σας με την πάροδο του χρόνου.",
+    "setsGraphExplanation": "Αυτό το γράφημα δείχνει την εξέλιξη του βάρους για κάθε σετ με την πάροδο του χρόνου. Κάθε γραμμή και χρώμα αντιπροσωπεύει διαφορετικό σετ, επιτρέποντάς σας να παρακολουθείτε την απόδοσή σας σε κάθε προπόνηση.",
+    "graphTipText": "Συμβουλή: Μπορείτε να πατήσετε τις τελείες στο γράφημα για να δείτε επιπλέον πληροφορίες για αυτή τη προπόνηση.",
+
+
+    "RepsCapital": "Επαναλήψεις",
+    "RepsGraph": "Γράφημα Επαναλήψεων",
+    "About Reps Progression": "Σχετικά με το Γράφημα Επαναλήψεων",
+    "repsGraphExplanation": "Αυτό το γράφημα δείχνει τις επαναλήψεις που κάνατε για κάθε σετ. Κάθε γραμμή και χρώμα αντιπροσωπεύει διαφορετικό αριθμό σετ όπως και το γράφημα σετ, αλλά ο άξονας Υ είναι οι επαναλήψεις αντί για τα βάρη. Ιδανικό για ασκήσεις με το σωματικό βάρος!",
+
+    "Workout Days": "Ημέρες Προπόνησης",
+
+
+    "settingsFirstWeekday": "Πρώτη Ημέρα της Εβδομάδας",
+
+
+    "workoutDetailsTip": "Συμβουλή: Μπορείτε να δείτε επιπλέον πληροφορίες για μια άσκηση πατώντας το όνομά της.",
+    "webLink": "Σύνδεσμος Ιστού",
+    "webLinkPlaceholder": "https://example.com (προαιρετικό)",
+    "invalidLinkTitle": "Μη έγκυρος σύνδεσμος",
+    "invalidLinkMessage": "Ο σύνδεσμος πρέπει να ξεκινά με \"http://\" ή \"https://\".",
+    "exerciseDetails": "Λεπτομέρειες Άσκησης",
+
+    "fileNotSelectedError": "Δεν επιλέχθηκε αρχείο ή το αρχείο δεν είναι έγκυρο.",
+    "workoutAlreadyExistsError": "Υπάρχει ήδη προπόνηση με αυτό το όνομα.",
+
+    "Unspecified": "Απροσδιόριστη",
+    "Chest": "Στήθος",
+    "Back": "Πλάτη",
+    "Shoulders": "Ώμοι",
+    "Biceps": "Δικέφαλοι",
+    "Triceps": "Τρικέφαλοι",
+    "Forearms": "Πήχεις",
+    "Abs": "Κοιλιακοί",
+    "Legs": "Πόδια",
+    "Glutes": "Γλουτοί",
+    "Hamstrings": "Οπίσθιοι Μηριαίοι",
+    "Calves": "Γάμπες",
+    "Quads": "Τετρακέφαλοι",
+
+    "muscleGroup": "Μυϊκή Ομάδα",
+
+
+    "Workout Volume": "Όγκος Προπόνησης",
+    "Muscle Distribution": "Κατανομή Μυών",
+    "Overall Muscle Groups": "Συνολικές Μυϊκές Ομάδες",
+    "Muscle Group Volume": "Όγκος Μυϊκής Ομάδας",
+
+    "Workout Stats": "Στατιστικά Προπόνησης",
+    "Overall Stats": "Συνολικά Στατιστικά",
+
+    "About Muscle Distribution": "Σχετικά με την Κατανομή Μυών",
+    "About Muscle Group Volume": "Σχετικά με τον Όγκο Μυϊκής Ομάδας",
+    "About Overall Muscle Groups": "Σχετικά με τις Συνολικές Μυϊκές Ομάδες",
+    
+
+    "muscleDistributionExplanation": "Αυτό το γράφημα δείχνει την κατανομή των μυϊκών ομάδων στις προπονήσεις σας, επιτρέποντάς σας να την προσαρμόσετε στους στόχους σας.",
+    "muscleGroupVolumeExplanation": "Αυτό το γράφημα δείχνει τον όγκο που έγινε από κάθε μυϊκή ομάδα στις προπονήσεις σας μέσα σε ένα χρονικό διάστημα, επιτρέποντάς σας να παρακολουθείτε την πρόοδό σας σε κάθε μυϊκή ομάδα.",
+    "overallMuscleGroupsExplanation": "Αυτό το γράφημα δείχνει τον αριθμό των σετ που έγιναν από κάθε μυϊκή ομάδα στις προπονήσεις σας μέσα σε ένα χρονικό διάστημα, επιτρέποντάς σας να δείτε πόσο γυμνάζετε κάθε μυϊκή ομάδα.",
+    "workoutVolumeExplanation": "Αυτό το γράφημα δείχνει τον όγκο των προπονήσεών σας μέσα σε ένα χρονικό διάστημα, επιτρέποντάς σας να δείτε πώς αποδώσατε σε κάθε προπόνηση.",
+
+
+    "duplicateRecurringWorkout": "Διπλά-καταγεγραμμένη Επαναλαμβανόμενη Προπόνηση",
+    "recurringWorkoutExists": "Υπάρχει ήδη επαναλαμβανόμενη προπόνηση με αυτό το όνομα για αυτή την ημέρα.",
+
+    "skipToNextExercise": "Παράληψη και Μετάβαση στην Επόμενη Άσκηση",
+    "enableSetSwitchSound": "Ενεργοποίηση Ήχου",
+    "autoFillWeights": "Αυτόματη Συμπλήρωση Βαρών",
+    "autoFillReps": "Αυτόματη Συμπλήρωση Επαναλήψεων",
+    "startedWorkoutTip": "Συμβουλή: Μπορείτε να μεταβείτε σε οποιαδήποτε άσκηση πατώντας το κουμπί με τις τρεις γραμμές πάνω δεξιά στην οθόνη.",
+
+
+   "completing": "Ολοκλήρωση",
+
+
+    "Day Volume": "Όγκος Ημέρας",
+    "About Day Volume": "Σχετικά με τον Όγκο Ημέρας",
+    "dayVolumeExplanation": "Αυτό το γράφημα δείχνει τον όγκο μιας συγκεκριμένης ημέρας προπόνησης μέσα σε ένα χρονικό διάστημα, επιτρέποντάς σας να δείτε την πρόοδό σας για εκείνη την ημέρα ξεχωριστά.",
+    
+    "workoutDeleteTip": "Συμβουλή: Πατήστε παρατεταμένα για να διαγράψετε μια προπόνηση",
+    "DeleteWorkoutTitle": "Διαγραφή Προπόνησης",
+    "DeleteWorkoutMessage": "Είστε σίγουροι ότι θέλετε να διαγράψετε αυτή την προπόνηση; Αν είναι καταχωρημένη προπόνηση, αυτή η ενέργεια θα διαγράψει και τα σχετικά καταχωρημένα δεδομένα.",
+
+    "Community": "Κοινότητα",
+    "logWeightsError": "Παρακαλώ βεβαιωθείτε ότι όλα τα πεδία είναι συμπληρωμένα και δεν είναι μηδέν.",
+    "logWeightsTipText": "Μπορείτε να διαγράψετε σετ από ασκήσεις πατώντας παρατεταμένα τον αριθμό του σετ.",
+    "exerciseNotes": "Σημειώσεις",
+    "exerciseNotesPlaceholder": "Σημειώσεις για την άσκηση (προαιρετικό)",
+    "quickWorkout": "Γρήγορη Προπόνηση",
+    "useLogsForRepsTitle": "Χρήση προηγούμενων επαναλήψεων",
+    "lastWorkoutInfo": "Προηγούμενη προπόνηση",
+
+    "editExerciseLog": "Επεξεργασία αρχείου άσκησης",
+    "editExerciseTipText": "Συμβουλή: Μπορείτε να επεξεργαστείτε τα αρχεία άσκησης κάνοντας κλικ σε αυτά.",
+    "savingError": "Σφάλμα αποθήκευσης",
+    "weightsValidationError": "Τα βάρη πρέπει να είναι πάνω από 0."
+
+    }
+  

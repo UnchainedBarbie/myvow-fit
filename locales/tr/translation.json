@@ -1,0 +1,487 @@
+{
+    
+
+    "_comment_global": "These are global strings.",
+
+
+    "alertCancel" : "İPTAL",
+    "alertDelete": "SİL",
+    "errorTitle": "Hata",
+    "Cancel":"İptal",
+    "Delete":"Sil",
+    "Save":"Kaydet",
+    "Sets":"set",
+    "Reps":"tekrar",
+    "Today":"Bugün",
+    "Tomorrow":"Yarın",
+    "Yesterday":"Dün",
+    "set": "Set",
+
+    "_comment_calendar": "These are calendar-related strings.",
+    "locale": "tr",
+    "Mon": "Pzt",
+    "Tue": "Sal",
+    "Wed": "Çar",
+    "Thu": "Per",
+    "Fri": "Cum",
+    "Sat": "Cmt",
+    "Sun": "Paz",
+    
+    "January": "Ocak",
+    "February": "Şubat",
+    "March": "Mart",
+    "April": "Nisan",
+    "May": "Mayıs",
+    "June": "Haziran",
+    "July": "Temmuz",
+    "August": "Ağustos",
+    "September": "Eylül",
+    "October": "Ekim",
+    "November": "Kasım",
+    "December": "Aralık",
+    "Exercise Stats": "Egzersiz\nİstatistikleri",
+    "Untracked": "Takip\nEdilmemiş",
+    "Missed": "Kaçırıldı",
+    "Upcoming": "Yaklaşan",
+    "Logged": "Kaydedilmiş",
+    "logWeightsManually": "Ağırlıkları Manuel Gir",
+    "View Logs": "Kayıtları Görüntüle",
+    "Logs": "Kayıtlar",
+    "Graph Type": "Grafik Türü",
+    "Metric": "Metrik",
+
+    "workoutNameErrorMessage": "Lütfen bir antrenman adı girin.",
+    "provideDayNamesErrorMessage": "Lütfen tüm günler için bir ad girin.",
+    "fillExercisesErrorMessage": "Lütfen tüm egzersizleri geçerli verilerle doldurun.",
+    "failedToCreateWorkoutErrorMessage": "Antrenman oluşturulamadı. Lütfen tekrar deneyin.",
+
+
+    "workoutNamePlaceholder": "Antrenman Adı",
+    "dayNamePlaceholder": "Gün Adı",
+    "exerciseNamePlaceholder": "Egzersiz Adı",
+    "setsPlaceholder": "Set",
+    "repsPlaceholder": "Tekrar",
+
+
+
+    "_comment_settings": "These are settings-related strings.",
+    
+    
+    "settingsTitle": "Ayarlar",
+    "settingsLanguage": "Dil",
+    "settingsDateFormat": "Tarih Formatı",
+    "settingsWeightFormat": "Ağırlık Formatı",
+    "settingsTheme": "Tema",
+    "settingsSwitchDark": "Karanlık moda geç",
+    "settingsSwitchLight": "Aydınlık moda geç",
+
+
+
+    "_comment_homepage": "These are homepage-related strings.",
+
+
+    "homeCreateWorkout": "Bir\nantrenman\noluştur.",
+    "homeGotoWorkouts": "Antrenmanlarım'a git",
+    "homeScheduleWorkouts": "Antrenmanlarını\ntakvimine\nekle.",
+    "homeGotoCalendar": "Takvimim'e git",
+    "homeTrackProgress": "İlerlemeni\ntakip\net.",
+    "homeGotoProgress": "İlerlemem'e git",
+
+
+    "_comment_workoutlist": "These are workoutlist-related strings.",
+
+    "MyWorkouts": "Antrenmanlarım",
+    "CreateAWorkout" : "Yeni\nAntrenman ",
+    "CreateAWorkoutButton" : "Yeni bir antrenman oluştur",
+    "WorkoutListTip" : "İpucu: Çoğu şeyi üstüne basılı tutarak silebilirsiniz, fırsat bulduğunuzda deneyin!",
+
+
+    "_comment_myworkoutspage": "These are myworkoutspage-related strings.",
+
+    "deleteWorkoutTitle": "{{workoutName}} siliniyor",
+    "deleteWorkoutMessage": "\"{{workoutName}}\" adlı antrenmanı silmek istediğinizden emin misiniz? Bu işlem mevcut kayıtları etkilemeyecek.",
+
+
+
+    "_comment_createWorkout": "These are create-workout-related strings.",
+
+    "deleteDayTitle": "Günü Sil",
+    "deleteDayMessage": "Gün Silinecek.",
+    "deleteExerciseTitle": "Egzersizi Sil",
+    "deleteExerciseMessage": "Bu egzersizi silmek istediğinizden emin misiniz?",
+
+    "addExercise": "+ Egzersiz Ekle",
+    "addDay": "+ Gün Ekle",
+    "saveWorkout": "Antrenmanı Kaydet",
+
+
+
+
+    "_comment_workoutDetails": "These are workot-details-related strings.",
+
+    "noExercises": "Bu günde egzersiz yok",
+    "addExerciseFromDetails": "Egzersiz Ekle",
+    "addDayFromDetails": "Gün Ekle",
+    "emptyWorkoutDetails": "Bu antrenman için gün veya egzersiz mevcut değil.",
+  
+    
+    
+    
+    "deleteDayTitleDetails": "Günü Sil",
+   "deleteExerciseTitleDetails": "Egzersizi Sil",
+   "deleteExerciseMessageDetails": "Bu egzersizi silmek istediğinizden emin misiniz? Bu işlem, egzersizi ileri tarihe planlanmış olan antrenmanlardan da silecektir.",
+    "deleteDayMessageDetails": "Bu günü silmek istediğinizden emin misiniz? Bu işlem, bu günü ileri tarihe planlanmış olan antrenmanlardan da silecektir.",
+
+    "repsValidationError": "Tekrar sayısı 0'dan büyük bir sayı olmalıdır.",
+    "setsValidationError": "Set sayısı 0'dan büyük bir sayı olmalıdır.",
+    "exerciseNameValidationError": "Egzersiz adı boş olamaz.",
+    "dayNameValidationError": "Gün adı boş olamaz.",
+
+    "_comment_editWorkout": "These are edit-workout-related strings.",
+    
+    "fetchWorkoutDetailsError": "Anternman detayları güncellenemedi",
+    "isSaving": "Kaydediliyor...",
+    "saveChanges": "Kaydet",
+    "daysAndExercises": "Günler ve Egzersizler",
+    "editWorkout": "Antenmanı Düzenle",
+
+
+
+    "_comment_myCalendar": "Bunlar takvimle ilgili metinlerdir.",
+
+"scheduleTip": "İpucu: Takvimden antrenmanlarınızı izleyebilir, planlayabilir, takip edebilir ve iptal edebilirsiniz. Artık hepsi tek bir yerde!",
+   "noUpcomingWorkouts": "Yaklaşan bir antrenman planlanmadı.",
+    "upcomingWorkouts": "Yaklaşan Antrenmanlar",
+    "noUntrackedWorkouts": "Takip edilmeyen bir antrenman bulunamadı.",
+    "untrackedWorkouts": "Takip Edilmeyen Antrenmanlar",
+    "noWorkoutToday": "Bugün için bir antrenman planlanmadı.",
+    "todaysWorkout": "Bugünün Antrenmanı",
+    "scheduleWorkout": "Bir Antrenman Planla",
+    "myCalendar": "Takvimim",
+    "noExerciseLogged": " Bu gün için egzersiz bulunamadı.",
+    "noWorkoutsScheduledForDate": "Bu tarihte planlanmış bir antrenman bulunamadı.",
+
+    "_comment_LogWorkouts": "These are Log-Workouts-related strings.",
+  
+    "noDatePicked": "Lütfen bir tarih seçin.",
+    "selectAWorkout": "Lütfen bir antrenman seçin.",
+    "selectADay": "Lütfen bir gün seçin.",
+    "duplicateLogTitle": "Çift Kayıt",
+    "duplicateLogMessage": "Aynı antrenman için aynı güne bir kayıt zaten mevcut.",
+    "selectDate": "Tarih Seç",
+    "selectADate": "Bir tarih seçin",
+    "selectWorkout": "Antrenman Seç",
+    "selectDay": "Gün Seç",
+    "emptyWorkoutLog": "Takip etmek için bir antrenman oluşturun!",
+    "noDaysAvailable": "Bu antrenmanda gün yok!",
+    "scheduleWorkoutLog": "Antrenman Planla",
+
+
+
+    "_comment_MyProgress": "These are My-Progress-related strings.",
+
+
+    "deleteLogsTitle": "Kayıtları Sil",
+    "deleteLogsMessage": "Bu antrenman ile ilişkilendirilen tüm kayıtları silmek istediğinizden emin misiniz?",
+    "failedToDeleteDays": "İlişkili günler silinemedi.",
+    "myProgress": "İlerlemem",
+    "trackAWorkout": "Bir antrenmanı takip et",
+    "notTracking": "Hiçbir antrenmanı takip etmiyorsunuz.",
+    "myProgressTip": "İpucu: Yaptığınız antrenmanlardaki egzersizleri buradan takip edebilirsiniz. Her. Bir. Detayına. Kadar.",
+    "allTracks": "Tüm kayıtlar",
+  
+    
+    "_comment_LogWeights": "These are Log-Weights-related strings.",
+
+
+    "failedToLogWeights": "Ağırlıklar kaydedilemedi.",
+    "Set":"Set",
+    "Weight":"Ağırlık",
+    "noWorkoutScheduled": "Antrenmanı takip etmek için önce planla!",
+    "trackWeights":"Ağırlıkları takip et",
+
+
+    "_comment_WeightLogDetails": "These are Weight-Log-Details-related strings.",
+
+  
+    "deleteWeightLog": "Bu tarihteki günün kayıtlarını silmek istediğinizden emin misiniz?",
+    "weightLog": "kayıtları",
+    "dateFrom": "Başlangıç Tarihi:",
+    "pickStartDate": "Bir başlangıç tarihi seçin",
+    "dateTo": "Bitiş Tarihi:",
+    "pickEndDate": "Bir bitiş tarihi seçin",
+    "clearSelection": "Seçimi Temizle",
+    "noLog": "Seçilen tarihler arasında kayıt bulunmamaktadır.",
+
+
+    "navigateToDifficulty": "Öne Çıkan Antrenmanlar",
+    "Difficulty": "Antrenman Zorluk Seviyesi",
+    "Beginner": "Başlangıç",
+    "Intermediate": "Orta seviye",
+    "Advanced": "İleri seviye",
+    "featuredWorkouts": "Öne Çıkan Antrenmanlar",
+    "templateListTip": "İpucu: Öne çıkan antrenmanları antrenman listenize ekledikten sonra özelleştirebilirsiniz.",
+    "addTemplate": "Antrenmanlarıma Ekle",
+
+
+
+
+
+      "recurringWorkouts": "Tekrarlayan Antrenmanlar",
+      "_comment_recurringWorkouts": "Bunlar tekrarlayan antrenmanlarla ilgili metinlerdir.",
+      "createRecurringWorkout": "Tekrarlayan Antrenman Oluştur",
+      "manageRecurringWorkouts": "Tekrarlayan Antrenmanları Yönet",
+      "recurringWorkoutsExplanation": "Antrenmanlarınızı düzenli aralıklarla takviminize otomatik olarak ekleyin.",
+      "everyXDays": "Her",
+      "everyday": "Her gün",
+      "weekly": "Haftalık",
+      "every": "Her",
+      "days": "günde bir",
+      "Monday": "Pazartesi",
+      "Tuesday": "Salı",
+      "Wednesday": "Çarşamba",
+      "Thursday": "Perşembe",
+      "Friday": "Cuma",
+      "Saturday": "Cumartesi",
+      "Sunday": "Pazar",
+      "deleteRecurringWorkout": "Tekrarlayan Antrenmanı Sil",
+      "deleteRecurringWorkoutMessage": "“{{workout}}” antrenmanını “{{day}}” tarihinde silmek istediğinizden emin misiniz?",
+      "failedToDeleteRecurringWorkout": "Tekrarlayan antrenman silinemedi.",
+      "noRecurringWorkoutsFound": "Tekrarlayan antrenman bulunamadı.",
+      "createRecurringWorkoutToSeeHere": "Burada görmek için tekrarlayan antrenman oluşturun.",
+      "workoutDetails": "Antrenman Detayları",
+      "workout": "Antrenman",
+      "day": "Gün",
+      "recurringInterval": "Tekrarlama Aralığı",
+      "selectDaysOfWeek": "Haftanın Günlerini Seç",
+      "selectedDays": "Seçilen Günler",
+      "notifications": "Bildirimler",
+      "enableNotifications": "Bildirimleri Etkinleştir",
+      "notificationTime": "Bildirim Zamanı",
+      "notificationPermissions": "Bildirim İzinleri",
+      "notificationPermissionsRequired": "Bildirimleri etkinleştirmek için izin gereklidir. Lütfen Ayarlar'dan etkinleştirin.",
+      "goToSettings": "Ayarlar'a Git",
+      "creating": "Oluşturuluyor…",
+      "saving": "Kaydediliyor…",
+      "done": "Tamam",
+      "editRecurringWorkout": "Tekrarlayan Antrenmanı Düzenle",
+      "recurringWorkoutNotFound": "Tekrarlayan antrenman bulunamadı.",
+      "errorLoadingRecurringWorkout": "Tekrarlayan antrenman yüklenirken hata oluştu.",
+      "failedToUpdateRecurringWorkout": "Tekrarlayan antrenman güncellenemedi.",
+      "anErrorOccurred": "Bir hata oluştu.",
+      "workoutNotFound": "Antrenman bulunamadı.",
+      "goBack": "Geri Dön",
+      "specificDaysOfWeek": "Haftanın Belirli Günleri",
+      "confirm": "Onayla",
+      "recurringWorkoutDetails": "Tekrarlayan Antrenman Detayları",
+      "Notifications enabled": "Bildirimler etkinleştirildi",
+      "Notificationsdisabled": "Bildirimler devre dışı bırakıldı",
+      "confirmDelete": "Silme Onayı",
+      "confirmDeleteRecurringWorkout": "Bu tekrarlayan antrenmanı silmek istediğinizden emin misiniz?",
+      "edit": "Düzenle",
+      "errorLoadingWorkout": "Antrenman yüklenirken hata oluştu.",
+
+      "_comment_startWorkout": "Bunlar Antrenmanı Başlatma ile ilgili metinlerdir.",
+      "startWorkout": "Antrenmanı Başlat",
+      "invalidRestTime": "Geçersiz Dinlenme Süresi",
+      "pleaseEnterValidSeconds": "Lütfen geçerli bir saniye sayısı girin.",
+      "missingInformation": "Eksik Bilgi",
+      "enterRepsAndWeight": "Devam etmeden önce tekrar ve ağırlık girin.",
+      "exitWorkout": "Antrenmandan Çıkılsın mı?",
+      "exitWorkoutMessage": "Çıkmak istediğinizden emin misiniz? İlerleme kaybolacak.",
+      "exit": "Çık",
+      "workoutCompleted": "Antrenman Tamamlandı!",
+      "dayInterval": "Gün Aralığı:",
+      "totalTime": "Toplam Süre",
+      "setsCompleted": "Tamamlanan Setler",
+      "completeWorkout": "Antrenmanı Bitir",
+      "workoutTime": "Antrenman Süresi",
+      "restTime": "Dinlenme Süresi",
+      "sec": "sn",
+      "addTime": "+15sn",
+      "takeBreath": "Nefes alın ve bir sonraki sete hazırlanın",
+      "upNext": "Sırada",
+      "skipRest": "Dinlenmeyi Atla",
+      "goal": "Hedef",
+      "repsDone": "Tamamlanan Tekrarlar",
+      "weightKgLbs": "Ağırlık (kg/lbs)",
+      "finishWorkout": "Antrenmanı Bitir",
+      "completeSetRest": "Seti Bitir & Dinlen",
+      "workoutSaved": "Antrenman Kaydedildi",
+      "workoutSavedMessage": "Antrenmanınız başarıyla kaydedildi!",
+      "loadingWorkout": "Antrenman yükleniyor…",
+      "exercises": "Egzersizler",
+      "totalSets": "Toplam Set",
+      "restTimeBetweenSets": "Setler Arası Dinlenme (sn)",
+      "restTimeBetweenExercises": "Egzersizler Arası Dinlenme (sn)",
+      "workoutSettings": "Antrenman Ayarları",
+      "vibration": "Titreşim",
+      "_comment_settings1": "Bunlar Ayarlar ile ilgili metinlerdir.",
+      "dataManagement": "Veri Yönetimi",
+      "exportData": "Veriyi Dışa Aktar",
+      "importData": "Veriyi İçe Aktar",
+      "notificationsDisableTitle": "Bildirimleri Devre Dışı Bırak",
+      "notificationsDisableMessage": "Bildirimleri devre dışı bırakmak tüm planlanmış hatırlatmaları iptal eder. Emin misiniz?",
+      "exportFailedTitle": "Dışa Aktarma Başarısız",
+      "databaseNotFound": "Veritabanı dosyası bulunamadı",
+      "sharingNotAvailable": "Bu cihazda paylaşım mevcut değil",
+      "exportDatabaseTitle": "Antrenman Veritabanını Dışa Aktar",
+      "exportErrorMessage": "Veritabanı dışa aktarılamadı",
+      "importConfirmTitle": "Veritabanını İçe Aktar",
+      "importConfirmMessage": "Veritabanı içe aktarma mevcut verilerinizi değiştirecek. Geri alınamaz. Devam?",
+      "importSuccessTitle": "İçe Aktarma Başarılı",
+      "importSuccessMessage": "Veritabanı başarıyla içe aktarıldı. Değişiklikler için uygulamayı yeniden başlatın.",
+      "importFailedTitle": "İçe Aktarma Başarısız",
+      "importErrorMessage": "Veritabanı içe aktarma başarısız",
+      "remindScheduledWorkouts": "Planlanan Antrenmanları Hatırlat",
+
+      "completeSet": "Seti Tamamla",
+      "upcomingSet": "Sıradaki Set",
+      "settingsTimeFormat": "Saat Formatı",
+
+
+
+      
+        "_comment_Graphs": "Bunlar grafiklerle ilgili metinlerdir.",
+        "Graphs": "Grafikler",
+        "SelectWorkoutforGraph": "Grafikler için bir antrenman seçin",
+        "No data available for the selected criteria": "Seçilen ölçütlere uygun veri yok",
+        "Combined Effort Score": "CES (Combined Effort Score)",
+        "About CES": "CES hakkında",
+        "About 1RM": "1RM hakkında",
+        "CESExplanation": "CES (Combined Effort Score), ağırlık, tekrar ve yoğunluğu dikkate alarak toplam antrenman hacminizi ölçer.",
+        "1RMExplanation": "1RM (One Rep Max), performansınıza dayanarak tek bir tekrar için kaldırabileceğiniz maksimum ağırlığı tahmin eder.\n(Bu gerçek 1RM'iniz değildir; bu ağırlık ile antrenman yapmanız durumunda olası yaralanmalardan geliştirici sorumlu değildir.)",
+        "Time Frame": "Zaman Aralığı",
+        "Select Exercise": "Egzersiz seç",
+        "Week": "Hafta",
+        "Estimated 1RM": "Tahmini 1RM",
+        "Month": "Ay",
+        "Year": "Yıl",
+        "All Time": "Tüm Zamanlar",
+        "Select an exercise": "Bir egzersiz seçin",
+        "No exercises available": "Egzersiz bulunmuyor",
+        "Track a workout first to see your progress": "Grafikleri görmek için bir antrenman takip edin.",
+        "No workout data available for graphs": "Grafikler için antrenman verisi yok",
+
+        "workoutReminderTitle": "Antrenman Hatırlatma: {{workoutName}}",
+        "workoutReminderBody": " Bugün {{dayName}} antrenmaınız var!",
+        "Workout in Progress": "Antrenman Devam Ediyor",
+        "Workout in Progress Message": "Antrenmanınızı bitirmeyi unutmayın!",
+
+
+
+        "_comment_GraphsWorkoutDetails": "Bunlar Grafikler-Antrenman Detayları ile ilgili dizelerdir.",
+    "setGraph": "Setler",
+    "Time": "Süre",
+    "completionTime": "Tamamlama Süresi",
+    "horizontalScrollHint": "Daha fazla veri görmek için sağa kaydırın",
+    "weightProgressionBySets": "Setlere Göre Ağırlık İlerlemesi",
+    "About Sets Progression": "Set Grafiği Hakkında",
+    "About Completion Time": "Süre Grafiği Hakkında",
+    "SetsGraph": "Set Grafiği",
+    "TimeGraph": "Süre Grafiği",
+    "timeGraphExplanation": "Bu grafik, antrenman seanslarınızı zaman içinde ne kadar sürede tamamladığınızı gösterir.",
+    "setsGraphExplanation": "Bu grafik, setlerinizin zaman içindeki ilerlemesini gösterir. Her çizgi ve renk farklı bir set numarasını temsil eder ve antrenman seanslarınız boyunca performansınızı izlemenizi sağlar.",
+    "graphTipText": "İpucu: Grafikteki noktalara basarak o antrenman seansı hakkında ek bilgi edinebilirsiniz.",
+
+    "RepsCapital": "Tekrarlar",
+    "settingsFirstWeekday": "Haftanın İlk Günü",
+    "RepsGraph": "Tekrar Grafiği",
+    "About Reps Progression": "Tekrar Grafiği Hakkında",
+    "repsGraphExplanation": "Bu grafik, bireysel setler içinde yaptığınız tekrarları gösterir. Her çizgi ve renk, Set Grafiği'nde olduğu gibi farklı bir seti temsil eder, ancak Y ekseni ağırlıklar yerine tekrarları gösterir. Vücut ağırlığı egzersizlerini takip etmek için mükkemmel!",
+    "Workout Days": "Antrenman Günleri",
+
+
+
+    "workoutDetailsTip": "İpucu: Bir egzersiz hakkında ek bilgi görmek için egzersizin adına dokunabilirsiniz.",
+"webLink": "Web Bağlantısı",
+"webLinkPlaceholder": "https://example.com (isteğe bağlı)",
+"invalidLinkTitle": "Geçersiz Bağlantı",
+"invalidLinkMessage": "Bağlantı \"http://\" veya \"https://\" ile başlamalıdır.",
+"exerciseDetails": "Egzersiz Detayları",
+"fileNotSelectedError": "Dosya seçilmedi veya dosya geçersiz.",
+"workoutAlreadyExistsError": "Bu adla bir antrenman zaten mevcut.",
+"Unspecified": "Belirtilmemiş",
+"Chest": "Göğüs",
+"Back": "Sırt",
+"Shoulders": "Omuz",
+"Biceps": "Ön kol",
+"Triceps": "Arka kol",
+"Forearms": "Bilek",
+"Abs": "Karın",
+"Legs": "Bacak",
+"Glutes": "Kalça", 
+"Hamstrings": "Arka Bacak",
+"Calves": "Kalf",
+"Quads": "Ön Bacak",
+"muscleGroup": "Kas Grubu",
+
+
+
+"Workout Volume": "Antrenman Hacmi",
+"Muscle Distribution": "Kas Dağılımı",
+"Overall Muscle Groups": "Genel Kas Grupları",
+"Muscle Group Volume": "Kas Grubu Hacmi",
+"Workout Stats": "Antrenman\nİstatistikleri",
+"Overall Stats": "Genel\nİstatistikler",
+"About Muscle Distribution": "Kas Dağılımı Hakkında",
+"About Muscle Group Volume": "Kas Grubu Hacmi Hakkında",
+"About Overall Muscle Groups": "Genel Kas Grupları Hakkında",
+"muscleDistributionExplanation": "Bu grafik, antrenmanlarınızdaki kas gruplarının dağılımını gösterir ve hedeflerinize göre değişiklikler yapabilmenizi sağlar.",
+"muscleGroupVolumeExplanation": "Bu grafik, antrenmanlarınızda her kas grubunun belirli bir zaman diliminde kaldırdığı hacmi gösterir ve her kas grubundaki ilerlemenizi takip etmenizi sağlar.",
+"overallMuscleGroupsExplanation": "Bu grafik, antrenmanlarınızda her kas grubunun belirli bir zaman diliminde yaptığı set sayısını gösterir ve her kas grubunu ne kadar çalıştığınızı görmenizi sağlar.",
+"workoutVolumeExplanation": "Bu grafik, antrenmanlarınızın belirli bir zaman dilimindeki günlük hacmini gösterir ve her antrenmanda nasıl performans gösterdiğinizi görmenizi sağlar.",
+"Volume": "Hacim",
+
+
+"duplicateRecurringWorkout": "Zaten mevcut",
+"recurringWorkoutExists": "Bu gün için tekrarlayan bir antrenman zaten mevcut.",
+"skipToNextExercise": "Bir sonraki egzersize atla",
+"enableSetSwitchSound": "Sesi etkinleştir",
+"autoFillWeights": "Ağırlıkları otomatik doldur",
+"autoFillReps": "Tekrarları otomatik doldur",
+"startedWorkoutTip": "İpucu: Egzersizler arasında geçiş yapmak için ekranın sağ üst köşesindeki üç çizgiye basabilirsiniz.",
+
+"completing": "Tamamlanıyor",
+"Day Volume": "Gün Hacmi",
+"About Day Volume": " Gün Hacmi Hakkında",
+"dayVolumeExplanation": "Bu grafik, belirli bir zaman diliminde spesifik bir antrenman gününü baz alarak o günün antrenman hacmini gösterir ve o antrenman gününü izole olarak takip etmenizi sağlar.",
+"workoutDeleteTip": "İpucu: Bir antrenmanı silmek için ona basılı tutun.",
+"DeleteWorkoutTitle": "Antrenmanı Sil",
+"DeleteWorkoutMessage": "Bu antrenmanı silmek istediğinizden emin misiniz? Bu antrenman kayıtlıysa, bu işlem aynı zamanda ilişkili kayıtları da siler.",
+"Community": "Topluluk",
+
+"logWeightsError": "Lütfen tüm alanları doldurun ve değerlerin sıfırdan farklı olduğundan emin olun.",
+"logWeightsTipText": "Set numarasına basılı tutarak egzersizlerden istediğiniz seti silebilirsiniz.",
+"exerciseNotes": "Notlar",
+"exerciseNotesPlaceholder": "Egzersiz notları (isteğe bağlı)",
+"quickWorkout": "Hızlı Antrenman",
+"useLogsForRepsTitle": "Önceki tekrarları kullan",
+"lastWorkoutInfo": "Önceki antrenman",
+
+
+
+    "editExerciseLog": "Egzersiz kaydını düzenle",
+    "editExerciseTipText": "İpucu: Egzersiz kayıtlarını egzersizlerin üzerine tıklayarak düzenleyebilirsiniz.",
+    "savingError": "Kaydetme Hatası",
+    "weightsValidationError": "Ağırlıklar 0'dan büyük olmalıdır."
+
+
+            
+        
+    
+    
+
+
+
+
+
+
+
+
+
+
+    
+    
+  }
+  
