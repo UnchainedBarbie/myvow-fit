@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
   View,
   Text,
@@ -198,6 +198,80 @@ export default function Nutrition() {
   const [scannerVisible, setScannerVisible] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
+  const [weeklyGrocery, setWeeklyGrocery] = useState<GroceryItem[]>([]);
+  const [weeklyPrep, setWeeklyPrep] = useState<{ plan_name: string; text: string }[]>([]);
+
+  const loadWeeklyAggregates = useCallback(async () => {
+    try {
+      // Determine all active plans for this week from DayActivePlan
+      const weekDates = [0, 1, 2, 3, 4, 5, 6].map((i) =>
+        addDaysIso(weekStart, i),
+      );
+      const activeRows = await db.getAllAsync<{ meal_plan_id: number }>(
+        `SELECT DISTINCT meal_plan_id FROM DayActivePlan WHERE date IN (?, ?, ?, ?, ?, ?, ?)`,
+        weekDates,
+      );
+      const activeIds = new Set(activeRows.map((r) => r.meal_plan_id));
+      const activePlans = mealPlans.filter((p) =>
+        activeIds.has(p.meal_plan_id),
+      );
+
+      // Aggregate grocery items across active plans
+      const items: GroceryItem[] = [];
+      activePlans.forEach((p) => {
+        if (!p.grocery_list) return;
+        try {
+          const parsed = JSON.parse(p.grocery_list);
+          if (Array.isArray(parsed)) {
+            parsed.forEach((entry: any, index: number) => {
+              const text = (entry.item ?? entry.text ?? '').trim();
+              if (!text) return;
+              const category = (entry.category || 'Other').trim() as GroceryItem['category'];
+              items.push({
+                id: `${p.meal_plan_id}_${index}_${text}`,
+                text,
+                category:
+                  category === 'Produce' ||
+                  category === 'Protein' ||
+                  category === 'Dairy' ||
+                  category === 'Pantry' ||
+                  category === 'Other'
+                    ? category
+                    : 'Other',
+                checked: false,
+              });
+            });
+          }
+        } catch {
+          // ignore malformed JSON for now
+        }
+      });
+
+      // De-duplicate by category+text
+      const seen = new Set<string>();
+      const unique = items.filter((it) => {
+        const key = `${it.category}|${it.text}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      setWeeklyGrocery(unique);
+
+      // Aggregate prep guides
+      const prepBlocks: { plan_name: string; text: string }[] = [];
+      activePlans.forEach((p) => {
+        if (p.prep_guide && p.prep_guide.trim()) {
+          prepBlocks.push({ plan_name: p.plan_name, text: p.prep_guide.trim() });
+        }
+      });
+      setWeeklyPrep(prepBlocks);
+    } catch (e) {
+      console.error('Error loading weekly grocery/prep aggregates:', e);
+      setWeeklyGrocery([]);
+      setWeeklyPrep([]);
+    }
+  }, [db, mealPlans, weekStart]);
+
   const [quantityModalVisible, setQuantityModalVisible] = useState(false);
   const [selectedFood, setSelectedFood] = useState<{
     name: string;
@@ -355,6 +429,12 @@ export default function Nutrition() {
       loadLoggedFoodsForDate(selectedDate);
     }
   }, [activeTab, selectedDate]);
+
+  useEffect(() => {
+    if (activeTab === 'plans') {
+      loadWeeklyAggregates();
+    }
+  }, [activeTab, loadWeeklyAggregates]);
 
   const categorizeFood = (name: string): GroceryItem['category'] => {
     const n = name.toLowerCase();
@@ -1593,6 +1673,104 @@ export default function Nutrition() {
             )}
             ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
           />
+        )}
+
+        <View style={[styles.mealPlansHeaderRow, { marginTop: 24 }]}>
+          <Text style={[styles.mealPlansTitle, { color: theme.text }]}>
+            Weekly Grocery List
+          </Text>
+        </View>
+        {weeklyGrocery.length === 0 ? (
+          <Text style={[styles.emptyPlansText, { color: theme.textSecondary }]}>
+            Activate meal plans on this week to build a combined grocery list.
+          </Text>
+        ) : (
+          <View
+            style={[
+              styles.planCard,
+              { borderColor: theme.border, backgroundColor: theme.card },
+            ]}
+          >
+            {(['Produce', 'Protein', 'Dairy', 'Pantry', 'Other'] as const).map(
+              (cat) => {
+                const catItems = weeklyGrocery.filter(
+                  (it) => it.category === cat,
+                );
+                if (!catItems.length) return null;
+                return (
+                  <View key={cat} style={{ marginBottom: 8 }}>
+                    <Text
+                      style={{
+                        fontSize: 13,
+                        fontWeight: '700',
+                        color: theme.text,
+                        marginBottom: 2,
+                      }}
+                    >
+                      {cat}:
+                    </Text>
+                    {catItems.map((it) => (
+                      <Text
+                        key={it.id}
+                        style={{
+                          fontSize: 13,
+                          color: theme.textSecondary,
+                          marginLeft: 8,
+                        }}
+                      >
+                        • {it.text}
+                      </Text>
+                    ))}
+                  </View>
+                );
+              },
+            )}
+          </View>
+        )}
+
+        <View style={[styles.mealPlansHeaderRow, { marginTop: 24 }]}>
+          <Text style={[styles.mealPlansTitle, { color: theme.text }]}>
+            Weekly Meal Prep Guide
+          </Text>
+        </View>
+        {weeklyPrep.length === 0 ? (
+          <Text style={[styles.emptyPlansText, { color: theme.textSecondary }]}>
+            Generate prep guides for active plans to see a combined weekly prep.
+          </Text>
+        ) : (
+          <View
+            style={[
+              styles.planCard,
+              { borderColor: theme.border, backgroundColor: theme.card },
+            ]}
+          >
+            {weeklyPrep.map((block, idx) => (
+              <View key={`${block.plan_name}-${idx}`} style={{ marginBottom: 12 }}>
+                <Text
+                  style={{
+                    fontSize: 13,
+                    fontWeight: '700',
+                    color: theme.text,
+                    marginBottom: 4,
+                  }}
+                >
+                  {block.plan_name}
+                </Text>
+                {block.text.split(/\r?\n/).map((line, i) => (
+                  <Text
+                    key={i}
+                    style={{
+                      fontSize: 12,
+                      color: theme.textSecondary,
+                      marginLeft: 8,
+                    }}
+                  >
+                    {line}
+                  </Text>
+                ))}
+              </View>
+            ))}
+          </View>
         )}
       </View>
     );

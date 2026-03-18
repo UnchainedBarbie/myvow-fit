@@ -343,6 +343,22 @@ export default function MealPlanDetail() {
             try {
               console.log('[SetAsActive] Step 0: today =', today, 'plan_id =', plan.meal_plan_id);
 
+              // Step 0.5: Mark this plan as active for this whole week (Mon–Sun) in DayActivePlan
+              const base = new Date(today + 'T12:00:00');
+              const day = base.getDay(); // 0=Sun,1=Mon
+              const mondayOffset = day === 0 ? -6 : 1 - day;
+              const monday = new Date(base);
+              monday.setDate(base.getDate() + mondayOffset);
+              for (let i = 0; i < 7; i++) {
+                const d = new Date(monday);
+                d.setDate(monday.getDate() + i);
+                const iso = d.toISOString().slice(0, 10);
+                await db.runAsync(
+                  'INSERT OR IGNORE INTO DayActivePlan (date, meal_plan_id) VALUES (?, ?)',
+                  [iso, plan.meal_plan_id],
+                );
+              }
+
               // Step 1: INSERT OR IGNORE into DailyLog
               await db.runAsync(
                 'INSERT OR IGNORE INTO DailyLog (log_date, meal_plan_id) VALUES (?, ?)',
@@ -498,133 +514,7 @@ export default function MealPlanDetail() {
         <Text style={styles.setActiveBtnText}>Set as Active</Text>
       </TouchableOpacity>
 
-      <View style={[styles.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
-        <TouchableOpacity style={styles.collapseHeader} onPress={() => setGroceryExpanded((e) => !e)} activeOpacity={0.7}>
-          <Text style={[styles.sectionTitleCollapse, { color: theme.text }]}>Grocery list</Text>
-          <Ionicons name={groceryExpanded ? 'chevron-up' : 'chevron-down'} size={22} color={theme.text} />
-        </TouchableOpacity>
-        {groceryExpanded && (
-          <>
-            {(() => {
-              const cleanList = formatGroceryListForDisplay(groceryList);
-              const groceryLines = cleanList ? cleanList.split(/\n/).filter(Boolean) : [];
-              return groceryLines.length > 0 ? (
-                <View style={styles.groceryListBlock}>
-                  {groceryLines.map((line, idx) => {
-                    const isHeader = line.endsWith(':');
-                    if (isHeader) {
-                      return (
-                        <Text key={idx} style={[styles.groceryLine, { color: theme.text }, styles.groceryCategory, idx > 0 && { marginTop: 12 }]}>
-                          {line}
-                        </Text>
-                      );
-                    }
-                    return (
-                      <TouchableOpacity
-                        key={idx}
-                        style={styles.prepLine}
-                        onPress={() => setGroceryChecked((prev) => { const n = new Set(prev); if (n.has(idx)) n.delete(idx); else n.add(idx); return n; })}
-                        activeOpacity={0.7}
-                      >
-                        <Ionicons name={groceryChecked.has(idx) ? 'checkbox' : 'ellipse-outline'} size={22} color={theme.text} style={{ marginRight: 10 }} />
-                        <Text style={[styles.prepLineText, { color: theme.text }, groceryChecked.has(idx) && styles.prepLineDone]}>
-                          {line}
-                        </Text>
-                      </TouchableOpacity>
-                    );
-                  })}
-                </View>
-              ) : (
-                <Text style={[styles.emptyHint, { color: theme.textSecondary }]}>No grocery list yet. Tap Generate to create one from this plan's meals.</Text>
-              );
-            })()}
-            <View style={styles.sectionActions}>
-              {formatGroceryListForDisplay(groceryList) ? (
-                <TouchableOpacity style={[styles.iconBtn, { backgroundColor: theme.background, borderColor: theme.border }]} onPress={async () => {
-                  const cleanList = formatGroceryListForDisplay(groceryList);
-                  if (cleanList) {
-                    try { await Share.share({ message: cleanList, title: `${name} – Grocery list` }); } catch (_) {}
-                  }
-                }}>
-                  <Ionicons name="share-outline" size={20} color={theme.text} />
-                  <Text style={[styles.iconBtnText, { color: theme.text }]}>Share list</Text>
-                </TouchableOpacity>
-              ) : null}
-              <TouchableOpacity
-                style={[styles.iconBtn, { backgroundColor: theme.background, borderColor: theme.border }]}
-                onPress={async () => {
-                  if (!meal_plan_id) return;
-                  try {
-                    await generateGroceryListFromPlan(db, meal_plan_id);
-                    await loadPlanDetails();
-                  } catch (e) {
-                    Alert.alert('Error', e instanceof Error ? e.message : 'Could not generate grocery list.');
-                  }
-                }}
-              >
-                <Ionicons name={formatGroceryListForDisplay(groceryList) ? 'refresh-outline' : 'add-circle-outline'} size={20} color={theme.text} />
-                <Text style={[styles.iconBtnText, { color: theme.text }]}>{formatGroceryListForDisplay(groceryList) ? 'Regenerate' : 'Generate'}</Text>
-              </TouchableOpacity>
-            </View>
-          </>
-        )}
-      </View>
-
-      <View style={[styles.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
-        <TouchableOpacity style={styles.collapseHeader} onPress={() => setPrepExpanded((e) => !e)} activeOpacity={0.7}>
-          <Text style={[styles.sectionTitleCollapse, { color: theme.text }]}>Prep guide</Text>
-          <Ionicons name={prepExpanded ? 'chevron-up' : 'chevron-down'} size={22} color={theme.text} />
-        </TouchableOpacity>
-        {prepExpanded && (
-          <>
-            {prepGuide && prepGuide.trim() ? (
-              <View>
-                {(prepGuide.trim().split(/\r?\n/).filter(Boolean).map((line, idx) => (
-                  <TouchableOpacity
-                    key={idx}
-                    style={styles.prepLine}
-                    onPress={() => setPrepChecked((prev) => { const n = new Set(prev); if (n.has(idx)) n.delete(idx); else n.add(idx); return n; })}
-                    activeOpacity={0.7}
-                  >
-                    <Ionicons name={prepChecked.has(idx) ? 'checkbox' : 'ellipse-outline'} size={22} color={theme.text} style={{ marginRight: 10 }} />
-                    <Text style={[styles.prepLineText, { color: theme.text }, prepChecked.has(idx) && styles.prepLineDone]}>{line}</Text>
-                  </TouchableOpacity>
-                )))}
-              </View>
-            ) : (
-              <Text style={[styles.emptyHint, { color: theme.textSecondary }]}>No prep guide yet. Tap Generate to create one.</Text>
-            )}
-            <View style={styles.sectionActions}>
-              {prepGuide && prepGuide.trim() ? (
-                <TouchableOpacity
-                  style={[styles.iconBtn, { backgroundColor: theme.background, borderColor: theme.border }]}
-                  onPress={async () => {
-                    try { await Share.share({ message: prepGuide.trim(), title: `${name} – Prep guide` }); } catch (_) {}
-                  }}
-                >
-                  <Ionicons name="share-outline" size={20} color={theme.text} />
-                  <Text style={[styles.iconBtnText, { color: theme.text }]}>Share</Text>
-                </TouchableOpacity>
-              ) : null}
-              <TouchableOpacity
-                style={[styles.iconBtn, { backgroundColor: theme.background, borderColor: theme.border }]}
-                onPress={async () => {
-                  if (!meal_plan_id) return;
-                  try {
-                    await generatePrepGuideFromPlan(db, meal_plan_id);
-                    await loadPlanDetails();
-                  } catch (e) {
-                    Alert.alert('Error', e instanceof Error ? e.message : 'Could not generate prep guide.');
-                  }
-                }}
-              >
-                <Ionicons name={prepGuide && prepGuide.trim() ? 'refresh-outline' : 'add-circle-outline'} size={20} color={theme.text} />
-                <Text style={[styles.iconBtnText, { color: theme.text }]}>{prepGuide && prepGuide.trim() ? 'Regenerate' : 'Generate'}</Text>
-              </TouchableOpacity>
-            </View>
-          </>
-        )}
-      </View>
+      {/* Per-plan grocery list and prep guide UI moved to combined weekly view in Meal Plans tab */}
     </ScrollView>
   );
 }
