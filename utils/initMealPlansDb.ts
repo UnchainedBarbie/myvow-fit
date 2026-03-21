@@ -1,10 +1,13 @@
 /**
  * Meal plans and schedule tables. Call from Nutrition screens (under SQLiteProvider).
  */
+let initialized = false;
+
 export const initMealPlansDb = async (db: {
   runAsync: (sql: string, params?: any[]) => Promise<void>;
   getAllAsync: (sql: string, params?: any[]) => Promise<any[]>;
 }) => {
+  if (initialized) return;
   try {
     await db.runAsync(`
       CREATE TABLE IF NOT EXISTS MealPlans (
@@ -18,6 +21,16 @@ export const initMealPlansDb = async (db: {
     } catch (_) {
       // Column may already exist
     }
+    // Create early so later statements cannot leave us without this table if they throw.
+    await db.runAsync(`
+      CREATE TABLE IF NOT EXISTS DayActivePlan (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        meal_plan_id INTEGER NOT NULL,
+        UNIQUE(date, meal_plan_id),
+        FOREIGN KEY (meal_plan_id) REFERENCES MealPlans(meal_plan_id) ON DELETE CASCADE
+      );
+    `);
     await db.runAsync(`
       CREATE TABLE IF NOT EXISTS MealPlanSchedule (
         schedule_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,15 +59,6 @@ export const initMealPlansDb = async (db: {
         FOREIGN KEY (meal_plan_id) REFERENCES MealPlans(meal_plan_id)
       );
     `);
-    await db.runAsync(`
-      CREATE TABLE IF NOT EXISTS DayActivePlan (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL,
-        meal_plan_id INTEGER NOT NULL,
-        UNIQUE(date, meal_plan_id),
-        FOREIGN KEY (meal_plan_id) REFERENCES MealPlans(meal_plan_id) ON DELETE CASCADE
-      );
-    `);
 
     await db.runAsync(`
       CREATE TABLE IF NOT EXISTS LoggedFoods (
@@ -71,6 +75,7 @@ export const initMealPlansDb = async (db: {
         fat REAL DEFAULT 0
       );
     `);
+    initialized = true;
   } catch (error) {
     console.error('initMealPlansDb error:', error);
   }

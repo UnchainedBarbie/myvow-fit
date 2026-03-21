@@ -106,22 +106,17 @@ function validateAndNormalize(data: unknown): AIWorkout {
 }
 
 export async function generateWorkoutWithAI(
-  apiKey: string,
   userDescription: string
 ): Promise<AIWorkout> {
   console.log('generateWorkoutWithAI called');
-  const trimmedKey = apiKey.trim();
-  if (!trimmedKey) throw new Error('API key is required');
   const trimmedDesc = userDescription.trim();
   if (!trimmedDesc) throw new Error('Please describe the workout you want');
 
-  console.log('Calling Anthropic API...');
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  console.log('Calling MyVow Fit AI API...');
+  const response = await fetch('https://myvow-fit-api.allison-spink.workers.dev', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': trimmedKey,
-      'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-5',
@@ -190,7 +185,7 @@ export async function insertAIWorkout(db: { withTransactionAsync: (fn: () => Pro
       workoutId = workoutIdResult[0].workout_id;
     }
 
-    for (const day of workout.days) {
+    for (const [index, day] of workout.days.entries()) {
       await db.runAsync('INSERT INTO Days (workout_id, day_name) VALUES (?, ?);', [workoutId, day.day_name]);
       const dayIdResult = (await db.getAllAsync<{ day_id: number }>('SELECT last_insert_rowid() as day_id;'));
       if (!dayIdResult.length) throw new Error('Failed to retrieve day ID.');

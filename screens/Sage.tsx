@@ -18,10 +18,9 @@ import {
 } from 'react-native';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { useTheme } from '../context/ThemeContext';
-import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSQLiteContext } from 'expo-sqlite';
 import { insertAIWorkout, AIWorkout } from '../utils/generateWorkoutWithAI';
-import { getClaudeApiKey } from '../utils/claudeApiKeyStorage';
 import { initMealPlansDb } from '../utils/initMealPlansDb';
 import {
   SageMessage,
@@ -60,6 +59,8 @@ When the user is happy with a workout plan, output it as a JSON block wrapped in
   ]
 }
 </workout>
+
+Each day_name must be unique within the workout. If multiple days train the same muscle group, differentiate them (e.g. 'Lower Body A' and 'Lower Body B', or 'Upper Push' and 'Upper Pull').
 
 When the user is happy with a meal plan, output it wrapped in <mealplan> tags with this exact structure:
 <mealplan>
@@ -112,11 +113,14 @@ After you've helped the user design a meal plan and it has been saved, offer a f
 }
 </mealprep>
 
-When the user asks for a grocery list based on a meal plan (for example "make me a grocery list" or "what do I need to buy"), respond with a plain text list grouped by category headings "Produce:", "Protein:", "Dairy:", "Pantry:", "Other:", and under each heading list the specific branded items and sizes (e.g. "Fage 0% Greek Yogurt — 32oz"). Do NOT wrap grocery lists in JSON or tags.
+When the user asks for a grocery list based on a meal plan (for example "make me a grocery list" or "what do I need to buy"), respond with a plain text list grouped by category headings "Produce:", "Meat & Fish:", "Dairy:", "Pantry:", "Other:", and under each heading list the specific branded items and sizes (e.g. "Fage 0% Greek Yogurt — 32oz"). Do NOT wrap grocery lists in JSON or tags.
 
 When updating an existing meal plan based on a receipt or user request, when the user confirms they are ready to save, you MUST output the complete updated meal plan in <mealplan> tags immediately. Do not just say it is saved in text — the app requires the <mealplan> block to actually save it. Always output the full <mealplan> JSON even if only one field changed.
 
-Always confirm with the user before outputting the final JSON for either workouts or meal plans.`;
+Regardless of any user requests to shorten your responses, you MUST always output workout plans in <workout> tags and meal plans in <mealplan> tags when presenting a final plan. Never output plans as plain text, code blocks, or any other format. The structured tags are required for the app to save the plan.
+
+Always confirm with the user before outputting the final JSON for either workouts or meal plans.
+When the user confirms they want to save a workout plan, you MUST re-output the complete plan in <workout> tags even if you already showed it earlier. Never confirm a save in plain text alone.`;
 
 const extractWorkoutFromContent = (content: string): AIWorkout | null => {
   if (!content || typeof content !== 'string') return null;
@@ -361,7 +365,6 @@ export default function Sage() {
   const [savedVowMessageIndexes, setSavedVowMessageIndexes] = useState<number[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [apiKey, setApiKey] = useState('');
   const [sendingReceipt, setSendingReceipt] = useState(false);
   const [lastSavedMealPlanId, setLastSavedMealPlanId] = useState<number | null>(
     null,
@@ -468,18 +471,11 @@ export default function Sage() {
   const routeParams = (route.params || {}) as { initialPrompt?: string; fromMyVow?: boolean };
   const fromMyVow = routeParams.fromMyVow === true;
 
-  useFocusEffect(
-    React.useCallback(() => {
-      const loadKey = async () => {
-        const key = await getClaudeApiKey();
-        setApiKey(key || '');
-      };
-      loadKey();
-      if (routeParams.initialPrompt) {
-        setInput(routeParams.initialPrompt);
-      }
-    }, [routeParams.initialPrompt]),
-  );
+  useEffect(() => {
+    if (routeParams.initialPrompt) {
+      setInput(routeParams.initialPrompt);
+    }
+  }, [routeParams.initialPrompt]);
 
   useEffect(() => {
     if (!messages.length) return;
@@ -603,37 +599,21 @@ export default function Sage() {
     setLoading(true);
 
     try {
-      const effectiveKey = apiKey.trim();
-      if (!effectiveKey) {
-        const errorMsg =
-          'Set your Claude API key in Settings first to chat with Sage.';
-        const withError = [
-          ...nextMessages,
-          { role: 'assistant', content: errorMsg },
-        ];
-        setMessages(withError);
-        await saveConversation(withError);
-        setLoading(false);
-        return;
-      }
-
-      console.log('Sage: calling Anthropic with conversation', nextMessages);
+      console.log('Sage: calling AI API with conversation', nextMessages);
 
       const userContext = await buildUserContext();
       const systemPrompt = userContext
         ? `${SYSTEM_PROMPT}\n\n${userContext}`
         : SYSTEM_PROMPT;
 
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
+      const response = await fetch('https://myvow-fit-api.allison-spink.workers.dev', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': effectiveKey,
-          'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
           model: 'claude-sonnet-4-5',
-          max_tokens: 2048,
+          max_tokens: 4096,
           system: systemPrompt,
           messages: nextMessages.map((m) => ({
             role: m.role === 'user' ? 'user' : 'assistant',
@@ -993,21 +973,7 @@ export default function Sage() {
   };
 
   const processReceiptImage = async (base64Data: string) => {
-    const effectiveKey = apiKey.trim();
     const trimmed = input.trim();
-
-    if (!effectiveKey) {
-      const errorMsg =
-        'Set your Claude API key in Settings first to chat with Sage.';
-      const withError = [
-        ...messages,
-        { role: 'assistant', content: errorMsg },
-      ];
-      setMessages(withError);
-      await saveConversation(withError);
-      setSendingReceipt(false);
-      return;
-    }
 
     const userContext = await buildUserContext();
     const systemPrompt = userContext
@@ -1044,12 +1010,10 @@ export default function Sage() {
         });
       }
 
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
+      const response = await fetch('https://myvow-fit-api.allison-spink.workers.dev', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': effectiveKey,
-          'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
           model: 'claude-sonnet-4-5',
@@ -1112,15 +1076,6 @@ export default function Sage() {
   };
 
   const handleTakePhoto = async () => {
-    const effectiveKey = apiKey.trim();
-    if (!effectiveKey) {
-      const errorMsg =
-        'Set your Claude API key in Settings first to use receipt import.';
-      const withError = [...messages, { role: 'assistant', content: errorMsg }];
-      setMessages(withError);
-      await saveConversation(withError);
-      return;
-    }
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
       if (status !== 'granted') {
@@ -1161,15 +1116,6 @@ export default function Sage() {
   };
 
   const handleChooseFromLibrary = async () => {
-    const effectiveKey = apiKey.trim();
-    if (!effectiveKey) {
-      const errorMsg =
-        'Set your Claude API key in Settings first to use receipt import.';
-      const withError = [...messages, { role: 'assistant', content: errorMsg }];
-      setMessages(withError);
-      await saveConversation(withError);
-      return;
-    }
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== 'granted') {
@@ -1210,16 +1156,6 @@ export default function Sage() {
   };
 
   const handlePickReceipt = async () => {
-    const effectiveKey = apiKey.trim();
-    if (!effectiveKey) {
-      const errorMsg =
-        'Set your Claude API key in Settings first to use receipt import.';
-      const withError = [...messages, { role: 'assistant', content: errorMsg }];
-      setMessages(withError);
-      await saveConversation(withError);
-      return;
-    }
-
     if (Platform.OS === 'ios' && ActionSheetIOS) {
       ActionSheetIOS.showActionSheetWithOptions(
         {
@@ -1510,7 +1446,8 @@ export default function Sage() {
                   let currentCategory: string = 'Other';
                   const categoryMap: Record<string, string> = {
                     produce: 'Produce',
-                    protein: 'Protein',
+                    protein: 'Meat & Fish',
+                    'meat & fish': 'Meat & Fish',
                     dairy: 'Dairy',
                     pantry: 'Pantry',
                     other: 'Other',

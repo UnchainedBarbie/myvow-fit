@@ -1,7 +1,7 @@
 /**
  * Meal plan detail: name, Schedule section (day chips + quick options), Set as Active.
  */
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -23,6 +23,13 @@ import {
   ALTERNATING_A_DAYS,
   ALTERNATING_B_DAYS,
 } from '../utils/initMealPlansDb';
+// Grocery/prep food categories use keyword lookup in utils/generateMealPlanGroceryAndPrep.ts
+import {
+  generateGroceryListFromPlan,
+  generatePrepGuideFromPlan,
+} from '../utils/generateMealPlanGroceryAndPrep';
+import { initNutritionDb } from '../utils/nutritionDb';
+import * as Clipboard from 'expo-clipboard';
 
 const SAGE = '#7C9A7E';
 const DAYS: DayOfWeek[] = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
@@ -56,12 +63,13 @@ function formatGroceryListForDisplay(raw: string | null): string {
     for (const entry of parsed) {
       const text = entry.item ?? entry.text ?? String(entry).trim();
       if (!text) continue;
-      const cat = (entry.category || 'Other').trim();
+      let cat = (entry.category || 'Other').trim();
+      if (cat === 'Protein') cat = 'Meat & Fish';
       if (!byCategory[cat]) byCategory[cat] = [];
       byCategory[cat].push(text);
     }
     const lines: string[] = [];
-    const order = ['Produce', 'Protein', 'Dairy', 'Pantry', 'Other'];
+    const order = ['Produce', 'Meat & Fish', 'Dairy', 'Pantry', 'Other'];
     const seen = new Set<string>();
     for (const cat of order) {
       if (byCategory[cat]?.length) {
@@ -93,134 +101,165 @@ function formatGroceryListForDisplay(raw: string | null): string {
 
 type RouteParams = { meal_plan_id: number; name: string };
 
-/** Map categorizeFood result to grocery list category labels. */
-function groceryCategoryFromFood(foodName: string): string {
-  const kind = categorizeFood(foodName);
-  const map: Record<string, string> = { grain: 'Pantry', protein: 'Protein', produce: 'Produce', dairy: 'Dairy', other: 'Other' };
-  return map[kind] ?? 'Other';
+type PlanFood = {
+  food_name: string;
+  brand: string | null;
+  serving_size: string | null;
+  calories: number;
+  protein: number;
+  carbs: number;
+  fat: number;
+};
+
+type PlanMeal = {
+  meal_id: number;
+  meal_name: string;
+  meal_type: string;
+  meal_order?: number | null;
+  foods: PlanFood[];
+};
+
+/** Readable schedule line for share/copy (expanded day keys). */
+function scheduleDaysToSummary(days: Set<string>): string {
+  if (days.size === 0) return 'Not set';
+  const labels = DAYS.filter((d) => days.has(d)).map((d) => DAY_LABELS[d]);
+  if (labels.length === 7) return 'Every day';
+  if (labels.length === 0) return 'Not set';
+  return labels.join(', ');
 }
 
-/** Generate grocery list from plan's PlannedMeals + FoodItems (or MealPlanItems fallback) and save to DB. */
-async function generateGroceryListFromPlan(
-  db: { getAllAsync: (sql: string, params?: any[]) => Promise<any[]>; runAsync: (sql: string, params?: any[]) => Promise<void> },
-  planId: number
-): Promise<void> {
-  let rows: { meal_type: string; food_name: string; brand?: string | null; serving_size?: string | null }[] = await db.getAllAsync(
-    `SELECT pm.meal_type, fi.food_name, fi.brand, fi.serving_size
-     FROM PlannedMeals pm
-     JOIN FoodItems fi ON fi.meal_id = pm.meal_id
-     WHERE pm.meal_plan_id = ?
-     ORDER BY pm.meal_order, fi.food_id`,
-    [planId]
-  ).catch(() => []);
-  if (rows.length === 0) {
-    const fallback = await db.getAllAsync<{ meal_type: string | null; food_name: string }>(
-      'SELECT meal_type, food_name FROM MealPlanItems WHERE meal_plan_id = ? ORDER BY sort_order, item_id',
-      [planId]
-    ).catch(() => []);
-    rows = fallback.map((r) => ({ meal_type: r.meal_type || 'Other', food_name: r.food_name }));
+/** Plain-text meal plan for sharing or clipboard. */
+function formatMealPlanShareText(planName: string, meals: PlanMeal[], scheduleSummary: string): string {
+  const lines: string[] = [`Meal plan: ${planName}`, ''];
+  lines.push(`Schedule: ${scheduleSummary}`);
+  lines.push('');
+  if (meals.length === 0) {
+    lines.push('(No meals in this plan yet.)');
+    return lines.join('\n').trim();
   }
-  const seen = new Set<string>();
-  const byCategory: Record<string, string[]> = { Produce: [], Protein: [], Dairy: [], Pantry: [], Other: [] };
-  for (const r of rows) {
-    const item = r.food_name + (r.serving_size ? ` — ${r.serving_size}` : '');
-    if (seen.has(item)) continue;
-    seen.add(item);
-    const cat = groceryCategoryFromFood(r.food_name);
-    if (byCategory[cat]) byCategory[cat].push(item);
-    else byCategory['Other'].push(item);
+  for (const meal of meals) {
+    const mealCals = meal.foods.reduce((sum, f) => sum + (f.calories ?? 0), 0);
+    const mealP = meal.foods.reduce((sum, f) => sum + (f.protein ?? 0), 0);
+    const mealC = meal.foods.reduce((sum, f) => sum + (f.carbs ?? 0), 0);
+    const mealF = meal.foods.reduce((sum, f) => sum + (f.fat ?? 0), 0);
+    lines.push(meal.meal_name);
+    lines.push(
+      `  Meal totals: ${Math.round(mealCals)} cal · P ${Math.round(mealP * 10) / 10}g · C ${Math.round(mealC * 10) / 10}g · F ${Math.round(mealF * 10) / 10}g`,
+    );
+    if (meal.foods.length === 0) {
+      lines.push('  (No foods listed.)');
+    } else {
+      for (const food of meal.foods) {
+        let line = `  • ${food.food_name}`;
+        if (food.brand?.trim()) line += ` — ${food.brand.trim()}`;
+        if (food.serving_size?.trim()) line += ` — ${food.serving_size.trim()}`;
+        line += ` — ${Math.round(food.calories)} cal`;
+        if (food.protein || food.carbs || food.fat) {
+          line += ` (P ${food.protein}g / C ${food.carbs}g / F ${food.fat}g)`;
+        }
+        lines.push(line);
+      }
+    }
+    lines.push('');
   }
-  const list: { category: string; item: string; checked: boolean }[] = [];
-  for (const cat of ['Produce', 'Protein', 'Dairy', 'Pantry', 'Other']) {
-    for (const item of byCategory[cat]) list.push({ category: cat, item, checked: false });
-  }
-  await db.runAsync('UPDATE MealPlans SET grocery_list = ? WHERE meal_plan_id = ?', [JSON.stringify(list), planId]);
+  return lines.join('\n').trim();
 }
 
-const GRAIN_WORDS = /rice|pasta|quinoa|oats?|bread|noodle|couscous|barley|bulgur|farro|potato|sweet potato/i;
-const PROTEIN_WORDS = /chicken|beef|pork|fish|salmon|tuna|turkey|egg|tofu|tempeh|beans?|lentil|shrimp/i;
-const PRODUCE_WORDS = /broccoli|spinach|kale|lettuce|tomato|carrot|onion|pepper|apple|banana|berry|berries|orange|avocado|celery|cucumber|zucchini|squash|green bean|pea|fruit|vegetable|salad/i;
-const DAIRY_WORDS = /milk|yogurt|cheese|cottage cheese|cream/i;
+const MEAL_TYPE_ORDER: Record<string, number> = {
+  breakfast: 0,
+  snack: 1,
+  lunch: 2,
+  dinner: 3,
+  other: 4,
+};
 
-function categorizeFood(name: string): 'grain' | 'protein' | 'produce' | 'dairy' | 'other' {
-  const n = name.toLowerCase();
-  if (GRAIN_WORDS.test(n)) return 'grain';
-  if (PROTEIN_WORDS.test(n)) return 'protein';
-  if (PRODUCE_WORDS.test(n)) return 'produce';
-  if (DAIRY_WORDS.test(n)) return 'dairy';
+function normalizeMealType(raw: string | null | undefined): string {
+  const t = (raw || 'snack').toLowerCase().trim();
+  if (t === 'breakfast' || t === 'lunch' || t === 'dinner' || t === 'snack') return t;
   return 'other';
 }
 
-/** Generate step-by-step meal prep guide from plan's meals and foods (or MealPlanItems fallback) and save to DB. */
-async function generatePrepGuideFromPlan(
-  db: { getAllAsync: (sql: string, params?: any[]) => Promise<any[]>; runAsync: (sql: string, params?: any[]) => Promise<void> },
-  planId: number
+function mealTypeSortKey(mealType: string): number {
+  return MEAL_TYPE_ORDER[normalizeMealType(mealType)] ?? MEAL_TYPE_ORDER.other;
+}
+
+function mealTypeSectionLabel(mealType: string): string {
+  const t = normalizeMealType(mealType);
+  if (t === 'other') return 'OTHER';
+  return t.toUpperCase();
+}
+
+/** Match loadSchedule: expand alternating_* rows into mon–sun keys used by Set as Active + DayActivePlan. */
+function expandMealPlanScheduleToWeekdayKeys(
+  rows: { day_of_week: string }[],
+): Set<string> {
+  const out = new Set<string>();
+  for (const r of rows) {
+    const v = r.day_of_week.toLowerCase().trim();
+    if (v === 'alternating_a') {
+      ALTERNATING_A_DAYS.forEach((d) => out.add(d));
+    } else if (v === 'alternating_b') {
+      ALTERNATING_B_DAYS.forEach((d) => out.add(d));
+    } else {
+      out.add(v);
+    }
+  }
+  return out;
+}
+
+const CAL_WEEKDAY_KEYS: ('sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat')[] = [
+  'sun',
+  'mon',
+  'tue',
+  'wed',
+  'thu',
+  'fri',
+  'sat',
+];
+
+/**
+ * After the user edits schedule chips, realign DayActivePlan with MealPlanSchedule for every
+ * calendar week that already had this plan assigned. Otherwise Nutrition "Today" keeps showing
+ * the old per-day assignment until "Set as Active" is pressed again.
+ */
+async function syncDayActivePlanFromScheduleForPlan(
+  db: any,
+  mealPlanId: number,
 ): Promise<void> {
-  let rows: { meal_type: string; food_name: string }[] = await db.getAllAsync(
-    `SELECT pm.meal_type, fi.food_name
-     FROM PlannedMeals pm
-     JOIN FoodItems fi ON fi.meal_id = pm.meal_id
-     WHERE pm.meal_plan_id = ?
-     ORDER BY pm.meal_order, fi.food_id`,
-    [planId]
-  ).catch(() => []);
-  if (rows.length === 0) {
-    rows = await db.getAllAsync<{ meal_type: string | null; food_name: string }>(
-      'SELECT meal_type, food_name FROM MealPlanItems WHERE meal_plan_id = ? ORDER BY sort_order, item_id',
-      [planId]
-    ).catch(() => []);
-    rows = rows.map((r) => ({ meal_type: r.meal_type || 'Meal', food_name: r.food_name }));
+  const scheduleRows = (await db
+    .getAllAsync('SELECT day_of_week FROM MealPlanSchedule WHERE meal_plan_id = ?', [mealPlanId])
+    .catch(() => [])) as { day_of_week: string }[];
+  const scheduledDaysExpanded = expandMealPlanScheduleToWeekdayKeys(scheduleRows);
+
+  const dateRows = (await db
+    .getAllAsync('SELECT date FROM DayActivePlan WHERE meal_plan_id = ?', [mealPlanId])
+    .catch(() => [])) as { date: string }[];
+  if (dateRows.length === 0) return;
+
+  const weekMondays = new Set<string>();
+  for (const { date } of dateRows) {
+    weekMondays.add(getMondayIso(date));
   }
-  const uniqueFoods = [...new Set(rows.map((r) => r.food_name.trim()))].filter(Boolean);
-  const byCategory: Record<string, string[]> = { grain: [], protein: [], produce: [], dairy: [], other: [] };
-  for (const name of uniqueFoods) {
-    const cat = categorizeFood(name);
-    byCategory[cat].push(name);
+
+  for (const monday_iso of weekMondays) {
+    const weekDates = getWeekDates(monday_iso);
+    const mon = weekDates[0];
+    const sun = weekDates[6];
+    await db.runAsync(
+      'DELETE FROM DayActivePlan WHERE meal_plan_id = ? AND date >= ? AND date <= ?',
+      [mealPlanId, mon, sun],
+    );
+    for (const iso of weekDates) {
+      const d = new Date(iso + 'T12:00:00');
+      const weekdayKey = CAL_WEEKDAY_KEYS[d.getDay()];
+      if (scheduledDaysExpanded.size === 0 || scheduledDaysExpanded.has(weekdayKey)) {
+        await db.runAsync(
+          'INSERT OR REPLACE INTO DayActivePlan (date, meal_plan_id) VALUES (?, ?)',
+          [iso, mealPlanId],
+        );
+      }
+    }
   }
-  const steps: string[][] = [];
-  if (byCategory.grain.length > 0) {
-    steps.push([
-      'Cook grains & starches',
-      `Cook in bulk for the week: ${byCategory.grain.join(', ')}. Let cool, then store in the fridge in airtight containers.`,
-    ]);
-  }
-  if (byCategory.protein.length > 0) {
-    steps.push([
-      'Cook & portion proteins',
-      `Prep and cook: ${byCategory.protein.join(', ')}. Portion into containers for each meal so you can grab and go.`,
-    ]);
-  }
-  if (byCategory.produce.length > 0) {
-    steps.push([
-      'Wash and chop produce',
-      `Wash, dry, and chop: ${byCategory.produce.join(', ')}. Store in containers or bags. Pre-portion for snacks if needed.`,
-    ]);
-  }
-  if (byCategory.dairy.length > 0) {
-    steps.push([
-      'Portion dairy',
-      `Portion out ${byCategory.dairy.join(', ')} into single-serving containers or add to meal containers as needed.`,
-    ]);
-  }
-  steps.push([
-    'Portion snacks and breakfast items',
-    'Portion out any grab-and-go snacks. Prep overnight oats, egg muffins, or other breakfast items so mornings are easy.',
-  ]);
-  steps.push([
-    'Assemble and store',
-    "Label containers by day or meal (e.g. Mon Lunch, Tue Dinner). Keep in the fridge; freeze any portions you won't use within 3–4 days.",
-  ]);
-  const lines: string[] = ['Meal prep for the week — follow these steps in order.', ''];
-  steps.forEach(([title, body], i) => {
-    lines.push(`${i + 1}. ${title}`);
-    lines.push(`   ${body}`);
-    lines.push('');
-  });
-  if (uniqueFoods.length > 0) {
-    lines.push('Your plan includes: ' + uniqueFoods.slice(0, 12).join(', ') + (uniqueFoods.length > 12 ? '...' : '.'));
-  }
-  const text = lines.join('\n').trim();
-  await db.runAsync('UPDATE MealPlans SET prep_guide = ? WHERE meal_plan_id = ?', [text || null, planId]);
 }
 
 export default function MealPlanDetail() {
@@ -237,10 +276,138 @@ export default function MealPlanDetail() {
   const [groceryChecked, setGroceryChecked] = useState<Set<number>>(new Set());
   const [groceryExpanded, setGroceryExpanded] = useState(false);
   const [prepExpanded, setPrepExpanded] = useState(false);
+  const [planMeals, setPlanMeals] = useState<PlanMeal[]>([]);
+
+  const loadMeals = useCallback(async () => {
+    if (!meal_plan_id) return;
+    try {
+      const mealRows = await db.getAllAsync<{
+        meal_id: number;
+        meal_name: string;
+        meal_type: string;
+        meal_order: number | null;
+        food_name: string | null;
+        brand: string | null;
+        serving_size: string | null;
+        calories: number | null;
+        protein: number | null;
+        carbs: number | null;
+        fat: number | null;
+      }>(
+        `SELECT pm.meal_id,
+                pm.meal_name,
+                pm.meal_type,
+                pm.meal_order,
+                fi.food_name,
+                fi.brand,
+                fi.serving_size,
+                fi.calories,
+                fi.protein,
+                fi.carbs,
+                fi.fat
+         FROM PlannedMeals pm
+         LEFT JOIN FoodItems fi ON fi.meal_id = pm.meal_id
+         WHERE pm.meal_plan_id = ?
+         ORDER BY pm.meal_order, pm.meal_id, fi.food_id`,
+        [meal_plan_id],
+      ).catch(() => []);
+
+      const mealMap = new Map<number, PlanMeal>();
+      for (const row of mealRows) {
+        if (!mealMap.has(row.meal_id)) {
+          mealMap.set(row.meal_id, {
+            meal_id: row.meal_id,
+            meal_name: row.meal_name || 'Meal',
+            meal_type: row.meal_type || 'snack',
+            meal_order: row.meal_order,
+            foods: [],
+          });
+        }
+        if (row.food_name) {
+          mealMap.get(row.meal_id)!.foods.push({
+            food_name: row.food_name,
+            brand: row.brand,
+            serving_size: row.serving_size,
+            calories: row.calories ?? 0,
+            protein: row.protein ?? 0,
+            carbs: row.carbs ?? 0,
+            fat: row.fat ?? 0,
+          });
+        }
+      }
+
+      let list = Array.from(mealMap.values());
+
+      if (list.length === 0) {
+        const items = await db
+          .getAllAsync<{
+            item_id: number;
+            meal_type: string | null;
+            food_name: string;
+          }>(
+            'SELECT item_id, meal_type, food_name FROM MealPlanItems WHERE meal_plan_id = ? ORDER BY sort_order, item_id',
+            [meal_plan_id],
+          )
+          .catch(() => []);
+
+        const byType = new Map<string, PlanMeal>();
+        let syntheticId = -1;
+        for (const it of items) {
+          const t = normalizeMealType(it.meal_type);
+          if (!byType.has(t)) {
+            byType.set(t, {
+              meal_id: syntheticId--,
+              meal_name:
+                t === 'other'
+                  ? 'Items'
+                  : `${t.charAt(0).toUpperCase()}${t.slice(1)}`,
+              meal_type: t,
+              foods: [],
+            });
+          }
+          byType.get(t)!.foods.push({
+            food_name: it.food_name,
+            brand: null,
+            serving_size: null,
+            calories: 0,
+            protein: 0,
+            carbs: 0,
+            fat: 0,
+          });
+        }
+        list = Array.from(byType.values());
+      }
+
+      list.sort((a, b) => {
+        const oa = a.meal_order ?? 0;
+        const ob = b.meal_order ?? 0;
+        if (oa !== ob) return oa - ob;
+        return mealTypeSortKey(a.meal_type) - mealTypeSortKey(b.meal_type);
+      });
+
+      setPlanMeals(list);
+    } catch {
+      setPlanMeals([]);
+    }
+  }, [db, meal_plan_id]);
 
   const loadPlanDetails = useCallback(async () => {
     if (!meal_plan_id) return;
     try {
+      const exists = await db.getFirstAsync<{ meal_plan_id: number }>(
+        'SELECT meal_plan_id FROM MealPlans WHERE meal_plan_id = ?',
+        [meal_plan_id]
+      );
+      if (!exists) return;
+
+      await db.runAsync(
+        'UPDATE MealPlans SET grocery_list = NULL, prep_guide = NULL WHERE meal_plan_id = ?',
+        [meal_plan_id]
+      );
+      await initNutritionDb(db as any).catch(() => {});
+      await generateGroceryListFromPlan(db, meal_plan_id);
+      await generatePrepGuideFromPlan(db, meal_plan_id);
+
       const rows = await db.getAllAsync<{ prep_guide: string | null; grocery_list: string | null }>(
         'SELECT prep_guide, grocery_list FROM MealPlans WHERE meal_plan_id = ?',
         [meal_plan_id]
@@ -276,6 +443,31 @@ export default function MealPlanDetail() {
     setScheduledDays(set);
   }, [db, meal_plan_id]);
 
+  const scheduleSummary = useMemo(() => scheduleDaysToSummary(scheduledDays), [scheduledDays]);
+
+  const mealPlanShareText = useMemo(
+    () => formatMealPlanShareText(name ?? 'Meal plan', planMeals, scheduleSummary),
+    [name, planMeals, scheduleSummary],
+  );
+
+  const copyMealPlan = useCallback(async () => {
+    try {
+      await Clipboard.setStringAsync(mealPlanShareText);
+      Alert.alert('Copied', 'Meal plan copied to the clipboard.');
+    } catch (e) {
+      console.warn('copyMealPlan', e);
+      Alert.alert('Copy failed', 'Could not copy to the clipboard.');
+    }
+  }, [mealPlanShareText]);
+
+  const shareMealPlan = useCallback(async () => {
+    try {
+      await Share.share({ message: mealPlanShareText, title: name || 'Meal plan' });
+    } catch (e) {
+      console.warn('shareMealPlan', e);
+    }
+  }, [mealPlanShareText, name]);
+
   useEffect(() => {
     loadSchedule();
   }, [loadSchedule]);
@@ -286,6 +478,16 @@ export default function MealPlanDetail() {
     useCallback(() => {
       loadPlanDetails();
     }, [loadPlanDetails])
+  );
+
+  useEffect(() => {
+    loadMeals();
+  }, [loadMeals]);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadMeals();
+    }, [loadMeals])
   );
   useEffect(() => {
     setGroceryChecked(new Set());
@@ -308,6 +510,11 @@ export default function MealPlanDetail() {
     for (const d of next) {
       await db.runAsync('INSERT INTO MealPlanSchedule (meal_plan_id, day_of_week) VALUES (?, ?)', [planId, d]);
     }
+    try {
+      await syncDayActivePlanFromScheduleForPlan(db, planId);
+    } catch (e) {
+      console.warn('syncDayActivePlanFromScheduleForPlan', e);
+    }
   };
 
   const applyQuick = async (days: DayOfWeek[]) => {
@@ -319,6 +526,11 @@ export default function MealPlanDetail() {
     for (const d of next) {
       await db.runAsync('INSERT INTO MealPlanSchedule (meal_plan_id, day_of_week) VALUES (?, ?)', [planId, d]);
     }
+    try {
+      await syncDayActivePlanFromScheduleForPlan(db, planId);
+    } catch (e) {
+      console.warn('syncDayActivePlanFromScheduleForPlan', e);
+    }
   };
 
   const setManualOnly = async () => {
@@ -327,6 +539,11 @@ export default function MealPlanDetail() {
     setScheduledDays(new Set());
     await db.runAsync('DELETE FROM MealPlanSchedule WHERE meal_plan_id = ?', [planId]);
     await db.runAsync("UPDATE MealPlans SET schedule_type = 'manual' WHERE meal_plan_id = ?", [planId]);
+    try {
+      await syncDayActivePlanFromScheduleForPlan(db, planId);
+    } catch (e) {
+      console.warn('syncDayActivePlanFromScheduleForPlan', e);
+    }
   };
 
   const setAsActive = () => {
@@ -344,19 +561,54 @@ export default function MealPlanDetail() {
               console.log('[SetAsActive] Step 0: today =', today, 'plan_id =', plan.meal_plan_id);
 
               // Step 0.5: Mark this plan as active for this whole week (Mon–Sun) in DayActivePlan
+              // BUT only on the weekdays it is scheduled for in MealPlanSchedule.
+              // Remove only this plan's rows for the current week, then INSERT OR REPLACE the right days.
+              const scheduleRows = await db.getAllAsync<{ day_of_week: string }>(
+                'SELECT day_of_week FROM MealPlanSchedule WHERE meal_plan_id = ?',
+                [plan.meal_plan_id],
+              ).catch(() => []);
+              // Must expand alternating_a / alternating_b — raw values never match weekday keys.
+              const scheduledDays = expandMealPlanScheduleToWeekdayKeys(scheduleRows);
+              console.log('[SetAsActive] scheduledDays:', Array.from(scheduledDays), 'scheduleRows:', scheduleRows);
+
+              const DAYS: ('sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat')[] = [
+                'sun',
+                'mon',
+                'tue',
+                'wed',
+                'thu',
+                'fri',
+                'sat',
+              ];
+
               const base = new Date(today + 'T12:00:00');
               const day = base.getDay(); // 0=Sun,1=Mon
               const mondayOffset = day === 0 ? -6 : 1 - day;
               const monday = new Date(base);
               monday.setDate(base.getDate() + mondayOffset);
+              const monday_iso = monday.toISOString().slice(0, 10);
+              const sundayEnd = new Date(monday);
+              sundayEnd.setDate(monday.getDate() + 6);
+              const sunday_iso = sundayEnd.toISOString().slice(0, 10);
+
+              await db.runAsync(
+                'DELETE FROM DayActivePlan WHERE meal_plan_id = ? AND date >= ? AND date <= ?',
+                [plan.meal_plan_id, monday_iso, sunday_iso],
+              );
+
               for (let i = 0; i < 7; i++) {
                 const d = new Date(monday);
                 d.setDate(monday.getDate() + i);
                 const iso = d.toISOString().slice(0, 10);
-                await db.runAsync(
-                  'INSERT OR IGNORE INTO DayActivePlan (date, meal_plan_id) VALUES (?, ?)',
-                  [iso, plan.meal_plan_id],
-                );
+                const weekdayKey = DAYS[d.getDay()]; // 'sun'...'sat'
+                if (scheduledDays.size === 0 || scheduledDays.has(weekdayKey)) {
+                  // If no schedule rows exist, treat as manual-only: apply to all days.
+                  await db.runAsync(
+                    'INSERT OR REPLACE INTO DayActivePlan (date, meal_plan_id) VALUES (?, ?)',
+                    [iso, plan.meal_plan_id],
+                  );
+                  console.log('[SetAsActive] inserted DayActivePlan for', iso, 'weekdayKey:', weekdayKey);
+                }
               }
 
               // Step 1: INSERT OR IGNORE into DailyLog
@@ -437,12 +689,7 @@ export default function MealPlanDetail() {
               }
               console.log('[SetAsActive] Step 6: LoggedFoods inserted for today =', count);
 
-              // Step 7: Add this plan to DayActivePlan for today (multiple plans can be active)
-              await initMealPlansDb(db);
-              await db.runAsync('INSERT OR IGNORE INTO DayActivePlan (date, meal_plan_id) VALUES (?, ?)', [today, plan.meal_plan_id]);
-              console.log('[SetAsActive] Step 7: DayActivePlan added for today; other active plans unchanged');
-
-              // Step 8: Navigate back to meal plan list
+              // Step 7: Navigate back to meal plan list
               navigation.navigate('Nutrition' as never, { activeTab: 'plans' } as never);
               Alert.alert('Success', 'Meal plan set for this week. Each day will show this plan.');
             } catch (e) {
@@ -469,7 +716,27 @@ export default function MealPlanDetail() {
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
           <Ionicons name="arrow-back" size={24} color={theme.text} />
         </TouchableOpacity>
-        <Text style={[styles.planName, { color: theme.text }]}>{name}</Text>
+        <Text style={[styles.planName, { color: theme.text }]} numberOfLines={2}>
+          {name}
+        </Text>
+        <View style={styles.headerActions}>
+          <TouchableOpacity
+            onPress={copyMealPlan}
+            style={styles.headerIconBtn}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            accessibilityLabel="Copy meal plan"
+          >
+            <Ionicons name="copy-outline" size={22} color={SAGE} />
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={shareMealPlan}
+            style={styles.headerIconBtn}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            accessibilityLabel="Share meal plan"
+          >
+            <Ionicons name="share-outline" size={22} color={SAGE} />
+          </TouchableOpacity>
+        </View>
       </View>
 
       <View style={[styles.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
@@ -514,6 +781,43 @@ export default function MealPlanDetail() {
         <Text style={styles.setActiveBtnText}>Set as Active</Text>
       </TouchableOpacity>
 
+      <View style={[styles.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
+        <Text style={[styles.sectionTitle, { color: theme.text }]}>Meals</Text>
+        {planMeals.length === 0 ? (
+          <Text style={[styles.planMealsEmpty, { color: theme.textSecondary }]}>
+            No meals in this plan yet.
+          </Text>
+        ) : (
+          planMeals.map((meal) => (
+            <View key={meal.meal_id} style={styles.planMealGroup}>
+              <View style={styles.planMealHeaderBlock}>
+                <Text style={[styles.planMealHeading, { color: theme.text }]}>{meal.meal_name}</Text>
+                <Text style={[styles.planMealTotals, { color: theme.textSecondary }]}>
+                  {Math.round(meal.foods.reduce((sum, f) => sum + (f.calories ?? 0), 0))} cal
+                  {' · '}P {Math.round(meal.foods.reduce((sum, f) => sum + (f.protein ?? 0), 0) * 10) / 10}g
+                  {' · '}C {Math.round(meal.foods.reduce((sum, f) => sum + (f.carbs ?? 0), 0) * 10) / 10}g
+                  {' · '}F {Math.round(meal.foods.reduce((sum, f) => sum + (f.fat ?? 0), 0) * 10) / 10}g
+                </Text>
+              </View>
+              {meal.foods.length === 0 ? (
+                <Text style={[styles.planFoodLine, { color: theme.textSecondary }]}>No foods listed.</Text>
+              ) : (
+                meal.foods.map((food, idx) => (
+                  <Text
+                    key={`${meal.meal_id}_${idx}`}
+                    style={[styles.planFoodLine, { color: theme.textSecondary }]}
+                  >
+                    {food.food_name}
+                    {food.serving_size ? ` · ${food.serving_size}` : ''}
+                    {` · ${Math.round(food.calories)} cal`}
+                  </Text>
+                ))
+              )}
+            </View>
+          ))
+        )}
+      </View>
+
       {/* Per-plan grocery list and prep guide UI moved to combined weekly view in Meal Plans tab */}
     </ScrollView>
   );
@@ -524,7 +828,9 @@ const styles = StyleSheet.create({
   content: { padding: 20, paddingBottom: 40 },
   header: { flexDirection: 'row', alignItems: 'center', marginBottom: 24 },
   backBtn: { marginRight: 12 },
-  planName: { fontSize: 22, fontWeight: '700', flex: 1 },
+  planName: { fontSize: 22, fontWeight: '700', flex: 1, flexShrink: 1 },
+  headerActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 4 },
+  headerIconBtn: { padding: 6 },
   section: { padding: 16, borderRadius: 12, borderWidth: 1, marginBottom: 20 },
   collapseHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 2 },
   sectionTitle: { fontSize: 18, fontWeight: '700', marginBottom: 4 },
@@ -538,8 +844,14 @@ const styles = StyleSheet.create({
   quickRow: { flexDirection: 'row', gap: 8, marginBottom: 8 },
   quickBtn: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1 },
   quickBtnText: { fontSize: 14 },
-  setActiveBtn: { paddingVertical: 14, borderRadius: 12, alignItems: 'center', marginBottom: 28 },
+  setActiveBtn: { paddingVertical: 14, borderRadius: 12, alignItems: 'center', marginBottom: 20 },
   setActiveBtnText: { color: '#fff', fontWeight: '700' },
+  planMealsEmpty: { fontSize: 14, lineHeight: 20, marginTop: 4 },
+  planMealGroup: { marginTop: 14 },
+  planMealHeaderBlock: { marginBottom: 4 },
+  planMealHeading: { fontSize: 16, fontWeight: '700', marginBottom: 4 },
+  planMealTotals: { fontSize: 12, lineHeight: 18, marginBottom: 8 },
+  planFoodLine: { fontSize: 14, lineHeight: 22, marginBottom: 4, paddingLeft: 2 },
   bodyText: { fontSize: 14, lineHeight: 20, marginBottom: 8 },
   emptyHint: { fontSize: 14, marginBottom: 8 },
   groceryListBlock: { marginBottom: 4 },

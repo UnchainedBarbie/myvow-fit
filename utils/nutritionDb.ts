@@ -17,6 +17,14 @@ export async function initNutritionDb(db: SQLiteDatabase): Promise<void> {
       grocery_list TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS DayActivePlan (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      meal_plan_id INTEGER NOT NULL,
+      UNIQUE(date, meal_plan_id),
+      FOREIGN KEY (meal_plan_id) REFERENCES MealPlans(meal_plan_id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS PlannedMeals (
       meal_id INTEGER PRIMARY KEY AUTOINCREMENT,
       meal_plan_id INTEGER,

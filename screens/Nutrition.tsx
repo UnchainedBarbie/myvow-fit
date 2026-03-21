@@ -15,7 +15,7 @@ import {
 import { useTheme } from '../context/ThemeContext';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useTranslation } from 'react-i18next';
-import { useRoute } from '@react-navigation/native';
+import { useRoute, useFocusEffect } from '@react-navigation/native';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Svg, { Circle } from 'react-native-svg';
@@ -47,7 +47,7 @@ type MealPlanRow = {
 type GroceryItem = {
   id: string;
   text: string;
-  category: 'Produce' | 'Protein' | 'Dairy' | 'Pantry' | 'Other';
+  category: 'Produce' | 'Meat & Fish' | 'Dairy' | 'Pantry' | 'Other';
   checked: boolean;
 };
 
@@ -144,6 +144,15 @@ export default function Nutrition() {
       setActiveTab('plans');
     }
   }, [routeParams.activeTab]);
+
+  /** Bumps when this screen gains focus so NutritionToday reloads plan/day mapping (e.g. after editing schedule). Does not change tab — use route `activeTab` (e.g. after Set as Active → plans). */
+  const [nutritionTodayReloadTick, setNutritionTodayReloadTick] = useState(0);
+  useFocusEffect(
+    useCallback(() => {
+      setNutritionTodayReloadTick((n) => n + 1);
+    }, []),
+  );
+
   const [selectedDate, setSelectedDate] = useState<Date>(new Date());
 
   const todayDate = new Date();
@@ -203,6 +212,7 @@ export default function Nutrition() {
 
   const loadWeeklyAggregates = useCallback(async () => {
     try {
+      await initMealPlansDb(db);
       // Determine all active plans for this week from DayActivePlan
       const weekDates = [0, 1, 2, 3, 4, 5, 6].map((i) =>
         addDaysIso(weekStart, i),
@@ -226,17 +236,19 @@ export default function Nutrition() {
             parsed.forEach((entry: any, index: number) => {
               const text = (entry.item ?? entry.text ?? '').trim();
               if (!text) return;
-              const category = (entry.category || 'Other').trim() as GroceryItem['category'];
+              let category = String(entry.category || 'Other').trim();
+              if (category === 'Protein') category = 'Meat & Fish';
+              const cat = category as GroceryItem['category'];
               items.push({
                 id: `${p.meal_plan_id}_${index}_${text}`,
                 text,
                 category:
-                  category === 'Produce' ||
-                  category === 'Protein' ||
-                  category === 'Dairy' ||
-                  category === 'Pantry' ||
-                  category === 'Other'
-                    ? category
+                  cat === 'Produce' ||
+                  cat === 'Meat & Fish' ||
+                  cat === 'Dairy' ||
+                  cat === 'Pantry' ||
+                  cat === 'Other'
+                    ? cat
                     : 'Other',
                 checked: false,
               });
@@ -446,7 +458,7 @@ export default function Nutrition() {
       return 'Produce';
     }
     if (/chicken|beef|turkey|salmon|tuna|pork|egg|tofu|beans/.test(n)) {
-      return 'Protein';
+      return 'Meat & Fish';
     }
     if (/milk|yogurt|cheese|butter|cream|cottage/.test(n)) {
       return 'Dairy';
@@ -561,7 +573,7 @@ export default function Nutrition() {
 
     const categories: GroceryItem['category'][] = [
       'Produce',
-      'Protein',
+      'Meat & Fish',
       'Dairy',
       'Pantry',
       'Other',
@@ -1536,7 +1548,7 @@ export default function Nutrition() {
               No grocery list yet. Tap Regenerate to create one.
             </Text>
           ) : (
-            ['Produce', 'Protein', 'Dairy', 'Pantry', 'Other'].map(
+            ['Produce', 'Meat & Fish', 'Dairy', 'Pantry', 'Other'].map(
               (catKey) => {
                 const catItems = groceryByCategory[
                   catKey as keyof typeof groceryByCategory
@@ -1691,7 +1703,7 @@ export default function Nutrition() {
               { borderColor: theme.border, backgroundColor: theme.card },
             ]}
           >
-            {(['Produce', 'Protein', 'Dairy', 'Pantry', 'Other'] as const).map(
+            {(['Produce', 'Meat & Fish', 'Dairy', 'Pantry', 'Other'] as const).map(
               (cat) => {
                 const catItems = weeklyGrocery.filter(
                   (it) => it.category === cat,
@@ -2146,7 +2158,7 @@ export default function Nutrition() {
           </View>
           <NutritionToday
             selectedDate={selectedIso}
-            reload={routeParams.reload}
+            reload={routeParams.reload ?? nutritionTodayReloadTick}
           />
         </>
       ) : (

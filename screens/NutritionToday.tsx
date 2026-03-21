@@ -2,7 +2,7 @@
  * Today tab: active plan, macro rings, meal sections (Breakfast, Snack, Lunch, Dinner),
  * swipe Edit/Delete per food, quantity modal, recalc totals.
  */
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -189,6 +189,8 @@ type NutritionTodayProps = {
 };
 
 export default function NutritionToday({ selectedDate, onLoadPlan, reload }: NutritionTodayProps) {
+  console.log('[NutritionToday render] selectedDate prop:', selectedDate);
+  const isLoadingRef = useRef(false);
   const { theme } = useTheme();
   const db = useSQLiteContext();
   const [scheduledPlan, setScheduledPlan] = useState<PlanInfo | null>(null);
@@ -366,12 +368,28 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
   }, [db, loadLoggedFoods, selectedDate]);
 
   const loadState = useCallback(async () => {
+    if (isLoadingRef.current) return;
+    isLoadingRef.current = true;
     try {
+      const allRows = await db.getAllAsync('SELECT * FROM DayActivePlan ORDER BY date');
+      console.log('[DayActivePlan ALL ROWS]', JSON.stringify(allRows));
+      try {
+        // One-time cleanup: remove duplicate DayActivePlan rows for same date
+        await db.runAsync(`
+          DELETE FROM DayActivePlan 
+          WHERE id NOT IN (
+            SELECT MIN(id) FROM DayActivePlan GROUP BY date, meal_plan_id
+          )
+        `);
+      } catch {
+        // ignore if table missing, SQLite quirk, etc.
+      }
       if (__DEV__) setPlanDebug(null);
       await initMealPlansDb(db);
 
       // 1) Use DayActivePlan override for this exact date (user explicitly set plan active)
       let override: { meal_plan_id: number; plan_name: string }[] = [];
+      console.log('[loadState] selectedDate:', selectedDate);
       try {
         override = await db.getAllAsync(
           `SELECT p.meal_plan_id, p.plan_name FROM DayActivePlan d JOIN MealPlans p ON p.meal_plan_id = d.meal_plan_id WHERE d.date = ?`,
@@ -396,7 +414,131 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
         setOverridePlan({ meal_plan_id: override[0].meal_plan_id, name: override[0].plan_name });
         setActivePlanName(displayName);
         setScheduledPlan(null);
-        await loadLoggedFoods();
+        if (selectedDate === todayIso) {
+          // Today: persist to DailyLog + LoggedFoods, then load from DB.
+          const targetPlanId = override[0].meal_plan_id;
+          const logRows = await db
+            .getAllAsync<{ log_id: number; meal_plan_id: number | null }>(
+              'SELECT log_id, meal_plan_id FROM DailyLog WHERE log_date = ?',
+              [selectedDate],
+            )
+            .catch(() => [] as { log_id: number; meal_plan_id: number | null }[]);
+          const logRow = logRows[0];
+          const currentPlanId = logRow?.meal_plan_id;
+          const planMismatch =
+            logRow == null ||
+            currentPlanId == null ||
+            Number(currentPlanId) !== Number(targetPlanId);
+
+          if (planMismatch) {
+            await db.runAsync(
+              'INSERT OR IGNORE INTO DailyLog (log_date, meal_plan_id) VALUES (?, ?)',
+              [selectedDate, targetPlanId],
+            );
+            await db.runAsync('UPDATE DailyLog SET meal_plan_id = ? WHERE log_date = ?', [
+              targetPlanId,
+              selectedDate,
+            ]);
+            const again = await db.getAllAsync<{ log_id: number }>(
+              'SELECT log_id FROM DailyLog WHERE log_date = ?',
+              [selectedDate],
+            );
+            const logId = again[0]?.log_id;
+            if (logId != null) {
+              await db.runAsync('DELETE FROM LoggedFoods WHERE log_id = ?', [logId]);
+              const foods = await db
+                .getAllAsync<{
+                  meal_type: string;
+                  food_name: string;
+                  brand: string | null;
+                  serving_size: string | null;
+                  calories: number;
+                  protein: number;
+                  carbs: number;
+                  fat: number;
+                }>(
+                  `SELECT pm.meal_type, fi.food_name, fi.brand, fi.serving_size, fi.calories, fi.protein, fi.carbs, fi.fat
+                   FROM PlannedMeals pm
+                   JOIN FoodItems fi ON fi.meal_id = pm.meal_id
+                   WHERE pm.meal_plan_id = ?
+                   ORDER BY pm.meal_order, fi.food_id`,
+                  [targetPlanId],
+                )
+                .catch(() => []);
+              for (const f of foods) {
+                await db
+                  .runAsync(
+                    `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type, serving_size, quantity, calories, protein, carbs, fat)
+                     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+                    [
+                      logId,
+                      f.food_name,
+                      f.brand,
+                      f.meal_type,
+                      f.serving_size,
+                      f.calories ?? 0,
+                      f.protein ?? 0,
+                      f.carbs ?? 0,
+                      f.fat ?? 0,
+                    ],
+                  )
+                  .catch(() => {});
+              }
+            }
+          } else {
+            for (const plan of override) {
+              await ensureDailyLogAndPrefillFoods(db, selectedDate, plan.meal_plan_id, false);
+            }
+          }
+          await loadLoggedFoods();
+        } else {
+          // Other days: show planned foods only — do not write LoggedFoods.
+          const mealPlanId = override[0].meal_plan_id;
+          const planRows = await db
+            .getAllAsync<{
+              meal_type: string;
+              food_name: string;
+              brand: string | null;
+              serving_size: string | null;
+              calories: number;
+              protein: number;
+              carbs: number;
+              fat: number;
+            }>(
+              `SELECT pm.meal_type, fi.food_name, fi.brand, fi.serving_size, fi.calories, fi.protein, fi.carbs, fi.fat
+               FROM PlannedMeals pm
+               JOIN FoodItems fi ON fi.meal_id = pm.meal_id
+               WHERE pm.meal_plan_id = ?
+               ORDER BY pm.meal_order, fi.food_id`,
+              [mealPlanId],
+            )
+            .catch(() => []);
+          const mapped: LoggedFood[] = planRows.map((r, i) => ({
+            logged_food_id: -(i + 1),
+            log_date: selectedDate,
+            meal_type: r.meal_type,
+            food_name: r.food_name,
+            brand: r.brand,
+            quantity: 1,
+            unit: r.serving_size ?? 'serving',
+            calories: r.calories ?? 0,
+            protein: r.protein ?? 0,
+            carbs: r.carbs ?? 0,
+            fat: r.fat ?? 0,
+          }));
+          setFoods(mapped);
+          setTotals(
+            mapped.reduce(
+              (acc, f) => ({
+                calories: acc.calories + (f.calories ?? 0),
+                protein: acc.protein + (f.protein ?? 0),
+                carbs: acc.carbs + (f.carbs ?? 0),
+                fat: acc.fat + (f.fat ?? 0),
+              }),
+              { calories: 0, protein: 0, carbs: 0, fat: 0 },
+            ),
+          );
+        }
         loadFavoritedSignatures();
         return;
       }
@@ -416,6 +558,7 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
       setFoods([]);
       setTotals({ calories: 0, protein: 0, carbs: 0, fat: 0 });
     } finally {
+      isLoadingRef.current = false;
       setLoading(false);
     }
   }, [selectedDate, todayIso, db, loadLoggedFoods, loadFavoritedSignatures]);

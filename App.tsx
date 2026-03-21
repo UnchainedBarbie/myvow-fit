@@ -48,16 +48,22 @@ import * as Notifications from 'expo-notifications';
   import { AppState } from 'react-native';
 import GraphsWorkoutDetails from './screens/GraphsWorkoutDetails';
 import { initNutritionDb } from './utils/nutritionDb';
+import { initMealPlansDb } from './utils/initMealPlansDb';
 import { addRecurringTable, createUpdateTriggers } from './utils/addRecurringTable';
+import { initWorkoutDb } from './utils/initWorkoutDb';
 import * as SplashScreen from 'expo-splash-screen';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import Onboarding from './screens/Onboarding';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 /** Bump to a new name (e.g. SimpleDB.v2.db) to force a fresh schema on next load; init runs on open. */
 const SQLITE_DATABASE_NAME = 'SimpleDB.db';
 
 /** Run once after DB open to keep important tables/indexes in sync. */
 async function onSqliteInit(db: { runAsync: (sql: string) => Promise<void> }) {
-  // Ensure DayActivePlan is recreated with the latest schema in initMealPlansDb.
-  await db.runAsync('DROP TABLE IF EXISTS DayActivePlan');
+  // Do NOT drop DayActivePlan here — that wiped every user's active plan/day assignments on each
+  // app launch. Ensure tables via idempotent CREATE IF NOT EXISTS only.
+  await initMealPlansDb(db as any);
 
   // Allow INSERT OR REPLACE on Workout_Log for duplicate (workout_date, day_name, workout_name)
   await db.runAsync(
@@ -68,6 +74,7 @@ async function onSqliteInit(db: { runAsync: (sql: string) => Promise<void> }) {
   // These helpers are idempotent (CREATE TABLE/CREATE TRIGGER IF NOT EXISTS).
   await addRecurringTable(db as any);
   await createUpdateTriggers(db as any);
+  await initWorkoutDb(db as any);
 }
 import { useFonts } from 'expo-font';
 import {
@@ -497,6 +504,8 @@ const AppContent = () => {
 
   export default function App() {
     const [dbLoaded, setDbLoaded] = useState(false);
+    const [onboardingResolved, setOnboardingResolved] = useState(false);
+    const [showOnboarding, setShowOnboarding] = useState(false);
     const navigationRef = useRef<NavigationContainerRef<any>>(null);
     const [fontsLoaded] = useFonts({
       'CormorantGaramond-Regular': require('./assets/fonts/CormorantGaramond-Regular.ttf'),
@@ -545,12 +554,27 @@ const AppContent = () => {
     }, []);
 
     useEffect(() => {
-      if (dbLoaded && fontsLoaded) {
+      if (!fontsLoaded) return;
+      (async () => {
+        try {
+          const done = await AsyncStorage.getItem('@onboarding_complete');
+          setShowOnboarding(done !== 'true');
+        } catch (e) {
+          console.warn('Onboarding check:', e);
+          setShowOnboarding(true);
+        } finally {
+          setOnboardingResolved(true);
+        }
+      })();
+    }, [fontsLoaded]);
+
+    useEffect(() => {
+      if (dbLoaded && fontsLoaded && onboardingResolved) {
         SplashScreen.hideAsync().catch(() => {});
       }
-    }, [dbLoaded, fontsLoaded]);
+    }, [dbLoaded, fontsLoaded, onboardingResolved]);
   
-    if (!dbLoaded || !fontsLoaded) {
+    if (!dbLoaded || !fontsLoaded || !onboardingResolved) {
       return (
         <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
           <ActivityIndicator size="large" color="black" />
@@ -561,17 +585,21 @@ const AppContent = () => {
 
     return (
       <ThemeProvider>
-      <GestureHandlerRootView>
+      <SafeAreaProvider>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        {showOnboarding ? (
+          <Onboarding onComplete={() => setShowOnboarding(false)} />
+        ) : (
         <NavigationContainer ref={navigationRef}>
           <SettingsProvider>
           <I18nextProvider i18n={i18n}>
           <AppContent/>
           </I18nextProvider>
           </SettingsProvider>
-         
         </NavigationContainer>
-        
+        )}
       </GestureHandlerRootView>
+      </SafeAreaProvider>
     </ThemeProvider>
     );
   }

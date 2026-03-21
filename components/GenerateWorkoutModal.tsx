@@ -14,7 +14,6 @@ import {
 import { useTheme } from '../context/ThemeContext';
 import { useTranslation } from 'react-i18next';
 import Ionicons from 'react-native-vector-icons/Ionicons';
-import { getClaudeApiKey } from '../utils/claudeApiKeyStorage';
 import { generateWorkoutWithAI, insertAIWorkout } from '../utils/generateWorkoutWithAI';
 import type { SQLiteDatabase } from 'expo-sqlite';
 
@@ -55,18 +54,7 @@ export default function GenerateWorkoutModal({
     setError(null);
     setLoading(true);
     try {
-      const apiKey = await getClaudeApiKey();
-      const masked =
-        apiKey && apiKey.length > 4
-          ? apiKey.slice(0, -4).replace(/./g, '*') + apiKey.slice(-4)
-          : apiKey || null;
-      console.log('Claude API key loaded (masked):', masked);
-      if (!apiKey) {
-        setError(t('aiWorkoutApiKeyRequired') || 'Set your Claude API key in Settings first.');
-        setLoading(false);
-        return;
-      }
-      const workout = await generateWorkoutWithAI(apiKey, trimmed);
+      const workout = await generateWorkoutWithAI(trimmed);
       await insertAIWorkout(db, workout);
       await onSuccess();
       handleClose();

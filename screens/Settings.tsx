@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   View,
   Text,
@@ -17,7 +17,7 @@ import { useNotifications } from '../utils/useNotifications';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
-import { getClaudeApiKey, setClaudeApiKey } from '../utils/claudeApiKeyStorage';
+import { setClaudeApiKey } from '../utils/claudeApiKeyStorage';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export default function Settings() {
@@ -45,15 +45,6 @@ export default function Settings() {
   // Use the notifications hook to access all notification-related functionality
   const { requestNotificationPermission, cancelAllNotifications } =
     useNotifications();
-
-  useEffect(() => {
-    (async () => {
-      const stored = await getClaudeApiKey();
-      if (stored) {
-        setClaudeApiKeyState(stored);
-      }
-    })();
-  }, []);
 
   const handleSaveClaudeKey = async () => {
     try {
