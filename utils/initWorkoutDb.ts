@@ -12,4 +12,18 @@ export async function initWorkoutDb(db: {
   } catch {
     // Column already exists (fresh DB with rest_seconds, or migration already applied).
   }
+  try {
+    await db.runAsync(
+      'ALTER TABLE Workout_Log ADD COLUMN recurring_workout_id INTEGER;',
+    );
+  } catch {
+    // Column already exists.
+  }
+  try {
+    await db.runAsync(
+      'ALTER TABLE Recurring_Workouts ADD COLUMN recurring_end_date INTEGER;',
+    );
+  } catch {
+    // Column already exists.
+  }
 }

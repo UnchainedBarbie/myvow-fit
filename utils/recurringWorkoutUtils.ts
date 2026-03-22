@@ -3,9 +3,21 @@
 import { useSQLiteContext } from 'expo-sqlite';
 import { useNotifications } from './useNotifications';
 import { useCallback } from 'react';
+import {
+  getCalendarGridUnixRange,
+  type CalendarFirstWeekday,
+} from './calendarGridRange';
 
 // Constants
 const DAY_IN_SECONDS = 86400; // 24 hours in seconds
+
+/** Local calendar midnight (unix seconds) for the calendar day of the given instant. */
+export function unixLocalMidnight(tsSeconds: number): number {
+  const d = new Date(tsSeconds * 1000);
+  return Math.floor(
+    new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000,
+  );
+}
 
 // Interface for recurring workout data
 interface RecurringWorkout {
@@ -16,8 +28,209 @@ interface RecurringWorkout {
   recurring_start_date: number;
   recurring_interval: number;
   recurring_days: string | null;
+  /** Inclusive last calendar day (unix); null/0 = no end. */
+  recurring_end_date?: number | null;
   notification_enabled: number;
   notification_time: string | null;
+}
+
+function parseRecurringDaysCsv(recurringDays: string | null): number[] {
+  if (!recurringDays || !String(recurringDays).trim()) return [];
+  return recurringDays
+    .split(',')
+    .map((x) => parseInt(x.trim(), 10))
+    .filter((n) => !Number.isNaN(n));
+}
+
+/** True if this rule should produce a calendar entry on the given local calendar day (midnight unix). */
+export function recurringOccursOnLocalDay(
+  workout: RecurringWorkout,
+  dayMid: number,
+): boolean {
+  const startMid = unixLocalMidnight(workout.recurring_start_date);
+  if (dayMid < startMid) return false;
+
+  const endRaw = workout.recurring_end_date;
+  if (endRaw != null && endRaw > 0) {
+    const endMid = unixLocalMidnight(endRaw);
+    if (dayMid > endMid) return false;
+  }
+
+  if (workout.recurring_interval > 0) {
+    const delta = dayMid - startMid;
+    if (delta < 0) return false;
+    const step = workout.recurring_interval * DAY_IN_SECONDS;
+    return delta % step === 0;
+  }
+
+  const selected = parseRecurringDaysCsv(workout.recurring_days);
+  if (selected.length === 0) return false;
+  const dow = new Date(dayMid * 1000).getDay();
+  return selected.includes(dow);
+}
+
+function eachLocalDayMidnightInclusive(
+  rangeStartUnix: number,
+  rangeEndUnix: number,
+): number[] {
+  const mids: number[] = [];
+  let mid = unixLocalMidnight(rangeStartUnix);
+  const lastMid = unixLocalMidnight(rangeEndUnix);
+  const maxDays = 800;
+  let n = 0;
+  while (mid <= lastMid && n < maxDays) {
+    mids.push(mid);
+    const d = new Date(mid * 1000);
+    d.setDate(d.getDate() + 1);
+    mid = Math.floor(
+      new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000,
+    );
+    n++;
+  }
+  return mids;
+}
+
+async function deletePendingWorkoutLogs(
+  db: any,
+  logs: Array<{ workout_log_id: number; notification_id: string | null }>,
+  cancelNotification?: (id: string) => Promise<void>,
+) {
+  for (const log of logs) {
+    if (log.notification_id && cancelNotification) {
+      try {
+        await cancelNotification(log.notification_id);
+      } catch {
+        /* ignore */
+      }
+    }
+    await db.runAsync('DELETE FROM Weight_Log WHERE workout_log_id = ?;', [
+      log.workout_log_id,
+    ]);
+    await db.runAsync('DELETE FROM Logged_Exercises WHERE workout_log_id = ?;', [
+      log.workout_log_id,
+    ]);
+    await db.runAsync('DELETE FROM Workout_Log WHERE workout_log_id = ?;', [
+      log.workout_log_id,
+    ]);
+  }
+}
+
+async function cleanupRecurringLogsPastEndDate(
+  db: any,
+  cancelNotification?: (id: string) => Promise<void>,
+) {
+  const rows = (await db.getAllAsync(
+    `SELECT recurring_workout_id, recurring_end_date FROM Recurring_Workouts
+     WHERE recurring_end_date IS NOT NULL AND recurring_end_date > 0`,
+  )) as Array<{ recurring_workout_id: number; recurring_end_date: number }>;
+
+  for (const r of rows) {
+    const endMid = unixLocalMidnight(r.recurring_end_date);
+    const pendingLogs = (await db.getAllAsync(
+      `SELECT wl.workout_log_id, wl.notification_id FROM Workout_Log wl
+       WHERE wl.recurring_workout_id = ?
+       AND wl.workout_date > ?
+       AND NOT EXISTS (SELECT 1 FROM Weight_Log w WHERE w.workout_log_id = wl.workout_log_id)`,
+      [r.recurring_workout_id, endMid],
+    )) as Array<{ workout_log_id: number; notification_id: string | null }>;
+
+    await deletePendingWorkoutLogs(db, pendingLogs, cancelNotification);
+  }
+}
+
+export async function materializeRecurringWorkoutsInRange(
+  db: any,
+  rangeStartUnix: number,
+  rangeEndUnix: number,
+  scheduleNotification: any,
+  notificationPermissionGranted: boolean,
+  cancelNotification?: (id: string) => Promise<void>,
+): Promise<boolean> {
+  try {
+    await cleanupRecurringLogsPastEndDate(db, cancelNotification);
+
+    const recurringWorkouts = (await db.getAllAsync(
+      'SELECT * FROM Recurring_Workouts',
+    )) as RecurringWorkout[];
+
+    const dayMids = eachLocalDayMidnightInclusive(rangeStartUnix, rangeEndUnix);
+
+    for (const dayMid of dayMids) {
+      for (const workout of recurringWorkouts) {
+        if (!recurringOccursOnLocalDay(workout, dayMid)) continue;
+
+        const existingLog = await db.getAllAsync(
+          `SELECT workout_log_id FROM Workout_Log 
+           WHERE workout_date = ? AND workout_name = ? AND day_name = ?`,
+          [dayMid, workout.workout_name, workout.day_name],
+        );
+
+        if (existingLog.length > 0) continue;
+
+        await scheduleWorkout(
+          db,
+          workout,
+          dayMid,
+          scheduleNotification,
+          notificationPermissionGranted,
+          { skipNotification: true },
+        );
+      }
+    }
+
+    return true;
+  } catch (error) {
+    console.error('Error in materializeRecurringWorkoutsInRange:', error);
+    return false;
+  }
+}
+
+async function ensureRecurringNotificationsInWindow(
+  db: any,
+  scheduleNotification: any,
+  notificationPermissionGranted: boolean,
+  windowStartMid: number,
+) {
+  if (!notificationPermissionGranted) return;
+
+  const windowEnd = windowStartMid + 14 * DAY_IN_SECONDS;
+  const recurring = (await db.getAllAsync(
+    `SELECT * FROM Recurring_Workouts WHERE notification_enabled = 1 AND notification_time IS NOT NULL`,
+  )) as RecurringWorkout[];
+
+  for (const workout of recurring) {
+    const logs = (await db.getAllAsync(
+      `SELECT workout_log_id, workout_date, notification_id FROM Workout_Log 
+       WHERE recurring_workout_id = ? AND workout_date >= ? AND workout_date <= ? 
+       AND notification_id IS NULL 
+       ORDER BY workout_date ASC LIMIT 3`,
+      [workout.recurring_workout_id, windowStartMid, windowEnd],
+    )) as Array<{
+      workout_log_id: number;
+      workout_date: number;
+      notification_id: string | null;
+    }>;
+
+    for (const log of logs) {
+      if (!workout.notification_time) continue;
+      const [hours, minutes] = workout.notification_time.split(':').map(Number);
+      const notificationTime = new Date();
+      notificationTime.setHours(hours, minutes, 0, 0);
+      const workoutDate = new Date(log.workout_date * 1000);
+      const notificationId = await scheduleNotification({
+        workoutName: workout.workout_name,
+        dayName: workout.day_name,
+        scheduledDate: workoutDate,
+        notificationTime,
+      });
+      if (notificationId) {
+        await db.runAsync(
+          'UPDATE Workout_Log SET notification_id = ? WHERE workout_log_id = ?',
+          [notificationId, log.workout_log_id],
+        );
+      }
+    }
+  }
 }
 
 interface Exercise {
@@ -31,234 +244,86 @@ interface Exercise {
 }
 
 /**
- * Check and schedule any pending recurring workouts
- * This should be called on app startup or when the user opens relevant screens
- */
-// utils/recurringWorkoutUtils.ts
-
-/**
- * Check and schedule any pending recurring workouts.
- * This version will schedule a specified number of upcoming occurrences.
- *
- * @param db The database connection.
- * @param scheduleNotification The function to schedule a notification.
- * @param notificationPermissionGranted Whether notification permission is granted.
- * @param scheduleAheadCount The number of upcoming occurrences to schedule.
+ * Materialize recurring workouts into Workout_Log for a date range (visible calendar grid
+ * or a long default window on app start). Respects weekly days, N-day interval, start date,
+ * and optional end date. Notifications are attached separately for the next few days.
  */
 export const checkAndScheduleRecurringWorkouts = async (
   db: any,
   scheduleNotification: any,
   notificationPermissionGranted: boolean,
-  scheduleAheadCount: number = 2 // Schedule the next 2 occurrences by default
+  viewMonth?: Date,
+  firstWeekday?: CalendarFirstWeekday,
+  cancelNotification?: (id: string) => Promise<void>,
 ) => {
   try {
-    console.log("RECURRING CHECK STARTED");
-    const recurringWorkouts = (await db.getAllAsync(
-      "SELECT * FROM Recurring_Workouts"
-    )) as RecurringWorkout[];
+    console.log('RECURRING MATERIALIZE STARTED');
+    const nowSec = Math.floor(Date.now() / 1000);
+    const todayMid = unixLocalMidnight(nowSec);
 
-    // Current date at midnight (normalized)
-    const now = new Date();
-    const currentTimestamp = Math.floor(
-      new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() /
-        1000
-    );
-
-    console.log(
-      `Current timestamp: ${currentTimestamp} (${new Date(
-        currentTimestamp * 1000
-      ).toDateString()})`
-    );
-    console.log(`Will attempt to schedule ${scheduleAheadCount} occurrences.`);
-
-    // Process each recurring workout definition
-    for (const workout of recurringWorkouts) {
-      console.log(
-        `--- Checking workout: ${workout.workout_name}/${workout.day_name} ---`
-      );
-
-      // This variable will track where to start the search for the next occurrence.
-      // It starts with today and gets updated after each occurrence is found.
-      let searchFromTimestamp = currentTimestamp;
-
-      // Loop to find and schedule the desired number of occurrences
-      for (let i = 0; i < scheduleAheadCount; i++) {
-        // Find the next occurrence starting from our search date
-        const nextOccurrence = await calculateNextOccurrence(
-          db,
-          workout,
-          searchFromTimestamp
-        );
-
-        // --- VALIDATION CHECKS ---
-
-        // 1. Skip if the calculated date is in the past.
-        //    We use the original `currentTimestamp` for this check.
-        if (nextOccurrence < currentTimestamp) {
-          console.log(
-            `Occurrence on ${new Date(
-              nextOccurrence * 1000
-            ).toDateString()} is in the past. Skipping.`
-          );
-          // We still need to update the search date to avoid an infinite loop
-          searchFromTimestamp = nextOccurrence + DAY_IN_SECONDS;
-          continue;
-        }
-
-        // 2. Check if a workout is already logged for this exact date and name
-        const existingLog = await db.getAllAsync(
-          `SELECT workout_log_id FROM Workout_Log 
-           WHERE workout_date = ? AND workout_name = ? AND day_name = ?`,
-          [nextOccurrence, workout.workout_name, workout.day_name]
-        );
-
-        if (existingLog.length > 0) {
-          console.log(
-            `SKIPPING - Workout already scheduled for ${new Date(
-              nextOccurrence * 1000
-            ).toDateString()}`
-          );
-        } else {
-          // --- SCHEDULING ---
-          console.log(
-            `SCHEDULING - New workout for ${new Date(
-              nextOccurrence * 1000
-            ).toDateString()}`
-          );
-          await scheduleWorkout(
-            db,
-            workout,
-            nextOccurrence,
-            scheduleNotification,
-            notificationPermissionGranted
-          );
-        }
-
-        // --- PREPARE FOR NEXT ITERATION ---
-        // Set the start for the next search to be the day AFTER the one we just found.
-        // This is crucial to ensure we find the *next* occurrence in the next loop.
-        searchFromTimestamp = nextOccurrence + DAY_IN_SECONDS;
-      }
+    let rangeStart: number;
+    let rangeEnd: number;
+    if (viewMonth != null && firstWeekday != null) {
+      const r = getCalendarGridUnixRange(viewMonth, firstWeekday);
+      rangeStart = r.startTimestamp;
+      rangeEnd = r.endTimestamp;
+    } else {
+      const startD = new Date(todayMid * 1000);
+      startD.setDate(startD.getDate() - 30);
+      rangeStart = Math.floor(startD.getTime() / 1000);
+      const endD = new Date(todayMid * 1000);
+      endD.setDate(endD.getDate() + 540);
+      rangeEnd = Math.floor(endD.getTime() / 1000) + 86399;
     }
 
-    console.log("RECURRING CHECK COMPLETED");
+    await materializeRecurringWorkoutsInRange(
+      db,
+      rangeStart,
+      rangeEnd,
+      scheduleNotification,
+      notificationPermissionGranted,
+      cancelNotification,
+    );
+
+    await ensureRecurringNotificationsInWindow(
+      db,
+      scheduleNotification,
+      notificationPermissionGranted,
+      todayMid,
+    );
+
+    console.log('RECURRING MATERIALIZE COMPLETED');
     return true;
   } catch (error) {
-    console.error("Error in checkAndScheduleRecurringWorkouts:", error);
+    console.error('Error in checkAndScheduleRecurringWorkouts:', error);
     return false;
   }
-};
-
-/**
- * Calculate the next occurrence date for a recurring workout
- */
-const calculateNextOccurrence = async (
-  db: any,
-  workout: RecurringWorkout,
-  currentTimestamp: number
-): Promise<number> => {
-  try {
-    console.log(
-      `Calculating next occurrence for ${
-        workout.workout_name
-      } from current date (${new Date(
-        currentTimestamp * 1000
-      ).toDateString()})`
-    );
-
-    // For interval-based scheduling (daily, every N days)
-    if (workout.recurring_interval > 0) {
-      let nextOccurrence = workout.recurring_start_date;
-      const intervalInSeconds = workout.recurring_interval * DAY_IN_SECONDS;
-
-      // Keep adding the interval until the next occurrence is in the future (or today)
-      while (nextOccurrence < currentTimestamp) {
-        nextOccurrence += intervalInSeconds;
-      }
-
-      console.log(
-        `Next interval occurs on: ${new Date(
-          nextOccurrence * 1000
-        ).toDateString()}`
-      );
-      return nextOccurrence;
-    }
-    // For day-of-week based scheduling
-    else if (workout.recurring_days) {
-      // This logic was already correct.
-      // Always find the next matching day from the current date.
-      return findNextMatchingDay(
-        workout.recurring_days,
-        currentTimestamp // Always start from the current date
-      );
-    }
-
-    // Default fallback
-    return currentTimestamp;
-  } catch (error) {
-    console.error("Error calculating next occurrence:", error);
-    return currentTimestamp;
-  }
-};
-
-/**
- * Find the next matching day based on the recurring_days pattern
- */
-const findNextMatchingDay = (
-  recurringDays: string,
-  currentTimestamp: number
-): number => {
-  // Parse selected days (0-6, where 0 is Sunday)
-  const selectedDays = recurringDays.split(",").map((day) => parseInt(day, 10));
-
-  if (selectedDays.length === 0) {
-    return currentTimestamp;
-  }
-
-  // --- THIS IS THE FIX ---
-  // Start checking from today, not tomorrow.
-  let checkDate = new Date(currentTimestamp * 1000);
-
-  // Look up to 7 days ahead to find the next matching day
-  for (let i = 0; i < 7; i++) {
-    const dayOfWeek = checkDate.getDay();
-
-    if (selectedDays.includes(dayOfWeek)) {
-      // Found a matching day, normalize to midnight
-      return Math.floor(
-        new Date(
-          checkDate.getFullYear(),
-          checkDate.getMonth(),
-          checkDate.getDate()
-        ).getTime() / 1000
-      );
-    }
-
-    // Check the next day
-    checkDate.setDate(checkDate.getDate() + 1);
-  }
-
-  // Fallback - should not reach here if selectedDays is valid
-  return currentTimestamp;
 };
 
 /**
  * Schedule a workout in the Workout_Log table
  */
 const scheduleWorkout = async (
-  db: any, 
-  workout: RecurringWorkout, 
+  db: any,
+  workout: RecurringWorkout,
   scheduledDate: number,
   scheduleNotification: any,
-  notificationPermissionGranted: boolean
+  notificationPermissionGranted: boolean,
+  options?: { skipNotification?: boolean },
 ) => {
   try {
     let notificationId = null;
     
     // First, insert the workout into the log
     const { lastInsertRowId: workoutLogId } = await db.runAsync(
-      'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id) VALUES (?, ?, ?, ?);',
-      [scheduledDate, workout.day_name, workout.workout_name, null] // Initially set notification_id to null
+      'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id, recurring_workout_id) VALUES (?, ?, ?, ?, ?);',
+      [
+        scheduledDate,
+        workout.day_name,
+        workout.workout_name,
+        null,
+        workout.recurring_workout_id,
+      ]
     );
     
     console.log(`Successfully inserted workout into log with ID: ${workoutLogId}`);
@@ -352,31 +417,37 @@ const getDayId = async (db: any, workoutId: number, dayName: string): Promise<nu
  */
 export const useRecurringWorkouts = () => {
   const db = useSQLiteContext();
-  const { 
-    scheduleNotification, 
+  const {
+    scheduleNotification,
+    cancelNotification,
     notificationPermissionGranted,
-    checkNotificationPermission
+    checkNotificationPermission,
   } = useNotifications();
   
- const checkRecurringWorkouts = useCallback(async () => {
-  let currentPermissionStatus;
-  try {
-    currentPermissionStatus = await checkNotificationPermission();
-    console.log(
-      `Current notification permission status: ${currentPermissionStatus}`
-    );
-  } catch (error) {
-    console.error("Error checking notification permissions:", error);
-    return; // Stop if permissions fail
-  }
-    
-return await checkAndScheduleRecurringWorkouts(
-    db,
-    scheduleNotification,
-    currentPermissionStatus,
-    3
+  const checkRecurringWorkouts = useCallback(
+    async (viewMonth?: Date, firstWeekday?: CalendarFirstWeekday) => {
+      let currentPermissionStatus;
+      try {
+        currentPermissionStatus = await checkNotificationPermission();
+        console.log(
+          `Current notification permission status: ${currentPermissionStatus}`,
+        );
+      } catch (error) {
+        console.error('Error checking notification permissions:', error);
+        return;
+      }
+
+      return await checkAndScheduleRecurringWorkouts(
+        db,
+        scheduleNotification,
+        currentPermissionStatus,
+        viewMonth,
+        firstWeekday,
+        cancelNotification,
+      );
+    },
+    [db, scheduleNotification, checkNotificationPermission, cancelNotification],
   );
-}, [db, scheduleNotification, checkNotificationPermission]);
   
   // Create a new recurring workout
   const createRecurringWorkout = async (data: {
@@ -385,17 +456,18 @@ return await checkAndScheduleRecurringWorkouts(
     day_name: string;
     recurring_interval: number;
     recurring_days?: string;
+    recurring_end_date?: number | null;
     notification_enabled?: boolean;
     notification_time?: string;
   }) => {
     try {
-      const startDate = Math.floor(new Date().getTime() / 1000);
-      
+      const startDate = unixLocalMidnight(Math.floor(Date.now() / 1000));
+
       await db.runAsync(
         `INSERT INTO Recurring_Workouts (
           workout_id, workout_name, day_name, recurring_start_date, 
-          recurring_interval, recurring_days, notification_enabled, notification_time
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
+          recurring_interval, recurring_days, recurring_end_date, notification_enabled, notification_time
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`,
         [
           data.workout_id,
           data.workout_name,
@@ -403,9 +475,12 @@ return await checkAndScheduleRecurringWorkouts(
           startDate,
           data.recurring_interval,
           data.recurring_days || null,
+          data.recurring_end_date != null && data.recurring_end_date > 0
+            ? data.recurring_end_date
+            : null,
           data.notification_enabled ? 1 : 0,
-          data.notification_time || null
-        ]
+          data.notification_time || null,
+        ],
       );
       
       return true;
@@ -421,30 +496,40 @@ return await checkAndScheduleRecurringWorkouts(
     updates: {
       recurring_interval?: number;
       recurring_days?: string;
+      recurring_end_date?: number | null;
       notification_enabled?: boolean;
       notification_time?: string;
-    }
+    },
   ) => {
     try {
       // Build the update query dynamically based on provided fields
       let updateFields = [];
       let params = [];
-      
+
       if (updates.recurring_interval !== undefined) {
         updateFields.push('recurring_interval = ?');
         params.push(updates.recurring_interval);
       }
-      
+
       if (updates.recurring_days !== undefined) {
         updateFields.push('recurring_days = ?');
         params.push(updates.recurring_days);
       }
-      
+
+      if (updates.recurring_end_date !== undefined) {
+        updateFields.push('recurring_end_date = ?');
+        params.push(
+          updates.recurring_end_date != null && updates.recurring_end_date > 0
+            ? updates.recurring_end_date
+            : null,
+        );
+      }
+
       if (updates.notification_enabled !== undefined) {
         updateFields.push('notification_enabled = ?');
         params.push(updates.notification_enabled ? 1 : 0);
       }
-      
+
       if (updates.notification_time !== undefined) {
         updateFields.push('notification_time = ?');
         params.push(updates.notification_time);
@@ -469,19 +554,67 @@ return await checkAndScheduleRecurringWorkouts(
     }
   };
   
-  // Delete a recurring workout
-  const deleteRecurringWorkout = async (recurringWorkoutId: number) => {
-    try {
-      await db.runAsync(
-        'DELETE FROM Recurring_Workouts WHERE recurring_workout_id = ?;',
-        [recurringWorkoutId]
-      );
-      return true;
-    } catch (error) {
-      console.error('Error deleting recurring workout:', error);
-      return false;
-    }
-  };
+  // Delete a recurring workout and remove its unlogged calendar placeholders from Workout_Log
+  const deleteRecurringWorkout = useCallback(
+    async (recurringWorkoutId: number) => {
+      try {
+        const metaRows = await db.getAllAsync<{
+          workout_name: string;
+          day_name: string;
+        }>(
+          'SELECT workout_name, day_name FROM Recurring_Workouts WHERE recurring_workout_id = ?;',
+          [recurringWorkoutId]
+        );
+        const meta = metaRows[0];
+        if (!meta) {
+          return false;
+        }
+
+        // Unlogged = no Weight_Log rows (same rule as MyCalendar isLogged)
+        const pendingLogs = await db.getAllAsync<{
+          workout_log_id: number;
+          notification_id: string | null;
+        }>(
+          `SELECT wl.workout_log_id, wl.notification_id FROM Workout_Log wl
+           WHERE NOT EXISTS (SELECT 1 FROM Weight_Log w WHERE w.workout_log_id = wl.workout_log_id)
+           AND (
+             wl.recurring_workout_id = ?
+             OR (wl.recurring_workout_id IS NULL AND wl.workout_name = ? AND wl.day_name = ?)
+           );`,
+          [recurringWorkoutId, meta.workout_name, meta.day_name]
+        );
+
+        for (const log of pendingLogs) {
+          if (log.notification_id) {
+            try {
+              await cancelNotification(log.notification_id);
+            } catch (e) {
+              console.warn('cancelNotification failed for workout_log', log.workout_log_id, e);
+            }
+          }
+          await db.runAsync('DELETE FROM Weight_Log WHERE workout_log_id = ?;', [
+            log.workout_log_id,
+          ]);
+          await db.runAsync('DELETE FROM Logged_Exercises WHERE workout_log_id = ?;', [
+            log.workout_log_id,
+          ]);
+          await db.runAsync('DELETE FROM Workout_Log WHERE workout_log_id = ?;', [
+            log.workout_log_id,
+          ]);
+        }
+
+        await db.runAsync(
+          'DELETE FROM Recurring_Workouts WHERE recurring_workout_id = ?;',
+          [recurringWorkoutId]
+        );
+        return true;
+      } catch (error) {
+        console.error('Error deleting recurring workout:', error);
+        return false;
+      }
+    },
+    [db, cancelNotification]
+  );
   
   // Get all recurring workouts
   const getAllRecurringWorkouts = async () => {

@@ -38,6 +38,7 @@ interface RecurringWorkout {
   day_name: string;
   recurring_interval: number;
   recurring_days: string | null;
+  recurring_end_date?: number | null;
   notification_enabled: number;
   notification_time: string | null;
 }
@@ -49,7 +50,7 @@ export default function RecurringWorkoutDetails() {
   const { t } = useTranslation();
   const db = useSQLiteContext();
   const { deleteRecurringWorkout } = useRecurringWorkouts();
-  const { timeFormat } = useSettings();
+  const { timeFormat, dateFormat } = useSettings();
 
   const [workout, setWorkout] = useState<RecurringWorkout | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -68,6 +69,7 @@ export default function RecurringWorkoutDetails() {
           day_name, 
           recurring_interval, 
           recurring_days,
+          recurring_end_date,
           notification_enabled,
           notification_time
         FROM Recurring_Workouts 
@@ -129,6 +131,20 @@ export default function RecurringWorkoutDetails() {
     }
     
     return timeString;
+  };
+
+  const formatEndDateDetail = (): string => {
+    if (!workout?.recurring_end_date || workout.recurring_end_date <= 0) {
+      return '';
+    }
+    const d = new Date(unixLocalMidnight(workout.recurring_end_date) * 1000);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    if (dateFormat === 'dd-mm-yyyy') {
+      return `${day}-${m}-${y}`;
+    }
+    return `${m}-${day}-${y}`;
   };
 
   // Format weekdays for display
@@ -199,6 +215,8 @@ export default function RecurringWorkoutDetails() {
     );
   }
 
+  const recurringEndDateDisplayStr = formatEndDateDetail();
+
   return (
     <ScrollView 
       style={[styles.container, { backgroundColor: theme.background }]}
@@ -229,6 +247,13 @@ export default function RecurringWorkoutDetails() {
             <Text style={[styles.infoValue, { color: theme.text }]}>{getWeekdaysDisplay()}</Text>
           </>
         )}
+
+        <Text style={[styles.infoLabel, { color: theme.text }]}>{t('recurringEndDate')}:</Text>
+        <Text style={[styles.infoValue, { color: theme.text }]}>
+          {recurringEndDateDisplayStr !== ''
+            ? t('recurringEndsOn', { date: recurringEndDateDisplayStr })
+            : t('recurringNoEndDate')}
+        </Text>
         
         <Text style={[styles.infoLabel, { color: theme.text }]}>{t('notifications')}:</Text>
         <Text style={[styles.infoValue, { color: theme.text }]}>

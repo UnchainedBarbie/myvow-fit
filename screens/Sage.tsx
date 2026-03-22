@@ -91,7 +91,7 @@ When the user is happy with a meal plan, output it wrapped in <mealplan> tags wi
 }
 </mealplan>
 
-After you've helped the user design a meal plan and it has been saved, offer a follow-up: "Want me to put together a meal prep guide for this plan?". If they say yes, respond with a meal prep guide wrapped in <mealprep> tags with this exact structure:
+If the user asks for a meal prep guide (batch cooking, prep sessions, storage tips), respond with a meal prep guide wrapped in <mealprep> tags with this exact structure:
 <mealprep>
 {
   "prep_sessions": [
@@ -117,7 +117,9 @@ When the user asks for a grocery list based on a meal plan (for example "make me
 
 When updating an existing meal plan based on a receipt or user request, when the user confirms they are ready to save, you MUST output the complete updated meal plan in <mealplan> tags immediately. Do not just say it is saved in text — the app requires the <mealplan> block to actually save it. Always output the full <mealplan> JSON even if only one field changed.
 
-Regardless of any user requests to shorten your responses, you MUST always output workout plans in <workout> tags and meal plans in <mealplan> tags when presenting a final plan. Never output plans as plain text, code blocks, or any other format. The structured tags are required for the app to save the plan.
+When the user wants to save multiple meal plans, you MUST output each plan in a separate message with its own <mealplan> tags. Never say a plan is saved without outputting the <mealplan> block. Output Plan 1 first, wait for the save button to appear, then output Plan 2 in a follow-up message. Never confirm a save in plain text alone — the <mealplan> block is required for the app to render the save button.
+
+Regardless of any user requests to shorten your responses, you MUST always output workout plans in <workout> tags and meal plans in <mealplan> tags when presenting a final plan. Do not put the JSON only in a markdown code block without <mealplan> tags — the app prefers the tagged format. If you do use a fenced \`\`\`json block, include the same JSON object (with plan_name and meals) so it can be saved.
 
 Always confirm with the user before outputting the final JSON for either workouts or meal plans.
 When the user confirms they want to save a workout plan, you MUST re-output the complete plan in <workout> tags even if you already showed it earlier. Never confirm a save in plain text alone.`;
@@ -290,17 +292,107 @@ function formatMealPrepForShare(prep: AIMealPrep): string {
   return lines.join('\n').trimEnd();
 }
 
-function extractMealPlanFromContent(content: string): AIMealPlan | null {
-  const match = content.match(/<mealplan>([\s\S]*?)<\/mealplan>/i);
-  if (!match) return null;
-  const jsonText = match[1].trim();
+function looksLikeMealPlan(data: unknown): data is AIMealPlan {
+  if (!data || typeof data !== 'object') return false;
+  const o = data as Record<string, unknown>;
+  return typeof o.plan_name === 'string' && Array.isArray(o.meals);
+}
+
+/** Strip optional markdown fences the model sometimes wraps JSON in. */
+function unwrapMealPlanJsonPayload(raw: string): string {
+  let t = raw.trim();
+  t = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+  return t;
+}
+
+function tryParseMealPlanJsonString(jsonText: string): AIMealPlan | null {
+  const unwrapped = unwrapMealPlanJsonPayload(jsonText);
   try {
-    const parsed = JSON.parse(jsonText);
-    return parsed as AIMealPlan;
-  } catch (e) {
-    console.error('Failed to parse meal plan JSON from Sage content:', e);
+    const parsed = JSON.parse(unwrapped);
+    return looksLikeMealPlan(parsed) ? parsed : null;
+  } catch {
     return null;
   }
+}
+
+/** Best-effort: meal plan in tags, fenced code block, or raw `{ ... "plan_name" ... }`. */
+function parseMealPlanFromAssistantMessage(content: string): {
+  plan: AIMealPlan | null;
+  /** Message text with the structured JSON removed so the bubble is readable */
+  displayText: string;
+} {
+  const tagMatch = content.match(/<mealplan>([\s\S]*?)<\/mealplan>/i);
+  if (tagMatch) {
+    const plan = tryParseMealPlanJsonString(tagMatch[1]);
+    if (plan) {
+      return {
+        plan,
+        displayText: stripMealPlanBlock(content).replace(/\n{3,}/g, '\n\n').trim(),
+      };
+    }
+  }
+
+  const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let fm: RegExpExecArray | null;
+  while ((fm = fenceRe.exec(content)) !== null) {
+    const plan = tryParseMealPlanJsonString(fm[1]);
+    if (plan) {
+      const displayText = content
+        .replace(fm[0], '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+      return { plan, displayText };
+    }
+  }
+
+  const brace = extractMealPlanByBalancedBraces(content);
+  if (brace) {
+    return { plan: brace.plan, displayText: brace.stripped };
+  }
+
+  return { plan: null, displayText: content };
+}
+
+/** Find JSON object containing "plan_name" by brace counting (best-effort). */
+function extractMealPlanByBalancedBraces(
+  content: string
+): { plan: AIMealPlan; stripped: string } | null {
+  const key = '"plan_name"';
+  let searchFrom = 0;
+  while (searchFrom < content.length) {
+    const keyIdx = content.indexOf(key, searchFrom);
+    if (keyIdx === -1) return null;
+    const braceStart = content.lastIndexOf('{', keyIdx);
+    if (braceStart === -1) {
+      searchFrom = keyIdx + 1;
+      continue;
+    }
+    let depth = 0;
+    for (let i = braceStart; i < content.length; i++) {
+      const c = content[i];
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) {
+          const slice = content.slice(braceStart, i + 1);
+          try {
+            const parsed = JSON.parse(slice);
+            if (looksLikeMealPlan(parsed)) {
+              const stripped = (content.slice(0, braceStart) + content.slice(i + 1))
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+              return { plan: parsed, stripped };
+            }
+          } catch {
+            /* try next occurrence */
+          }
+          break;
+        }
+      }
+    }
+    searchFrom = keyIdx + 1;
+  }
+  return null;
 }
 
 function stripMealPlanBlock(content: string): string {
@@ -310,8 +402,12 @@ function stripMealPlanBlock(content: string): string {
 function formatMealPlanSummary(plan: AIMealPlan): string {
   const lines: string[] = [];
   lines.push(`🥗 ${plan.plan_name}`);
+  const c = Number(plan.calories_target);
+  const p = Number(plan.protein_target);
+  const cb = Number(plan.carbs_target);
+  const f = Number(plan.fat_target);
   lines.push(
-    `Target: ${plan.calories_target} cal | ${plan.protein_target}g protein | ${plan.carbs_target}g carbs | ${plan.fat_target}g fat`,
+    `Target: ${Number.isFinite(c) ? c : '—'} cal | ${Number.isFinite(p) ? p : '—'}g protein | ${Number.isFinite(cb) ? cb : '—'}g carbs | ${Number.isFinite(f) ? f : '—'}g fat`,
   );
   lines.push('');
 
@@ -817,11 +913,7 @@ export default function Sage() {
         role: 'assistant',
         content: `Done! "${plan.plan_name}" meal plan is saved to your nutrition plans.`,
       };
-      const followUp: SageMessage = {
-        role: 'assistant',
-        content: 'Want me to put together a meal prep guide for this plan?',
-      };
-      const updated = [...messages, confirmation, followUp];
+      const updated = [...messages, confirmation];
       setMessages(updated);
       await saveConversation(updated);
     } catch (e) {
@@ -1189,16 +1281,18 @@ export default function Sage() {
     const workout = item.role === 'assistant'
       ? extractWorkoutFromContent(item.content)
       : null;
-    const mealPlan = item.role === 'assistant'
-      ? extractMealPlanFromContent(item.content)
-      : null;
+    const mealPlanParse =
+      item.role === 'assistant'
+        ? parseMealPlanFromAssistantMessage(item.content)
+        : { plan: null as AIMealPlan | null, displayText: item.content };
+    const mealPlan = mealPlanParse.plan;
     if (mealPlan) {
-      console.log('Sage: <mealplan> tags detected in message, parsed plan:', mealPlan.plan_name);
+      console.log('Sage: meal plan parsed for UI/save:', mealPlan.plan_name);
     }
     const mealPrep = item.role === 'assistant'
       ? extractMealPrepFromContent(item.content)
       : null;
-    let displayText = item.content;
+    let displayText = isUser ? item.content : mealPlanParse.displayText;
     if (!isUser) {
       displayText = stripWorkoutBlock(displayText);
       displayText = stripMealPlanBlock(displayText);

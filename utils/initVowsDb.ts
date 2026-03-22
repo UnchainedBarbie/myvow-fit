@@ -23,6 +23,11 @@ export async function initVowsDb(db: {
   } catch {
     // ignore if column already exists
   }
+  try {
+    await db.runAsync(`ALTER TABLE Vows ADD COLUMN why_text TEXT;`);
+  } catch {
+    // ignore if column already exists
+  }
   await db.runAsync(`
     CREATE TABLE IF NOT EXISTS VowCheckIns (
       check_in_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +46,7 @@ export type VowRow = {
   title: string;
   category: string;
   frequency_per_week: number;
+  why_text?: string | null;
   status: string;
   created_at: string;
   completed_at: string | null;

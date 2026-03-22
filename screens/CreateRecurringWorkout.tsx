@@ -21,7 +21,7 @@ import { useTranslation } from 'react-i18next';
 import { WorkoutLogStackParamList } from '../App';
 import { useSQLiteContext } from 'expo-sqlite';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import { useRecurringWorkouts } from '../utils/recurringWorkoutUtils';
+import { useRecurringWorkouts, unixLocalMidnight } from '../utils/recurringWorkoutUtils';
 import { useSettings } from '../context/SettingsContext';
 
 type NavigationProp = StackNavigationProp<
@@ -45,7 +45,7 @@ export default function CreateRecurringWorkout() {
   const { t } = useTranslation();
   const db = useSQLiteContext();
   const { createRecurringWorkout } = useRecurringWorkouts();
-  const { notificationPermissionGranted, timeFormat } = useSettings();
+  const { notificationPermissionGranted, timeFormat, dateFormat } = useSettings();
 
   // Using t() for day names inside the component
   const DAYS_OF_WEEK = [
@@ -80,7 +80,17 @@ export default function CreateRecurringWorkout() {
     return date;
   });
   const [showTimePicker, setShowTimePicker] = useState<boolean>(false);
-  
+
+  const defaultEndDate = () => {
+    const d = new Date();
+    d.setMonth(d.getMonth() + 6);
+    d.setHours(12, 0, 0, 0);
+    return d;
+  };
+  const [hasEndDate, setHasEndDate] = useState(false);
+  const [endDate, setEndDate] = useState<Date>(defaultEndDate);
+  const [showEndDatePicker, setShowEndDatePicker] = useState(false);
+
   // UI states
   const [showWorkoutList, setShowWorkoutList] = useState<boolean>(false);
   const [showDayList, setShowDayList] = useState<boolean>(false);
@@ -166,6 +176,23 @@ export default function CreateRecurringWorkout() {
     }
   };
 
+  const handleEndDateChange = (event: any, selected?: Date) => {
+    setShowEndDatePicker(Platform.OS === 'ios');
+    if (selected) {
+      setEndDate(selected);
+    }
+  };
+
+  const formatEndDateLabel = (d: Date): string => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    if (dateFormat === 'dd-mm-yyyy') {
+      return `${day}-${m}-${y}`;
+    }
+    return `${m}-${day}-${y}`;
+  };
+
   // Calculate recurring interval based on selection
   const getRecurringInterval = (): number => {
     switch (intervalType) {
@@ -211,6 +238,15 @@ export default function CreateRecurringWorkout() {
       }
     } catch (e) {
         console.error("error checking for duplicates", e);
+    }
+
+    if (hasEndDate) {
+      const endMid = unixLocalMidnight(Math.floor(endDate.getTime() / 1000));
+      const startMid = unixLocalMidnight(Math.floor(Date.now() / 1000));
+      if (endMid < startMid) {
+        Alert.alert(t('error'), t('recurringEndDateBeforeStart'));
+        return;
+      }
     }
 
     setIsLoading(true);
@@ -608,6 +644,55 @@ export default function CreateRecurringWorkout() {
                 </View>
               </View>
             </Modal>
+          </View>
+        )}
+
+        {/* End date — only after day selected */}
+        {selectedDay && (
+          <View style={[styles.notificationSection, { backgroundColor: theme.card }]}>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>
+              {t('recurringEndDate')}
+            </Text>
+            <View style={styles.switchRow}>
+              <Text style={[styles.switchLabel, { color: theme.text }]}>
+                {t('recurringSetEndDate')}
+              </Text>
+              <Switch
+                value={hasEndDate}
+                onValueChange={(v) => {
+                  setHasEndDate(v);
+                  if (v) setShowEndDatePicker(Platform.OS === 'ios');
+                }}
+                trackColor={{ false: '#767577', true: theme.buttonBackground }}
+                thumbColor={'#f4f3f4'}
+              />
+            </View>
+            {!hasEndDate && (
+              <Text style={{ color: theme.text, opacity: 0.8, marginTop: 4 }}>
+                {t('recurringNoEndDate')}
+              </Text>
+            )}
+            {hasEndDate && (
+              <>
+                <TouchableOpacity
+                  style={styles.timeSelector}
+                  onPress={() => setShowEndDatePicker(true)}
+                >
+                  <Text style={[styles.timeSelectorText, { color: theme.text }]}>
+                    {formatEndDateLabel(endDate)}
+                  </Text>
+                  <Ionicons name="calendar-outline" size={22} color={theme.text} />
+                </TouchableOpacity>
+                {showEndDatePicker && (
+                  <DateTimePicker
+                    value={endDate}
+                    mode="date"
+                    display="default"
+                    onChange={handleEndDateChange}
+                  />
+                )}
+              </>
+            )}
           </View>
         )}
         

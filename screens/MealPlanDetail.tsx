@@ -29,7 +29,6 @@ import {
   generatePrepGuideFromPlan,
 } from '../utils/generateMealPlanGroceryAndPrep';
 import { initNutritionDb } from '../utils/nutritionDb';
-import * as Clipboard from 'expo-clipboard';
 
 const SAGE = '#7C9A7E';
 const DAYS: DayOfWeek[] = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
@@ -278,6 +277,22 @@ export default function MealPlanDetail() {
   const [prepExpanded, setPrepExpanded] = useState(false);
   const [planMeals, setPlanMeals] = useState<PlanMeal[]>([]);
 
+  const planNutritionTotals = useMemo(() => {
+    let calories = 0;
+    let protein = 0;
+    let carbs = 0;
+    let fat = 0;
+    for (const meal of planMeals) {
+      for (const f of meal.foods) {
+        calories += Number(f.calories) || 0;
+        protein += Number(f.protein) || 0;
+        carbs += Number(f.carbs) || 0;
+        fat += Number(f.fat) || 0;
+      }
+    }
+    return { calories, protein, carbs, fat };
+  }, [planMeals]);
+
   const loadMeals = useCallback(async () => {
     if (!meal_plan_id) return;
     try {
@@ -452,11 +467,17 @@ export default function MealPlanDetail() {
 
   const copyMealPlan = useCallback(async () => {
     try {
+      // Dynamic import so startup doesn't require ExpoClipboard native code.
+      // Rebuild your dev client with expo-clipboard linked for copy to work.
+      const Clipboard = await import('expo-clipboard');
       await Clipboard.setStringAsync(mealPlanShareText);
       Alert.alert('Copied', 'Meal plan copied to the clipboard.');
     } catch (e) {
       console.warn('copyMealPlan', e);
-      Alert.alert('Copy failed', 'Could not copy to the clipboard.');
+      Alert.alert(
+        'Copy unavailable',
+        'Clipboard needs native code in your build. Run a new development build, or use Share instead.',
+      );
     }
   }, [mealPlanShareText]);
 
@@ -783,6 +804,55 @@ export default function MealPlanDetail() {
 
       <View style={[styles.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
         <Text style={[styles.sectionTitle, { color: theme.text }]}>Meals</Text>
+        {planMeals.length > 0 ? (
+          <View
+            style={[
+              styles.planNutritionTotals,
+              { backgroundColor: theme.background, borderColor: theme.border },
+            ]}
+          >
+            <Text style={[styles.planNutritionTotalsTitle, { color: theme.text }]}>
+              Total nutrition
+            </Text>
+            <Text style={[styles.planNutritionTotalsSub, { color: theme.textSecondary }]}>
+              Sum of all foods in this plan (one day)
+            </Text>
+            <View style={styles.planNutritionGrid}>
+              <View style={styles.planNutritionCell}>
+                <Text style={[styles.planNutritionValue, { color: theme.text }]}>
+                  {Math.round(planNutritionTotals.calories)}
+                </Text>
+                <Text style={[styles.planNutritionLabel, { color: theme.textSecondary }]}>
+                  Calories
+                </Text>
+              </View>
+              <View style={styles.planNutritionCell}>
+                <Text style={[styles.planNutritionValue, { color: theme.text }]}>
+                  {Math.round(planNutritionTotals.protein * 10) / 10}g
+                </Text>
+                <Text style={[styles.planNutritionLabel, { color: theme.textSecondary }]}>
+                  Protein
+                </Text>
+              </View>
+              <View style={styles.planNutritionCell}>
+                <Text style={[styles.planNutritionValue, { color: theme.text }]}>
+                  {Math.round(planNutritionTotals.carbs * 10) / 10}g
+                </Text>
+                <Text style={[styles.planNutritionLabel, { color: theme.textSecondary }]}>
+                  Carbs
+                </Text>
+              </View>
+              <View style={styles.planNutritionCell}>
+                <Text style={[styles.planNutritionValue, { color: theme.text }]}>
+                  {Math.round(planNutritionTotals.fat * 10) / 10}g
+                </Text>
+                <Text style={[styles.planNutritionLabel, { color: theme.textSecondary }]}>
+                  Fat
+                </Text>
+              </View>
+            </View>
+          </View>
+        ) : null}
         {planMeals.length === 0 ? (
           <Text style={[styles.planMealsEmpty, { color: theme.textSecondary }]}>
             No meals in this plan yet.
@@ -847,6 +917,23 @@ const styles = StyleSheet.create({
   setActiveBtn: { paddingVertical: 14, borderRadius: 12, alignItems: 'center', marginBottom: 20 },
   setActiveBtnText: { color: '#fff', fontWeight: '700' },
   planMealsEmpty: { fontSize: 14, lineHeight: 20, marginTop: 4 },
+  planNutritionTotals: {
+    marginTop: 12,
+    marginBottom: 4,
+    padding: 14,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  planNutritionTotalsTitle: { fontSize: 15, fontWeight: '700', marginBottom: 2 },
+  planNutritionTotalsSub: { fontSize: 12, lineHeight: 16, marginBottom: 12 },
+  planNutritionGrid: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+  planNutritionCell: { flex: 1, alignItems: 'center', paddingHorizontal: 4 },
+  planNutritionValue: { fontSize: 17, fontWeight: '700', marginBottom: 2 },
+  planNutritionLabel: { fontSize: 11, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.3 },
   planMealGroup: { marginTop: 14 },
   planMealHeaderBlock: { marginBottom: 4 },
   planMealHeading: { fontSize: 16, fontWeight: '700', marginBottom: 4 },

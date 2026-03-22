@@ -6,7 +6,7 @@
  * - Progress: circular rings (Workout, Nutrition, Activity, Hydration) always visible
  * - History: past vows and streaks
  */
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -20,7 +20,6 @@ import {
   ActivityIndicator,
   Dimensions,
   Keyboard,
-  TouchableWithoutFeedback,
   KeyboardAvoidingView,
   Platform,
 } from 'react-native';
@@ -28,6 +27,8 @@ import Svg, { Circle } from 'react-native-svg';
 import { useTheme } from '../context/ThemeContext';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
+import { useHeaderHeight } from '@react-navigation/elements';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { initVowsDb, type VowRow, type VowCheckInRow } from '../utils/initVowsDb';
 
@@ -65,6 +66,43 @@ const SUGGESTED_VOWS: Record<SuggestedCategory, string[]> = {
     'Rest when my body asks for it',
   ],
 };
+
+/** User-selectable categories when creating a vow (stored comma-separated in DB). */
+const WRITE_CATEGORY_OPTIONS = ['Movement', 'Nutrition', 'Recovery', 'Mindset'] as const;
+
+/** Order for picking which section list a vow appears under (first match wins). */
+const VOW_SECTION_ORDER = ['Fitness', 'Movement', 'Nutrition', 'Recovery', 'Mindset'] as const;
+
+function parseVowCategoryTokens(raw: string | null | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return [...new Set(raw.split(',').map((s) => s.trim()).filter(Boolean))];
+}
+
+/** Which section bucket to show this vow in (one card per vow). */
+function vowPrimarySection(raw: string): (typeof VOW_SECTION_ORDER)[number] | 'other' {
+  const tokens = new Set(parseVowCategoryTokens(raw));
+  for (const key of VOW_SECTION_ORDER) {
+    if (tokens.has(key)) return key;
+  }
+  return 'other';
+}
+
+function formatVowCategoriesSubtitle(raw: string): string {
+  const tokens = parseVowCategoryTokens(raw);
+  if (tokens.length === 0) return 'Custom';
+  return tokens
+    .map((t) => (t === 'Mindset' ? 'Mindset / Self-Compassion' : t))
+    .join(' · ');
+}
+
+function sortWriteCategories(cats: string[]): string[] {
+  const uniq = [...new Set(cats)];
+  return uniq.sort(
+    (a, b) =>
+      WRITE_CATEGORY_OPTIONS.indexOf(a as (typeof WRITE_CATEGORY_OPTIONS)[number]) -
+      WRITE_CATEGORY_OPTIONS.indexOf(b as (typeof WRITE_CATEGORY_OPTIONS)[number]),
+  );
+}
 
 function todayYmd() {
   return new Date().toISOString().split('T')[0];
@@ -140,6 +178,8 @@ export default function MyVow() {
   const { theme } = useTheme();
   const db = useSQLiteContext();
   const navigation = useNavigation<any>();
+  const headerHeight = useHeaderHeight();
+  const insets = useSafeAreaInsets();
 
   const [activeVows, setActiveVows] = useState<VowRow[]>([]);
   const [completedVows, setCompletedVows] = useState<VowRow[]>([]);
@@ -153,8 +193,10 @@ export default function MyVow() {
   const [checkIns, setCheckIns] = useState<VowCheckInRow[]>([]);
 
   const [writeText, setWriteText] = useState('');
-  const [writeCategory, setWriteCategory] = useState<string>('Movement');
+  const [writeWhy, setWriteWhy] = useState('');
+  const [writeCategories, setWriteCategories] = useState<string[]>(['Movement']);
   const [writeFrequency, setWriteFrequency] = useState<string>('3');
+  const [writeKeyboardHeight, setWriteKeyboardHeight] = useState(0);
 
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
   const [weeklyReport, setWeeklyReport] = useState<
@@ -202,7 +244,7 @@ export default function MyVow() {
   const loadVows = useCallback(async () => {
     await initVowsDb(db);
     const all = await db.getAllAsync<VowRow>(
-      'SELECT vow_id, title, category, frequency_per_week, status, created_at, completed_at, broken_at FROM Vows ORDER BY created_at DESC'
+      'SELECT vow_id, title, category, frequency_per_week, why_text, status, created_at, completed_at, broken_at FROM Vows ORDER BY created_at DESC'
     );
     setActiveVows(all.filter((v) => v.status === 'active'));
     setCompletedVows(all.filter((v) => v.status === 'completed'));
@@ -234,11 +276,17 @@ export default function MyVow() {
     loadCheckIns(vow.vow_id);
   };
 
-  const addVow = async (title: string, category: string, frequencyPerWeek: number = 3) => {
+  const addVow = async (
+    title: string,
+    category: string,
+    frequencyPerWeek: number = 3,
+    whyText?: string | null,
+  ) => {
     const now = new Date().toISOString();
+    const why = whyText?.trim() ? whyText.trim() : null;
     await db.runAsync(
-      'INSERT INTO Vows (title, category, frequency_per_week, status, created_at) VALUES (?, ?, ?, ?, ?)',
-      [title.trim(), category, frequencyPerWeek, 'active', now]
+      'INSERT INTO Vows (title, category, frequency_per_week, why_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [title.trim(), category, frequencyPerWeek, why, 'active', now]
     );
     await loadVows();
   };
@@ -328,18 +376,60 @@ export default function MyVow() {
   // Open write modal with suggestion pre-filled so user can edit before saving
   const openAddSuggestedVow = (title: string, category: string) => {
     setWriteText(title);
-    setWriteCategory(category);
+    setWriteWhy('');
+    setWriteCategories([category]);
     setWriteFrequency('3');
     setSuggestedModalVisible(false);
     setWriteModalVisible(true);
   };
 
+  const openWriteOwnModal = () => {
+    setWriteText('');
+    setWriteWhy('');
+    setWriteCategories(['Movement']);
+    setWriteFrequency('3');
+    setWriteModalVisible(true);
+  };
+
+  useEffect(() => {
+    if (!writeModalVisible) {
+      setWriteKeyboardHeight(0);
+      return;
+    }
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const onShow = Keyboard.addListener(showEvent, (e) => {
+      setWriteKeyboardHeight(e.endCoordinates?.height ?? 0);
+    });
+    const onHide = Keyboard.addListener(hideEvent, () => setWriteKeyboardHeight(0));
+    return () => {
+      onShow.remove();
+      onHide.remove();
+    };
+  }, [writeModalVisible]);
+
+  const toggleWriteCategory = (c: string) => {
+    setWriteCategories((prev) => {
+      if (prev.includes(c)) {
+        if (prev.length <= 1) return prev;
+        return sortWriteCategories(prev.filter((x) => x !== c));
+      }
+      return sortWriteCategories([...prev, c]);
+    });
+  };
+
   const saveWriteOwn = () => {
     if (!writeText.trim()) return;
+    if (writeCategories.length === 0) {
+      Alert.alert('Category', 'Select at least one category.');
+      return;
+    }
     const freq = Math.max(0, parseInt(writeFrequency, 10) || 0);
-    addVow(writeText.trim(), writeCategory, freq);
+    const categoryCsv = sortWriteCategories(writeCategories).join(',');
+    addVow(writeText.trim(), categoryCsv, freq, writeWhy.trim() || null);
     setWriteText('');
-    setWriteCategory('Movement');
+    setWriteWhy('');
+    setWriteCategories(['Movement']);
     setWriteFrequency('3');
     setWriteModalVisible(false);
   };
@@ -359,14 +449,12 @@ export default function MyVow() {
     );
   }
 
-  const fitnessVows = activeVows.filter((v) => v.category === 'Fitness');
-  const movementVows = activeVows.filter((v) => v.category === 'Movement');
-  const nutritionVows = activeVows.filter((v) => v.category === 'Nutrition');
-  const recoveryVows = activeVows.filter((v) => v.category === 'Recovery');
-  const mindsetVows = activeVows.filter((v) => v.category === 'Mindset');
-  const otherVows = activeVows.filter(
-    (v) => !['Fitness', 'Movement', 'Nutrition', 'Recovery', 'Mindset'].includes(v.category)
-  );
+  const fitnessVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Fitness');
+  const movementVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Movement');
+  const nutritionVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Nutrition');
+  const recoveryVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Recovery');
+  const mindsetVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Mindset');
+  const otherVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'other');
   const historyCount = completedVows.length + brokenVows.length;
 
   return (
@@ -388,7 +476,7 @@ export default function MyVow() {
               <Ionicons name="sparkles" size={18} color="#fff" />
               <Text style={styles.ctaPrimaryText}>Generate with Sage</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={[styles.ctaSecondary, { borderColor: SAGE }]} onPress={() => setWriteModalVisible(true)}>
+            <TouchableOpacity style={[styles.ctaSecondary, { borderColor: SAGE }]} onPress={openWriteOwnModal}>
               <Ionicons name="create-outline" size={18} color={SAGE} />
               <Text style={[styles.ctaSecondaryText, { color: SAGE }]}>Create my own vow</Text>
             </TouchableOpacity>
@@ -407,7 +495,7 @@ export default function MyVow() {
             <Text style={[styles.placeholderText, { color: theme.text }]}>
               No vows yet. Create a promise to yourself above—or let Sage suggest one.
             </Text>
-            <TouchableOpacity style={[styles.placeholderBtn, { backgroundColor: SAGE_LIGHT }]} onPress={() => setWriteModalVisible(true)}>
+            <TouchableOpacity style={[styles.placeholderBtn, { backgroundColor: SAGE_LIGHT }]} onPress={openWriteOwnModal}>
               <Text style={[styles.placeholderBtnText, { color: SAGE }]}>Create my first vow</Text>
             </TouchableOpacity>
           </View>
@@ -419,7 +507,7 @@ export default function MyVow() {
                 vow={vow}
                 theme={theme}
                 icon="barbell-outline"
-                subtitle="Workout"
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
                 actionLabel="Check in"
                 onPress={() => openDetail(vow)}
                 onAction={() => checkInToday(vow)}
@@ -431,7 +519,7 @@ export default function MyVow() {
                 vow={vow}
                 theme={theme}
                 icon="walk-outline"
-                subtitle="Movement"
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
                 actionLabel="Check in"
                 onPress={() => openDetail(vow)}
                 onAction={() => checkInToday(vow)}
@@ -443,7 +531,7 @@ export default function MyVow() {
                 vow={vow}
                 theme={theme}
                 icon="nutrition-outline"
-                subtitle="Nutrition"
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
                 actionLabel="Check in"
                 onPress={() => openDetail(vow)}
                 onAction={() => checkInToday(vow)}
@@ -467,7 +555,7 @@ export default function MyVow() {
                 vow={vow}
                 theme={theme}
                 icon="heart-outline"
-                subtitle="Mindset"
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
                 actionLabel="Check in"
                 onPress={() => openDetail(vow)}
                 onAction={() => checkInToday(vow)}
@@ -479,7 +567,7 @@ export default function MyVow() {
                 vow={vow}
                 theme={theme}
                 icon="heart-outline"
-                subtitle={vow.category}
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
                 actionLabel="Check in"
                 onPress={() => openDetail(vow)}
                 onAction={() => checkInToday(vow)}
@@ -551,10 +639,10 @@ export default function MyVow() {
         )}
       </ScrollView>
 
-      {/* Suggested Vows modal: cards by category with Add Vow */}
+      {/* Suggested vows: full area below stack header (MyVow Fit) */}
       <Modal visible={suggestedModalVisible} transparent animationType="slide">
-        <View style={styles.modalOverlay}>
-          <View style={[styles.modalBox, { backgroundColor: theme.background }]}>
+        <View style={[styles.suggestedModalRoot, { paddingTop: headerHeight }]}>
+          <View style={[styles.suggestedModalSheet, { backgroundColor: theme.background }]}>
             <View style={styles.modalHeader}>
               <Text style={[styles.modalTitle, { color: theme.text }]}>Suggested vows</Text>
               <TouchableOpacity onPress={() => setSuggestedModalVisible(false)}>
@@ -564,7 +652,11 @@ export default function MyVow() {
             <Text style={[styles.suggestedIntro, { color: theme.text }]}>
               Supportive ideas for movement, nutrition, recovery, and self-compassion. Tap Add Vow to use one—you can edit it before saving.
             </Text>
-            <ScrollView style={styles.modalScroll} showsVerticalScrollIndicator={false}>
+            <ScrollView
+              style={styles.suggestedModalScroll}
+              contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 12) + 16 }}
+              showsVerticalScrollIndicator={false}
+            >
               {SUGGESTED_VOW_CATEGORIES.map((cat) => (
                 <View key={cat} style={styles.suggestedCategory}>
                   <Text style={[styles.suggestedSectionHeader, { color: SAGE }]}>
@@ -586,25 +678,39 @@ export default function MyVow() {
         </View>
       </Modal>
 
-      <Modal visible={writeModalVisible} transparent animationType="slide">
+      <Modal
+        visible={writeModalVisible}
+        animationType="slide"
+        presentationStyle="fullScreen"
+        onRequestClose={() => setWriteModalVisible(false)}
+      >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          style={styles.modalOverlay}
+          style={[styles.writeModalRoot, { backgroundColor: theme.background }]}
         >
-          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-            <View style={styles.modalOverlay}>
-              <View style={[styles.modalBox, { backgroundColor: theme.background }]}>
-                <View style={styles.modalHeader}>
-                  <Text style={[styles.modalTitle, { color: theme.text }]}>Create your own vow</Text>
-                  <TouchableOpacity onPress={() => setWriteModalVisible(false)}>
-                    <Ionicons name="close" size={24} color={theme.text} />
-                  </TouchableOpacity>
-                </View>
-                <ScrollView
-                  style={{ maxHeight: 420 }}
-                  contentContainerStyle={{ paddingBottom: 20 }}
-                  keyboardShouldPersistTaps="handled"
-                >
+          <View
+            style={[
+              styles.writeModalInner,
+              { paddingTop: insets.top + 8, paddingBottom: 0 },
+            ]}
+          >
+            <View style={styles.modalHeader}>
+              <Text style={[styles.modalTitle, { color: theme.text }]}>Create your own vow</Text>
+              <TouchableOpacity onPress={() => setWriteModalVisible(false)} hitSlop={12}>
+                <Ionicons name="close" size={24} color={theme.text} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView
+              style={styles.writeModalScroll}
+              contentContainerStyle={{
+                paddingHorizontal: 4,
+                paddingBottom: 24 + writeKeyboardHeight + Math.max(insets.bottom, 8),
+                flexGrow: 1,
+              }}
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+              showsVerticalScrollIndicator
+            >
               <Text style={[styles.label, { color: theme.text }]}>Your vow</Text>
               <TextInput
                 style={[styles.input, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]}
@@ -613,6 +719,19 @@ export default function MyVow() {
                 placeholder="e.g. Move for 30 minutes this week"
                 placeholderTextColor="#888"
                 multiline
+              />
+              <Text style={[styles.label, { color: theme.text }]}>Why</Text>
+              <Text style={[styles.labelHint, { color: theme.textSecondary }]}>
+                What matters about this promise? (Optional — helps you stay connected when it gets hard.)
+              </Text>
+              <TextInput
+                style={[styles.input, styles.whyInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]}
+                value={writeWhy}
+                onChangeText={setWriteWhy}
+                placeholder="e.g. I feel calmer when I move, and I want to trust myself again."
+                placeholderTextColor="#888"
+                multiline
+                textAlignVertical="top"
               />
               <Text style={[styles.label, { color: theme.text }]}>Times per week (goal)</Text>
               <TextInput
@@ -626,27 +745,42 @@ export default function MyVow() {
                 placeholderTextColor="#888"
                 keyboardType="number-pad"
               />
-              <Text style={[styles.label, { color: theme.text }]}>Category</Text>
+              <Text style={[styles.label, { color: theme.text }]}>Categories</Text>
+              <Text style={[styles.labelHint, { color: theme.textSecondary }]}>
+                Select all that apply (e.g. Movement and Mindset).
+              </Text>
                   <View style={styles.categoryRow}>
-                    {(['Movement', 'Nutrition', 'Recovery', 'Mindset'] as const).map((c) => (
+                    {WRITE_CATEGORY_OPTIONS.map((c) => {
+                      const selected = writeCategories.includes(c);
+                      return (
                       <TouchableOpacity
                         key={c}
-                        style={[styles.categoryChip, writeCategory === c && { backgroundColor: SAGE }, { borderColor: theme.border }]}
-                        onPress={() => setWriteCategory(c)}
+                        style={[styles.categoryChip, selected && { backgroundColor: SAGE }, { borderColor: theme.border }]}
+                        onPress={() => toggleWriteCategory(c)}
                       >
-                        <Text style={[styles.categoryChipText, { color: writeCategory === c ? '#fff' : theme.text }]}>
+                        <Text style={[styles.categoryChipText, { color: selected ? '#fff' : theme.text }]}>
                           {c === 'Mindset' ? 'Mindset' : c}
                         </Text>
                       </TouchableOpacity>
-                    ))}
+                      );
+                    })}
                   </View>
-                </ScrollView>
-                <TouchableOpacity style={[styles.saveBtn, { backgroundColor: SAGE }]} onPress={saveWriteOwn}>
-                  <Text style={styles.saveBtnText}>Save vow</Text>
-                </TouchableOpacity>
-              </View>
+            </ScrollView>
+            <View
+              style={[
+                styles.writeModalFooter,
+                {
+                  borderTopColor: theme.border,
+                  backgroundColor: theme.background,
+                  paddingBottom: Math.max(16, insets.bottom),
+                },
+              ]}
+            >
+              <TouchableOpacity style={[styles.saveBtn, { backgroundColor: SAGE }]} onPress={saveWriteOwn}>
+                <Text style={styles.saveBtnText}>Save vow</Text>
+              </TouchableOpacity>
             </View>
-          </TouchableWithoutFeedback>
+          </View>
         </KeyboardAvoidingView>
       </Modal>
 
@@ -661,7 +795,9 @@ export default function MyVow() {
             </View>
             {selectedVow && (
               <>
-                <Text style={[styles.detailMeta, { color: theme.text }]}>{selectedVow.category} · {selectedVow.status}</Text>
+                <Text style={[styles.detailMeta, { color: theme.text }]}>
+                  {formatVowCategoriesSubtitle(selectedVow.category)} · {selectedVow.status}
+                </Text>
                 {selectedVow.status === 'active' && (
                   <View style={styles.detailActions}>
                     <TouchableOpacity style={[styles.detailBtn, { backgroundColor: SAGE }]} onPress={() => checkInToday(selectedVow)}>
@@ -813,6 +949,26 @@ const styles = StyleSheet.create({
   hint: { fontSize: 14, opacity: 0.8, marginBottom: 8 },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' },
   modalBox: { borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, maxHeight: '85%' },
+  writeModalRoot: { flex: 1 },
+  writeModalInner: { flex: 1, paddingHorizontal: 20 },
+  writeModalScroll: { flex: 1 },
+  writeModalFooter: {
+    paddingHorizontal: 0,
+    paddingTop: 12,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  whyInput: { minHeight: 100, marginBottom: 16 },
+  detailWhyText: { fontSize: 15, lineHeight: 22, opacity: 0.95 },
+  suggestedModalRoot: { flex: 1, backgroundColor: 'transparent' },
+  suggestedModalSheet: {
+    flex: 1,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 20,
+    paddingTop: 20,
+    overflow: 'hidden',
+  },
+  suggestedModalScroll: { flex: 1 },
   modalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 },
   modalTitle: { fontSize: 18, fontWeight: '700', flex: 1 },
   modalScroll: { maxHeight: 420 },
@@ -838,6 +994,7 @@ const styles = StyleSheet.create({
   suggestedItem: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 14, borderRadius: 10, borderWidth: 1, marginBottom: 8 },
   suggestedItemText: { fontSize: 15 },
   label: { fontSize: 14, fontWeight: '600', marginBottom: 6 },
+  labelHint: { fontSize: 12, marginBottom: 8, lineHeight: 16 },
   input: { borderWidth: 1, borderRadius: 10, padding: 12, fontSize: 16, minHeight: 80, marginBottom: 16 },
   categoryRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 16 },
   categoryChip: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 20, borderWidth: 1 },

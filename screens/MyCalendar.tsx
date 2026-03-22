@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -34,6 +34,12 @@ import { useTranslation } from 'react-i18next';
 import { useNotifications } from '../utils/useNotifications';
 import { useRecurringWorkouts } from '../utils/recurringWorkoutUtils';
 import { addMuscleGroupToWeightLog } from '../utils/exerciseDetailUtils';
+import {
+  Gesture,
+  GestureDetector,
+  ScrollView as GestureScrollView,
+} from 'react-native-gesture-handler';
+import { runOnJS } from 'react-native-reanimated';
 
 type MyCalendarNavigationProp = StackNavigationProp<
   WorkoutLogStackParamList,
@@ -99,6 +105,19 @@ export default function MyCalendar() {
     ExerciseDetails[]
   >([]);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
+
+  const workoutsRef = useRef(workouts);
+  const selectedDateRef = useRef(selectedDate);
+  const detailedWorkoutRef = useRef(detailedWorkout);
+  useEffect(() => {
+    workoutsRef.current = workouts;
+  }, [workouts]);
+  useEffect(() => {
+    selectedDateRef.current = selectedDate;
+  }, [selectedDate]);
+  useEffect(() => {
+    detailedWorkoutRef.current = detailedWorkout;
+  }, [detailedWorkout]);
 
   // Reschedule workout flow
   const [rescheduleModalVisible, setRescheduleModalVisible] = useState(false);
@@ -256,12 +275,101 @@ export default function MyCalendar() {
     [db, firstWeekday],
   );
 
-  // Refresh the calendar data every time the screen is focused
+  /** Load workouts for one local calendar day (used when swiping the day modal off-grid). */
+  const fetchWorkoutEntriesForLocalDay = useCallback(
+    async (day: Date): Promise<WorkoutEntry[]> => {
+      const start = new Date(day.getFullYear(), day.getMonth(), day.getDate());
+      const startTimestamp = Math.floor(start.getTime() / 1000);
+      const endTimestamp = startTimestamp + 86399;
+      const allWorkoutsInRange = await db.getAllAsync<
+        WorkoutEntry['workout']
+      >(`SELECT * FROM Workout_Log WHERE workout_date BETWEEN ? AND ?;`, [
+        startTimestamp,
+        endTimestamp,
+      ]);
+      const loggedWorkoutIdsResult = await db.getAllAsync<{
+        workout_log_id: number;
+      }>(
+        `SELECT DISTINCT workout_log_id FROM Weight_Log
+         WHERE workout_log_id IN (SELECT workout_log_id FROM Workout_Log WHERE workout_date BETWEEN ? AND ?);`,
+        [startTimestamp, endTimestamp],
+      );
+      const loggedWorkoutIds = new Set(
+        loggedWorkoutIdsResult.map((item) => item.workout_log_id),
+      );
+      return allWorkoutsInRange.map((workout) => ({
+        workout,
+        isLogged: loggedWorkoutIds.has(workout.workout_log_id),
+      }));
+    },
+    [db],
+  );
+
+  const shiftDayModalBy = useCallback(
+    async (delta: number) => {
+      if (detailedWorkoutRef.current) return;
+      const prev = selectedDateRef.current;
+      if (!prev) return;
+      const next = new Date(
+        prev.getFullYear(),
+        prev.getMonth(),
+        prev.getDate() + delta,
+      );
+      setSelectedDate(next);
+      selectedDateRef.current = next;
+      const dateKey = `${next.getFullYear()}-${String(
+        next.getMonth() + 1,
+      ).padStart(2, '0')}-${String(next.getDate()).padStart(2, '0')}`;
+      const fromMap = workoutsRef.current.get(dateKey);
+      const entries =
+        fromMap !== undefined
+          ? [...fromMap]
+          : await fetchWorkoutEntriesForLocalDay(next);
+      setSelectedDateWorkouts(entries);
+      setDetailedWorkout(null);
+      setExercises([]);
+      setCompletionTime(null);
+    },
+    [fetchWorkoutEntriesForLocalDay],
+  );
+
+  const dayModalSwipeGesture = useMemo(() => {
+    if (detailedWorkout) {
+      return Gesture.Pan().enabled(false);
+    }
+    const trigger = (dir: number) => {
+      void shiftDayModalBy(dir);
+    };
+    return Gesture.Pan()
+      .activeOffsetX([-42, 42])
+      .failOffsetY([-20, 20])
+      .onEnd((e) => {
+        const { translationX, velocityX } = e;
+        if (translationX < -55 || velocityX < -380) {
+          runOnJS(trigger)(1);
+        } else if (translationX > 55 || velocityX > 380) {
+          runOnJS(trigger)(-1);
+        }
+      });
+  }, [detailedWorkout, shiftDayModalBy]);
+
+  // Materialize recurring rows for the visible grid, then load workouts
   useFocusEffect(
     useCallback(() => {
-      console.log('MyCalendar: Screen focused, fetching workouts for grid.');
-      fetchWorkoutsForGrid(currentDate);
-    }, [currentDate, fetchWorkoutsForGrid]),
+      let cancelled = false;
+      (async () => {
+        console.log(
+          'MyCalendar: Screen focused, materializing recurring & fetching grid.',
+        );
+        await checkRecurringWorkouts(currentDate, firstWeekday);
+        if (!cancelled) {
+          await fetchWorkoutsForGrid(currentDate);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [currentDate, firstWeekday, checkRecurringWorkouts, fetchWorkoutsForGrid]),
   );
 
   const fetchWorkoutDetails = async (
@@ -367,7 +475,7 @@ export default function MyCalendar() {
   useEffect(() => {
     const handleRefresh = async () => {
       console.log('DEBUG: Refresh signal received, starting async process.');
-      await checkRecurringWorkouts();
+      await checkRecurringWorkouts(currentDate, firstWeekday);
       console.log('Recurring workouts check complete.');
       await fetchWorkoutsForGrid(currentDate);
       console.log('Calendar grid data re-fetched.');
@@ -382,6 +490,7 @@ export default function MyCalendar() {
     navigation,
     fetchWorkoutsForGrid,
     currentDate,
+    firstWeekday,
     checkRecurringWorkouts,
   ]);
 
@@ -904,6 +1013,7 @@ export default function MyCalendar() {
             { backgroundColor: 'rgba(0, 0, 0, 0.5)' },
           ]}
         >
+          <GestureDetector gesture={dayModalSwipeGesture}>
           <View style={[styles.modalContent, { backgroundColor: theme.card }]}>
             <View style={styles.modalHeader}>
               {detailedWorkout ? (
@@ -960,7 +1070,7 @@ export default function MyCalendar() {
                     </Text>
                   </View>
                 )}
-                <ScrollView style={{ width: '100%', maxHeight: 400 }} showsVerticalScrollIndicator={false}>
+                <GestureScrollView style={{ width: '100%', maxHeight: 400 }} showsVerticalScrollIndicator={false}>
                   {exercises.length > 0 ? (
                     exercises.map((exercise, index) => (
                       <View key={index} style={styles.modalExercise}>
@@ -1003,7 +1113,7 @@ export default function MyCalendar() {
                       {t('noExerciseLogged')}
                     </Text>
                   )}
-                </ScrollView>
+                </GestureScrollView>
               </>
             ) : (
               <>
@@ -1219,6 +1329,7 @@ export default function MyCalendar() {
               </>
             )}
           </View>
+          </GestureDetector>
         </View>
       </Modal>
       )}

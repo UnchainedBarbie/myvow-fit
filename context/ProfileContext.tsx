@@ -16,11 +16,13 @@ import {
   Image,
   Platform,
   Keyboard,
+  KeyboardAvoidingView,
 } from 'react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import * as ImagePicker from 'expo-image-picker';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from './ThemeContext';
 import { useTranslation } from 'react-i18next';
 
@@ -119,6 +121,7 @@ const SAGE_STORAGE_KEYS = {
 function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }: ProfileModalProps) {
   const { theme } = useTheme();
   const { t } = useTranslation();
+  const insets = useSafeAreaInsets();
   const [name, setName] = useState('');
   const [heightFeet, setHeightFeet] = useState('');
   const [heightInches, setHeightInches] = useState('');
@@ -131,6 +134,7 @@ function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }:
   const [sageAllergies, setSageAllergies] = useState('');
   const [sageBrands, setSageBrands] = useState('');
   const [showDatePicker, setShowDatePicker] = useState(false);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
 
   const loadStored = useCallback(async () => {
     try {
@@ -186,6 +190,23 @@ function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }:
     }
   }, [visible, loadStored, loadSageFromStorage]);
 
+  useEffect(() => {
+    if (!visible) {
+      setKeyboardHeight(0);
+      return;
+    }
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const onShow = Keyboard.addListener(showEvent, (e) => {
+      setKeyboardHeight(e.endCoordinates?.height ?? 0);
+    });
+    const onHide = Keyboard.addListener(hideEvent, () => setKeyboardHeight(0));
+    return () => {
+      onShow.remove();
+      onHide.remove();
+    };
+  }, [visible]);
+
   const pickImage = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
@@ -229,17 +250,30 @@ function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }:
     }
   };
 
+  const scrollBottomPad = 24 + keyboardHeight + Math.max(insets.bottom, 8);
+
   return (
     <Modal visible={visible} transparent animationType="slide">
-      <View style={styles.modalOverlay}>
-        <View style={[styles.modalBox, { backgroundColor: theme.card }]}>
-          <View style={[styles.modalHeader, { borderBottomColor: theme.border }]}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>Edit Profile</Text>
-            <TouchableOpacity onPress={onClose} hitSlop={12}>
-              <Ionicons name="close" size={24} color={theme.text} />
-            </TouchableOpacity>
-          </View>
-          <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled" contentContainerStyle={styles.scrollContent}>
+      <KeyboardAvoidingView
+        style={styles.keyboardRoot}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        keyboardVerticalOffset={0}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { backgroundColor: theme.card }]}>
+            <View style={[styles.modalHeader, { borderBottomColor: theme.border }]}>
+              <Text style={[styles.modalTitle, { color: theme.text }]}>Edit Profile</Text>
+              <TouchableOpacity onPress={onClose} hitSlop={12}>
+                <Ionicons name="close" size={24} color={theme.text} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView
+              style={styles.scroll}
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+              contentContainerStyle={[styles.scrollContent, { paddingBottom: scrollBottomPad }]}
+              showsVerticalScrollIndicator
+            >
             <TouchableOpacity style={styles.photoWrap} onPress={pickImage}>
               {photoUri ? (
                 <Image source={{ uri: photoUri }} style={styles.photoCircle} />
@@ -394,19 +428,31 @@ function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }:
                 AsyncStorage.setItem(SAGE_STORAGE_KEYS.brands, text).catch(() => {});
               }}
             />
-          </ScrollView>
-          <View style={[styles.saveFooter, { borderTopColor: theme.border }]}>
-            <TouchableOpacity style={styles.saveBtn} onPress={save} activeOpacity={0.8}>
-              <Text style={styles.saveBtnText}>Save</Text>
-            </TouchableOpacity>
+            </ScrollView>
+            <View
+              style={[
+                styles.saveFooter,
+                {
+                  borderTopColor: theme.border,
+                  paddingBottom: Math.max(16, insets.bottom),
+                },
+              ]}
+            >
+              <TouchableOpacity style={styles.saveBtn} onPress={save} activeOpacity={0.8}>
+                <Text style={styles.saveBtnText}>Save</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
-      </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
+  keyboardRoot: {
+    flex: 1,
+  },
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.4)',
@@ -416,8 +462,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
-    height: '90%',
-    maxHeight: '90%',
+    width: '100%',
+    height: '88%',
+    maxHeight: '92%',
   },
   modalHeader: {
     flexDirection: 'row',
@@ -501,8 +548,8 @@ const styles = StyleSheet.create({
   datePickerAndroid: { width: '100%' },
   sectionLabel: { fontSize: 16, fontWeight: '600', marginTop: 20, marginBottom: 8 },
   saveFooter: {
-    padding: 16,
-    paddingBottom: 32,
+    paddingHorizontal: 16,
+    paddingTop: 16,
     borderTopWidth: 1,
   },
   saveBtn: {

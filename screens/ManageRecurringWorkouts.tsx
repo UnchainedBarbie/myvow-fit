@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, FlatList, Alert, ActivityIndicator } from 'react-native';
+import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { StackNavigationProp } from '@react-navigation/stack';
 import Ionicons from 'react-native-vector-icons/Ionicons';
@@ -7,7 +8,8 @@ import { useTheme } from '../context/ThemeContext';
 import { useTranslation } from 'react-i18next';
 import { WorkoutLogStackParamList } from '../App';
 import { useSQLiteContext } from 'expo-sqlite';
-import { useRecurringWorkouts } from '../utils/recurringWorkoutUtils';
+import { useRecurringWorkouts, unixLocalMidnight } from '../utils/recurringWorkoutUtils';
+import { useSettings } from '../context/SettingsContext';
 
 type NavigationProp = StackNavigationProp<
   WorkoutLogStackParamList,
@@ -20,6 +22,19 @@ interface RecurringWorkout {
   day_name: string;
   recurring_interval: number;
   recurring_days: string | null;
+  recurring_end_date?: number | null;
+}
+
+function formatEndDateShort(ts: number | null | undefined, df: string): string {
+  if (ts == null || ts <= 0) return '';
+  const d = new Date(unixLocalMidnight(ts) * 1000);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  if (df === 'dd-mm-yyyy') {
+    return `${day}-${m}-${y}`;
+  }
+  return `${m}-${day}-${y}`;
 }
 
 // Helper function to format interval description
@@ -45,6 +60,7 @@ export default function ManageRecurringWorkouts() {
   const { t } = useTranslation();
   const db = useSQLiteContext();
   const { deleteRecurringWorkout } = useRecurringWorkouts();
+  const { dateFormat } = useSettings();
 
   const [recurringWorkouts, setRecurringWorkouts] = useState<RecurringWorkout[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -67,7 +83,8 @@ export default function ManageRecurringWorkouts() {
           workout_name, 
           day_name, 
           recurring_interval, 
-          recurring_days 
+          recurring_days,
+          recurring_end_date
         FROM Recurring_Workouts 
         ORDER BY workout_name, day_name`
       );
@@ -126,25 +143,71 @@ export default function ManageRecurringWorkouts() {
     );
   };
 
-  // Render each recurring workout item
-  const renderItem = ({ item }: { item: RecurringWorkout }) => (
-    <TouchableOpacity 
-      style={[styles.workoutItem, { backgroundColor: theme.card }]}
-      onPress={() => navigation.navigate('RecurringWorkoutDetails', { 
-        recurring_workout_id: item.recurring_workout_id 
-      })}
-      onLongPress={() => handleDeleteWorkout(item)}
-      delayLongPress={500}
-    >
-      <Text style={[styles.workoutName, { color: theme.text }]}>
-        {item.workout_name}
-      </Text>
-      <Text style={[styles.workoutDetails, { color: theme.text }]}>
-        {item.day_name} • {getIntervalDescription(item, t)}
-      </Text>
-      <Ionicons name="chevron-forward" size={20} color={theme.text} style={styles.arrow} />
-    </TouchableOpacity>
-  );
+  // Swipe right → Edit (left actions); swipe left → Delete (right actions)
+  const renderItem = ({ item }: { item: RecurringWorkout }) => {
+    let swipeRef: Swipeable | null = null;
+    const renderLeftActions = () => (
+      <RectButton
+        style={styles.swipeEditBtn}
+        onPress={() => {
+          swipeRef?.close();
+          navigation.navigate('EditRecurringWorkout', {
+            recurring_workout_id: item.recurring_workout_id,
+          });
+        }}
+      >
+        <Ionicons name="create-outline" size={22} color="#fff" />
+        <Text style={styles.swipeBtnText}>{t('edit')}</Text>
+      </RectButton>
+    );
+    const renderRightActions = () => (
+      <RectButton
+        style={styles.swipeDeleteBtn}
+        onPress={() => {
+          swipeRef?.close();
+          handleDeleteWorkout(item);
+        }}
+      >
+        <Ionicons name="trash-outline" size={22} color="#fff" />
+        <Text style={styles.swipeBtnText}>{t('delete')}</Text>
+      </RectButton>
+    );
+    const endStr = formatEndDateShort(item.recurring_end_date, dateFormat);
+    const detailLine =
+      endStr !== ''
+        ? `${item.day_name} • ${getIntervalDescription(item, t)} • ${t('recurringEndsOn', { date: endStr })}`
+        : `${item.day_name} • ${getIntervalDescription(item, t)}`;
+    return (
+      <Swipeable
+        ref={(r) => {
+          swipeRef = r;
+        }}
+        renderLeftActions={renderLeftActions}
+        renderRightActions={renderRightActions}
+        friction={2}
+        overshootLeft={false}
+        overshootRight={false}
+      >
+        <TouchableOpacity
+          style={[styles.workoutItem, { backgroundColor: theme.card, borderColor: theme.border }]}
+          activeOpacity={0.7}
+          onPress={() =>
+            navigation.navigate('RecurringWorkoutDetails', {
+              recurring_workout_id: item.recurring_workout_id,
+            })
+          }
+        >
+          <View style={styles.workoutItemTextCol}>
+            <Text style={[styles.workoutName, { color: theme.text }]}>{item.workout_name}</Text>
+            <Text style={[styles.workoutDetails, { color: theme.text }]}>
+              {detailLine}
+            </Text>
+          </View>
+          <Ionicons name="chevron-forward" size={20} color={theme.text} style={styles.arrow} />
+        </TouchableOpacity>
+      </Swipeable>
+    );
+  };
 
   return (
     <View style={[styles.container, { backgroundColor: theme.background }]}>
@@ -214,18 +277,45 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 2,
     elevation: 2,
-    borderColor: 'rgba(0, 0, 0, 0.1)', // More subtle border color
     borderWidth: 1,
+  },
+  workoutItemTextCol: {
+    flex: 1,
+    marginRight: 8,
   },
   workoutName: {
     fontSize: 18,
     fontWeight: 'bold',
-    flex: 1,
   },
   workoutDetails: {
     fontSize: 14,
     opacity: 0.7,
-    marginRight: 10,
+    marginTop: 4,
+  },
+  swipeEditBtn: {
+    backgroundColor: '#E67E22',
+    justifyContent: 'center',
+    alignItems: 'center',
+    width: 88,
+    borderRadius: 12,
+    marginBottom: 12,
+    marginRight: 6,
+    gap: 4,
+  },
+  swipeDeleteBtn: {
+    backgroundColor: '#C0392B',
+    justifyContent: 'center',
+    alignItems: 'center',
+    width: 88,
+    borderRadius: 12,
+    marginBottom: 12,
+    marginLeft: 6,
+    gap: 4,
+  },
+  swipeBtnText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 12,
   },
   arrow: {
     marginLeft: 'auto',
