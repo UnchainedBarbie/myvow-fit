@@ -15,21 +15,27 @@ import {
   Keyboard,
   TouchableWithoutFeedback,
   Share,
+  Modal,
 } from 'react-native';
 import { useTheme } from '../context/ThemeContext';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import { initMealPlansDb } from '../utils/initMealPlansDb';
 import { initNutritionDb } from '../utils/nutritionDb';
 import {
   buildPrepGuideTextFromUniqueFoodNames,
+  buildGroceryListJsonFromPlanFoodRows,
+  buildGroceryListJsonFromUniqueFoodNames,
+  fetchMealPlanFoodRowsForGrocery,
   generateGroceryListFromPlan,
   generatePrepGuideFromPlan,
 } from '../utils/generateMealPlanGroceryAndPrep';
 
 const SAGE = '#7C9A7E';
+const CREAM_MODAL_BG = '#F5F0E8';
 
 type PlanRow = { meal_plan_id: number; name: string };
 
@@ -90,12 +96,36 @@ function buildWeeklyPrepShareText(guideText: string): string {
   return `Weekly meal prep\n\n${t}`;
 }
 
+/** Parse grocery_list JSON into merged rows for the weekly list UI. */
+function groceryJsonToMergedRows(parsed: unknown): MergedGroceryRow[] {
+  if (!Array.isArray(parsed)) return [];
+  const seenGrocery = new Set<string>();
+  const items: MergedGroceryRow[] = [];
+  for (const entry of parsed) {
+    const text = String((entry as { item?: string; text?: string })?.item ?? (entry as { text?: string })?.text ?? '').trim();
+    if (!text) continue;
+    const category = normalizeGroceryCategory((entry as { category?: string })?.category);
+    const key = `${category}|${text.toLowerCase()}`;
+    if (seenGrocery.has(key)) continue;
+    seenGrocery.add(key);
+    items.push({ key, text, category });
+  }
+  items.sort((a, b) => {
+    const ca = GROCERY_CATS.indexOf(a.category);
+    const cb = GROCERY_CATS.indexOf(b.category);
+    if (ca !== cb) return ca - cb;
+    return a.text.localeCompare(b.text);
+  });
+  return items;
+}
+
 export type MealPlanListProps = { weekStart: string; currentWeekStart: string };
 
 export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanListProps) {
   const { theme } = useTheme();
   const db = useSQLiteContext();
   const navigation = useNavigation<any>();
+  const insets = useSafeAreaInsets();
   const [plans, setPlans] = useState<PlanRow[]>([]);
   const [copying, setCopying] = useState(false);
   /** Plans with at least one DayActivePlan row on any day Mon–Sun of the displayed week. */
@@ -106,6 +136,11 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
   const [groceryChecked, setGroceryChecked] = useState<Set<string>>(new Set());
   const [prepStepChecked, setPrepStepChecked] = useState<Record<string, boolean>>({});
   const [regeneratingWeekly, setRegeneratingWeekly] = useState(false);
+  /** When not `database`, merged grocery UI comes from tracker/family generation (not DB merge). */
+  const [groceryUiSource, setGroceryUiSource] = useState<'database' | 'tracker' | 'family'>('database');
+  const [groceryModalVisible, setGroceryModalVisible] = useState(false);
+  const [groceryModalMode, setGroceryModalMode] = useState<'mealPlan' | 'tracker' | 'family'>('mealPlan');
+  const [familySize, setFamilySize] = useState(1);
   const [grocerySectionExpanded, setGrocerySectionExpanded] = useState(false);
   const [prepSectionExpanded, setPrepSectionExpanded] = useState(false);
   const [renamingPlan, setRenamingPlan] = useState<PlanRow | null>(null);
@@ -120,6 +155,10 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
     setGroceryChecked(new Set());
     setPrepStepChecked({});
   }, [weekStart, activePlanIdsSignature]);
+
+  useEffect(() => {
+    setGroceryUiSource('database');
+  }, [weekStart]);
 
   const groceryByCategory = useMemo(() => {
     const map: Record<GroceryCategory, MergedGroceryRow[]> = {
@@ -189,7 +228,8 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
     }
   }, [combinedPrepGuideText]);
 
-  const loadPlans = useCallback(async () => {
+  const loadPlans = useCallback(async (opts?: { groceryForceDb?: boolean }) => {
+    const mergeGroceryFromDb = opts?.groceryForceDb === true || groceryUiSource === 'database';
     await initMealPlansDb(db);
     await initNutritionDb(db as any).catch(() => {});
     try {
@@ -217,8 +257,10 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
     setActivePlanIdsInWeek(new Set(uniqueActive));
 
     if (uniqueActive.length === 0) {
-      setMergedGrocery([]);
       setCombinedPrepGuideText('');
+      if (mergeGroceryFromDb) {
+        setMergedGrocery([]);
+      }
     } else {
       const ph = uniqueActive.map(() => '?').join(',');
       const planRows = (await db
@@ -232,34 +274,31 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
         grocery_list: string | null;
       }[];
 
-      const seenGrocery = new Set<string>();
-      const items: MergedGroceryRow[] = [];
-      for (const p of planRows) {
-        const raw = p.grocery_list;
-        if (!raw) continue;
-        try {
-          const parsed = JSON.parse(raw);
-          if (!Array.isArray(parsed)) continue;
-          for (const entry of parsed) {
-            const text = String(entry?.item ?? entry?.text ?? '').trim();
-            if (!text) continue;
-            const category = normalizeGroceryCategory(entry?.category);
-            const key = `${category}|${text.toLowerCase()}`;
-            if (seenGrocery.has(key)) continue;
-            seenGrocery.add(key);
-            items.push({ key, text, category });
+      if (mergeGroceryFromDb) {
+        const deduped: MergedGroceryRow[] = [];
+        const seenKey = new Set<string>();
+        for (const p of planRows) {
+          const raw = p.grocery_list;
+          if (!raw) continue;
+          try {
+            const parsed = JSON.parse(raw);
+            for (const row of groceryJsonToMergedRows(parsed)) {
+              if (seenKey.has(row.key)) continue;
+              seenKey.add(row.key);
+              deduped.push(row);
+            }
+          } catch {
+            /* ignore malformed grocery JSON */
           }
-        } catch {
-          /* ignore malformed grocery JSON */
         }
+        deduped.sort((a, b) => {
+          const ca = GROCERY_CATS.indexOf(a.category);
+          const cb = GROCERY_CATS.indexOf(b.category);
+          if (ca !== cb) return ca - cb;
+          return a.text.localeCompare(b.text);
+        });
+        setMergedGrocery(deduped);
       }
-      items.sort((a, b) => {
-        const ca = GROCERY_CATS.indexOf(a.category);
-        const cb = GROCERY_CATS.indexOf(b.category);
-        if (ca !== cb) return ca - cb;
-        return a.text.localeCompare(b.text);
-      });
-      setMergedGrocery(items);
 
       const fromPlanned = (await db
         .getAllAsync<{ food_name: string }>(
@@ -281,7 +320,11 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       ];
       setCombinedPrepGuideText(buildPrepGuideTextFromUniqueFoodNames(allFoodNames));
     }
-  }, [db, weekStart, currentWeekStart]);
+  }, [db, weekStart, currentWeekStart, groceryUiSource]);
+
+  const applyGroceryJsonToUi = useCallback((list: { category: string; item: string; checked?: boolean }[]) => {
+    setMergedGrocery(groceryJsonToMergedRows(list));
+  }, []);
 
   /** Build grocery_list + prep_guide from each active plan's meals (PlannedMeals / MealPlanItems). */
   const regenerateWeeklyForActivePlans = useCallback(async () => {
@@ -297,7 +340,8 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
         await generateGroceryListFromPlan(db, id);
         await generatePrepGuideFromPlan(db, id);
       }
-      await loadPlans();
+      setGroceryUiSource('database');
+      await loadPlans({ groceryForceDb: true });
     } catch (e) {
       console.error('regenerateWeeklyForActivePlans', e);
       Alert.alert(
@@ -308,6 +352,90 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       setRegeneratingWeekly(false);
     }
   }, [activePlanIdsInWeek, db, loadPlans]);
+
+  const confirmGroceryModal = useCallback(async () => {
+    if (groceryModalMode === 'mealPlan') {
+      setGroceryModalVisible(false);
+      await regenerateWeeklyForActivePlans();
+      setGrocerySectionExpanded(true);
+      return;
+    }
+
+    if (groceryModalMode === 'tracker') {
+      setRegeneratingWeekly(true);
+      try {
+        await initNutritionDb(db as any).catch(() => {});
+        const monday = currentWeekStart;
+        const sunday = sundayOfWeekIso(monday);
+        const rows = (await db
+          .getAllAsync<{ food_name: string }>(
+            `SELECT DISTINCT lf.food_name AS food_name
+             FROM LoggedFoods lf
+             INNER JOIN DailyLog dl ON lf.log_id = dl.log_id
+             WHERE dl.log_date >= ? AND dl.log_date <= ?
+               AND lf.food_name IS NOT NULL AND TRIM(lf.food_name) != ''`,
+            [monday, sunday],
+          )
+          .catch(() => [])) as { food_name: string }[];
+        const names = rows.map((r) => r.food_name).filter(Boolean);
+        if (names.length === 0) {
+          Alert.alert(
+            'No logged foods',
+            'Nothing logged for the current calendar week yet. Add foods in Nutrition (Today) for Mon–Sun, then try again.',
+          );
+          return;
+        }
+        const json = buildGroceryListJsonFromUniqueFoodNames(names);
+        setGroceryUiSource('tracker');
+        applyGroceryJsonToUi(json);
+        setGroceryModalVisible(false);
+        setGrocerySectionExpanded(true);
+      } catch (e) {
+        console.error('confirmGroceryModal tracker', e);
+        Alert.alert('Could not build list', 'Try again in a moment.');
+      } finally {
+        setRegeneratingWeekly(false);
+      }
+      return;
+    }
+
+    const ids = [...activePlanIdsInWeek];
+    if (ids.length === 0) {
+      Alert.alert('No active plans', 'Set an active meal plan for this week to scale a family grocery list.');
+      return;
+    }
+    setRegeneratingWeekly(true);
+    try {
+      await initNutritionDb(db as any).catch(() => {});
+      const allRows: { food_name: string; serving_size?: string | null }[] = [];
+      for (const id of ids) {
+        const rows = await fetchMealPlanFoodRowsForGrocery(db, id);
+        allRows.push(...rows);
+      }
+      if (allRows.length === 0) {
+        Alert.alert('No foods in plans', 'Add foods to your active meal plans first.');
+        return;
+      }
+      const json = buildGroceryListJsonFromPlanFoodRows(allRows, { familySize });
+      setGroceryUiSource('family');
+      applyGroceryJsonToUi(json);
+      setGroceryModalVisible(false);
+      setGrocerySectionExpanded(true);
+    } catch (e) {
+      console.error('confirmGroceryModal family', e);
+      Alert.alert('Could not build list', 'Try again in a moment.');
+    } finally {
+      setRegeneratingWeekly(false);
+    }
+  }, [
+    applyGroceryJsonToUi,
+    currentWeekStart,
+    db,
+    familySize,
+    groceryModalMode,
+    regenerateWeeklyForActivePlans,
+    activePlanIdsInWeek,
+  ]);
 
   useFocusEffect(
     useCallback(() => {
@@ -475,12 +603,16 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       {activePlanIdsInWeek.size > 0 ? (
         <View style={[styles.weeklyActionCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
           <Text style={[styles.weeklyActionHint, { color: theme.textSecondary }]}>
-            Grocery and prep are created from the foods in each <Text style={{ fontWeight: '700' }}>active</Text> plan.
-            Tap after you add or change meals.
+            Grocery and prep come from your <Text style={{ fontWeight: '700' }}>active</Text> plans, or choose tracker /
+            family options in the generator. Tap after you add or change meals.
           </Text>
           <TouchableOpacity
             style={[styles.refreshWeeklyBtn, { backgroundColor: SAGE }]}
-            onPress={regenerateWeeklyForActivePlans}
+            onPress={() => {
+              setGroceryModalMode('mealPlan');
+              setFamilySize(1);
+              setGroceryModalVisible(true);
+            }}
             disabled={regeneratingWeekly}
             activeOpacity={0.85}
           >
@@ -488,12 +620,8 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
               <ActivityIndicator color="#fff" />
             ) : (
               <View style={styles.refreshWeeklyBtnInner}>
-                <Ionicons name="refresh" size={20} color="#fff" />
-                <Text style={styles.refreshWeeklyBtnText}>
-                  {mergedGrocery.length === 0 && !combinedPrepGuideText.trim()
-                    ? 'Generate grocery list & meal prep'
-                    : 'Refresh grocery list & meal prep'}
-                </Text>
+                <Ionicons name="cart-outline" size={20} color="#fff" />
+                <Text style={styles.refreshWeeklyBtnText}>Generate grocery list</Text>
               </View>
             )}
           </TouchableOpacity>
@@ -530,8 +658,12 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
         {grocerySectionExpanded ? (
           <>
             <Text style={[styles.sectionSub, { color: theme.textSecondary }]}>
-              Merged from all meal plans active this week ({weekStart} – {sundayOfWeekIso(weekStart)}). Tap
-              share to send to Notes, Messages, etc.
+              {groceryUiSource === 'tracker'
+                ? `From foods logged this calendar week (${currentWeekStart} – ${sundayOfWeekIso(currentWeekStart)}).`
+                : groceryUiSource === 'family'
+                  ? `Scaled for ${familySize} people from active plans' template foods (not saved to each plan).`
+                  : `Merged from stored lists for plans active this week (${weekStart} – ${sundayOfWeekIso(weekStart)}).`}{' '}
+              Tap share to send to Notes, Messages, etc.
             </Text>
             {activePlanIdsInWeek.size === 0 ? (
               <Text style={[styles.sectionHint, { color: theme.textSecondary }]}>
@@ -703,6 +835,121 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
         ListEmptyComponent={emptyComponent}
         ListFooterComponent={listFooter}
       />
+      <Modal
+        visible={groceryModalVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={() => !regeneratingWeekly && setGroceryModalVisible(false)}
+      >
+        <View style={styles.groceryModalOverlay}>
+          <TouchableOpacity
+            style={StyleSheet.absoluteFill}
+            activeOpacity={1}
+            onPress={() => !regeneratingWeekly && setGroceryModalVisible(false)}
+          />
+          <View
+            style={[
+              styles.groceryModalSheet,
+              {
+                paddingBottom: Math.max(insets.bottom, 20) + 8,
+                backgroundColor: CREAM_MODAL_BG,
+                borderColor: SAGE,
+              },
+            ]}
+          >
+            <View style={styles.groceryModalHeaderRow}>
+              <Text style={styles.groceryModalTitle}>Generate grocery list</Text>
+              <TouchableOpacity
+                onPress={() => !regeneratingWeekly && setGroceryModalVisible(false)}
+                hitSlop={12}
+                accessibilityLabel="Close"
+              >
+                <Ionicons name="close" size={26} color="#333" />
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.groceryModalHint}>
+              Choose a source. Meal plan updates your saved lists and meal prep; tracker and family views are for shopping only.
+            </Text>
+
+            {(
+              [
+                { mode: 'mealPlan' as const, title: 'My Meal Plan', sub: 'From active meal plan templates (saved to each plan + prep guide).' },
+                { mode: 'tracker' as const, title: "This Week's Tracker", sub: `Logged foods Mon–Sun for ${currentWeekStart} week.` },
+                { mode: 'family' as const, title: 'Family Size', sub: 'Scale template servings for multiple people (shopping list only).' },
+              ] as const
+            ).map((opt) => {
+              const selected = groceryModalMode === opt.mode;
+              return (
+                <TouchableOpacity
+                  key={opt.mode}
+                  style={[
+                    styles.groceryModalOption,
+                    {
+                      borderColor: selected ? SAGE : 'rgba(124, 154, 126, 0.35)',
+                      backgroundColor: selected ? SAGE : 'rgba(255, 252, 247, 0.95)',
+                    },
+                  ]}
+                  onPress={() => setGroceryModalMode(opt.mode)}
+                  activeOpacity={0.85}
+                >
+                  <Text
+                    style={[
+                      styles.groceryModalOptionTitle,
+                      { color: selected ? '#fff' : '#2c2c2c' },
+                    ]}
+                  >
+                    {opt.title}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.groceryModalOptionSub,
+                      { color: selected ? 'rgba(255,255,255,0.92)' : '#555' },
+                    ]}
+                  >
+                    {opt.sub}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+
+            {groceryModalMode === 'family' ? (
+              <View style={styles.groceryModalStepperRow}>
+                <Text style={styles.groceryModalStepperLabel}>People</Text>
+                <View style={styles.groceryModalStepper}>
+                  <TouchableOpacity
+                    style={[styles.groceryModalStepperBtn, { borderColor: SAGE }]}
+                    onPress={() => setFamilySize((n) => Math.max(1, n - 1))}
+                    disabled={familySize <= 1}
+                  >
+                    <Ionicons name="remove" size={22} color={familySize <= 1 ? '#ccc' : SAGE} />
+                  </TouchableOpacity>
+                  <Text style={styles.groceryModalStepperValue}>{familySize}</Text>
+                  <TouchableOpacity
+                    style={[styles.groceryModalStepperBtn, { borderColor: SAGE }]}
+                    onPress={() => setFamilySize((n) => Math.min(8, n + 1))}
+                    disabled={familySize >= 8}
+                  >
+                    <Ionicons name="add" size={22} color={familySize >= 8 ? '#ccc' : SAGE} />
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : null}
+
+            <TouchableOpacity
+              style={[styles.groceryModalPrimaryBtn, { backgroundColor: SAGE, opacity: regeneratingWeekly ? 0.7 : 1 }]}
+              onPress={confirmGroceryModal}
+              disabled={regeneratingWeekly}
+            >
+              {regeneratingWeekly ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.groceryModalPrimaryBtnText}>Generate</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       {renamingPlan && (
         <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
           <View style={styles.renameOverlay}>
@@ -895,4 +1142,104 @@ const styles = StyleSheet.create({
   checkRowText: { flex: 1, fontSize: 15, lineHeight: 22 },
   checkRowTextDone: { textDecorationLine: 'line-through', opacity: 0.55 },
   prepStepText: { fontSize: 14 },
+  groceryModalOverlay: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  groceryModalSheet: {
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    borderWidth: 1,
+    paddingHorizontal: 20,
+    paddingTop: 18,
+    maxHeight: '88%',
+  },
+  groceryModalHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  groceryModalTitle: {
+    fontFamily: 'CormorantGaramond-Bold',
+    fontSize: 26,
+    color: '#2a2a2a',
+    flex: 1,
+    paddingRight: 8,
+  },
+  groceryModalHint: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 14,
+    lineHeight: 20,
+    color: '#444',
+    marginBottom: 16,
+  },
+  groceryModalOption: {
+    borderRadius: 12,
+    borderWidth: 1,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    marginBottom: 10,
+  },
+  groceryModalOptionTitle: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  groceryModalOptionSub: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  groceryModalStepperRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 16,
+    marginTop: 4,
+    paddingHorizontal: 4,
+  },
+  groceryModalStepperLabel: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 16,
+    color: '#333',
+  },
+  groceryModalStepper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 16,
+  },
+  groceryModalStepperBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 252, 247, 0.95)',
+  },
+  groceryModalStepperValue: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 20,
+    fontWeight: '600',
+    minWidth: 28,
+    textAlign: 'center',
+    color: '#222',
+  },
+  groceryModalPrimaryBtn: {
+    marginTop: 8,
+    paddingVertical: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 52,
+  },
+  groceryModalPrimaryBtnText: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#fff',
+  },
 });

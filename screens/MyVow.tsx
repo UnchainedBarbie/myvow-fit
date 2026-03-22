@@ -39,39 +39,114 @@ const CREAM = '#FDF8F0';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const RING_SIZE = (SCREEN_WIDTH - 32 - 24) / 4 - 8; // 4 rings with gap
 
-// Suggested vows by category: Mindset first, then Movement, Nutrition, Recovery
-const SUGGESTED_VOW_CATEGORIES = ['Mindset', 'Movement', 'Nutrition', 'Recovery'] as const;
-type SuggestedCategory = (typeof SUGGESTED_VOW_CATEGORIES)[number];
-
-const SUGGESTED_VOWS: Record<SuggestedCategory, string[]> = {
-  Movement: [
-    'Move my body 3 times this week',
-    'Take a 20 minute walk when I feel stressed',
-    'Stretch for 10 minutes twice this week',
-  ],
-  Nutrition: [
-    'Eat protein with every meal',
-    'Drink water before coffee',
-    'Cook one nourishing meal this week',
-  ],
-  Recovery: [
-    'Sleep 7+ hours three nights this week',
-    'Take one full rest day',
-    'Spend 10 minutes outside',
-  ],
-  Mindset: [
-    'Love myself even when I miss a workout',
-    'Speak to my body with kindness',
-    'Celebrate effort, not perfection',
-    'Rest when my body asks for it',
-  ],
-};
+/** Suggested vow groups: label for UI, id = category stored on the vow when chosen. */
+const SUGGESTED_VOW_GROUPS = [
+  {
+    id: 'NervousSystem',
+    label: 'Nervous System & Stress',
+    vows: [
+      'Limit caffeine to 1 cup before noon',
+      'No screens 30 min before bed',
+      '5 min breathing exercise daily',
+      'Cold shower in the morning',
+      '10 min walk outside daily',
+      'No phone first 30 min of waking',
+      'No news before noon',
+      'Set a phone cutoff time',
+    ],
+  },
+  {
+    id: 'Nutrition',
+    label: 'Nutrition & Gut Health',
+    vows: [
+      'Cut out processed sugar',
+      'No artificial sweeteners',
+      'No seed oils',
+      'Eat whole foods only',
+      'No alcohol on weekdays',
+      'Drink 8 glasses of water daily',
+      'No eating after 8pm',
+      'Eat breakfast within 1 hour of waking',
+      'No fast food',
+    ],
+  },
+  {
+    id: 'BodyCare',
+    label: 'Body Care & Self Care',
+    vows: [
+      'Apply lotion before bed',
+      'Wash face morning and night',
+      'Take vitamins daily',
+      'Floss daily',
+      'Stretch for 5 min before bed',
+      'Dry brush before shower',
+      'Epsom salt bath once a week',
+      'Apply SPF every morning',
+      'Do nails once a week',
+      'Hair mask once a week',
+    ],
+  },
+  {
+    id: 'Mindset',
+    label: 'Mindset',
+    vows: [
+      'Journal 5 min daily',
+      'Gratitude practice morning or night',
+      '10 min meditation daily',
+      'Read 10 pages before bed',
+      'No negative self talk',
+      'Say one affirmation daily',
+      'Weekly self check-in',
+    ],
+  },
+  {
+    id: 'Sleep',
+    label: 'Sleep',
+    vows: [
+      'In bed by 10pm',
+      'No alcohol within 3 hours of sleep',
+      'Keep bedroom cool and dark',
+      'Same wake time every day',
+      'No naps after 3pm',
+    ],
+  },
+] as const;
 
 /** User-selectable categories when creating a vow (stored comma-separated in DB). */
-const WRITE_CATEGORY_OPTIONS = ['Movement', 'Nutrition', 'Recovery', 'Mindset'] as const;
+const WRITE_CATEGORY_OPTIONS = [
+  'NervousSystem',
+  'Nutrition',
+  'BodyCare',
+  'Mindset',
+  'Sleep',
+  'Movement',
+  'Recovery',
+  'Fitness',
+] as const;
+
+/** Friendly labels for chips and vow subtitles. */
+const CATEGORY_DISPLAY_LABELS: Record<string, string> = {
+  NervousSystem: 'Nervous system & stress',
+  Nutrition: 'Nutrition & gut',
+  BodyCare: 'Body care',
+  Mindset: 'Mindset',
+  Sleep: 'Sleep',
+  Movement: 'Movement',
+  Recovery: 'Recovery',
+  Fitness: 'Fitness',
+};
 
 /** Order for picking which section list a vow appears under (first match wins). */
-const VOW_SECTION_ORDER = ['Fitness', 'Movement', 'Nutrition', 'Recovery', 'Mindset'] as const;
+const VOW_SECTION_ORDER = [
+  'Fitness',
+  'Movement',
+  'Nutrition',
+  'NervousSystem',
+  'BodyCare',
+  'Mindset',
+  'Sleep',
+  'Recovery',
+] as const;
 
 function parseVowCategoryTokens(raw: string | null | undefined): string[] {
   if (!raw?.trim()) return [];
@@ -90,9 +165,7 @@ function vowPrimarySection(raw: string): (typeof VOW_SECTION_ORDER)[number] | 'o
 function formatVowCategoriesSubtitle(raw: string): string {
   const tokens = parseVowCategoryTokens(raw);
   if (tokens.length === 0) return 'Custom';
-  return tokens
-    .map((t) => (t === 'Mindset' ? 'Mindset / Self-Compassion' : t))
-    .join(' · ');
+  return tokens.map((t) => CATEGORY_DISPLAY_LABELS[t] ?? t).join(' · ');
 }
 
 function sortWriteCategories(cats: string[]): string[] {
@@ -106,37 +179,6 @@ function sortWriteCategories(cats: string[]): string[] {
 
 function todayYmd() {
   return new Date().toISOString().split('T')[0];
-}
-
-// Selectable suggested vow card: vow text, category label, Add Vow button
-function SuggestedVowCard({
-  text,
-  category,
-  theme,
-  onAddVow,
-}: {
-  text: string;
-  category: SuggestedCategory;
-  theme: any;
-  onAddVow: () => void;
-}) {
-  return (
-    <View style={[styles.suggestedVowCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
-      <View style={styles.suggestedVowCardBody}>
-        <Text style={[styles.suggestedVowCardCategory, { color: SAGE }]}>
-          {category === 'Mindset' ? 'Mindset / Self-Compassion' : category}
-        </Text>
-        <Text style={[styles.suggestedVowCardText, { color: theme.text }]}>{text}</Text>
-      </View>
-      <TouchableOpacity
-        style={[styles.suggestedVowCardButton, { backgroundColor: SAGE }]}
-        onPress={onAddVow}
-        activeOpacity={0.85}
-      >
-        <Text style={styles.suggestedVowCardButtonText}>Add Vow</Text>
-      </TouchableOpacity>
-    </View>
-  );
 }
 
 // Circular progress ring (0–100). Always visible. Uses SVG for a proper arc.
@@ -187,6 +229,8 @@ export default function MyVow() {
   const [loading, setLoading] = useState(true);
 
   const [suggestedModalVisible, setSuggestedModalVisible] = useState(false);
+  /** Which suggested-vow accordion sections are expanded (by group id). */
+  const [suggestedExpandedIds, setSuggestedExpandedIds] = useState<Set<string>>(new Set());
   const [writeModalVisible, setWriteModalVisible] = useState(false);
   const [detailModalVisible, setDetailModalVisible] = useState(false);
   const [selectedVow, setSelectedVow] = useState<VowRow | null>(null);
@@ -373,6 +417,15 @@ export default function MyVow() {
     ]);
   };
 
+  const toggleSuggestedGroup = (groupId: string) => {
+    setSuggestedExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  };
+
   // Open write modal with suggestion pre-filled so user can edit before saving
   const openAddSuggestedVow = (title: string, category: string) => {
     setWriteText(title);
@@ -452,8 +505,11 @@ export default function MyVow() {
   const fitnessVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Fitness');
   const movementVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Movement');
   const nutritionVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Nutrition');
-  const recoveryVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Recovery');
+  const nervousSystemVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'NervousSystem');
+  const bodyCareVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'BodyCare');
   const mindsetVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Mindset');
+  const sleepVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Sleep');
+  const recoveryVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'Recovery');
   const otherVows = activeVows.filter((v) => vowPrimarySection(v.category) === 'other');
   const historyCount = completedVows.length + brokenVows.length;
 
@@ -480,7 +536,13 @@ export default function MyVow() {
               <Ionicons name="create-outline" size={18} color={SAGE} />
               <Text style={[styles.ctaSecondaryText, { color: SAGE }]}>Create my own vow</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={[styles.ctaSecondary, { borderColor: SAGE }]} onPress={() => setSuggestedModalVisible(true)}>
+            <TouchableOpacity
+              style={[styles.ctaSecondary, { borderColor: SAGE }]}
+              onPress={() => {
+                setSuggestedExpandedIds(new Set());
+                setSuggestedModalVisible(true);
+              }}
+            >
               <Ionicons name="list-outline" size={18} color={SAGE} />
               <Text style={[styles.ctaSecondaryText, { color: SAGE }]}>Suggested vows</Text>
             </TouchableOpacity>
@@ -537,13 +599,25 @@ export default function MyVow() {
                 onAction={() => checkInToday(vow)}
               />
             ))}
-            {recoveryVows.map((vow) => (
+            {nervousSystemVows.map((vow) => (
               <VowCard
                 key={vow.vow_id}
                 vow={vow}
                 theme={theme}
-                icon="moon-outline"
-                subtitle="Recovery"
+                icon="pulse-outline"
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
+                actionLabel="Check in"
+                onPress={() => openDetail(vow)}
+                onAction={() => checkInToday(vow)}
+              />
+            ))}
+            {bodyCareVows.map((vow) => (
+              <VowCard
+                key={vow.vow_id}
+                vow={vow}
+                theme={theme}
+                icon="sparkles-outline"
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
                 actionLabel="Check in"
                 onPress={() => openDetail(vow)}
                 onAction={() => checkInToday(vow)}
@@ -555,6 +629,30 @@ export default function MyVow() {
                 vow={vow}
                 theme={theme}
                 icon="heart-outline"
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
+                actionLabel="Check in"
+                onPress={() => openDetail(vow)}
+                onAction={() => checkInToday(vow)}
+              />
+            ))}
+            {sleepVows.map((vow) => (
+              <VowCard
+                key={vow.vow_id}
+                vow={vow}
+                theme={theme}
+                icon="bed-outline"
+                subtitle={formatVowCategoriesSubtitle(vow.category)}
+                actionLabel="Check in"
+                onPress={() => openDetail(vow)}
+                onAction={() => checkInToday(vow)}
+              />
+            ))}
+            {recoveryVows.map((vow) => (
+              <VowCard
+                key={vow.vow_id}
+                vow={vow}
+                theme={theme}
+                icon="leaf-outline"
                 subtitle={formatVowCategoriesSubtitle(vow.category)}
                 actionLabel="Check in"
                 onPress={() => openDetail(vow)}
@@ -650,29 +748,40 @@ export default function MyVow() {
               </TouchableOpacity>
             </View>
             <Text style={[styles.suggestedIntro, { color: theme.text }]}>
-              Supportive ideas for movement, nutrition, recovery, and self-compassion. Tap Add Vow to use one—you can edit it before saving.
+              Tap a category to expand it, then tap a vow to open the editor—you can adjust the text, why, and frequency before saving.
             </Text>
             <ScrollView
               style={styles.suggestedModalScroll}
               contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 12) + 16 }}
               showsVerticalScrollIndicator={false}
             >
-              {SUGGESTED_VOW_CATEGORIES.map((cat) => (
-                <View key={cat} style={styles.suggestedCategory}>
-                  <Text style={[styles.suggestedSectionHeader, { color: SAGE }]}>
-                    {cat === 'Mindset' ? 'Mindset / Self-Compassion' : cat}
-                  </Text>
-                  {SUGGESTED_VOWS[cat].map((title, i) => (
-                    <SuggestedVowCard
-                      key={`${cat}-${i}`}
-                      text={title}
-                      category={cat}
-                      theme={theme}
-                      onAddVow={() => openAddSuggestedVow(title, cat)}
-                    />
-                  ))}
-                </View>
-              ))}
+              {SUGGESTED_VOW_GROUPS.map((group) => {
+                const expanded = suggestedExpandedIds.has(group.id);
+                return (
+                  <View key={group.id} style={styles.suggestedCategory}>
+                    <TouchableOpacity
+                      style={[styles.suggestedAccordionHeader, { borderColor: theme.border, backgroundColor: theme.card }]}
+                      onPress={() => toggleSuggestedGroup(group.id)}
+                      activeOpacity={0.75}
+                    >
+                      <Text style={[styles.suggestedAccordionTitle, { color: theme.text }]}>{group.label}</Text>
+                      <Ionicons name={expanded ? 'chevron-up' : 'chevron-down'} size={22} color={SAGE} />
+                    </TouchableOpacity>
+                    {expanded &&
+                      group.vows.map((title, i) => (
+                        <TouchableOpacity
+                          key={`${group.id}-${i}`}
+                          style={[styles.suggestedVowRow, { borderColor: theme.border, backgroundColor: theme.card }]}
+                          onPress={() => openAddSuggestedVow(title, group.id)}
+                          activeOpacity={0.85}
+                        >
+                          <Text style={[styles.suggestedVowRowText, { color: theme.text }]}>{title}</Text>
+                          <Ionicons name="chevron-forward" size={18} color={SAGE} />
+                        </TouchableOpacity>
+                      ))}
+                  </View>
+                );
+              })}
             </ScrollView>
           </View>
         </View>
@@ -759,7 +868,7 @@ export default function MyVow() {
                         onPress={() => toggleWriteCategory(c)}
                       >
                         <Text style={[styles.categoryChipText, { color: selected ? '#fff' : theme.text }]}>
-                          {c === 'Mindset' ? 'Mindset' : c}
+                          {CATEGORY_DISPLAY_LABELS[c] ?? c}
                         </Text>
                       </TouchableOpacity>
                       );
@@ -973,23 +1082,30 @@ const styles = StyleSheet.create({
   modalTitle: { fontSize: 18, fontWeight: '700', flex: 1 },
   modalScroll: { maxHeight: 420 },
   suggestedIntro: { fontSize: 14, lineHeight: 20, opacity: 0.9, marginBottom: 16 },
-  suggestedCategory: { marginBottom: 24 },
-  suggestedSectionHeader: { fontSize: 16, fontWeight: '700', marginBottom: 10 },
-  suggestedVowCard: {
-    padding: 16,
-    borderRadius: 16,
-    borderWidth: 1,
-    marginBottom: 12,
-  },
-  suggestedVowCardBody: { marginBottom: 14 },
-  suggestedVowCardCategory: { fontSize: 12, fontWeight: '700', marginBottom: 6 },
-  suggestedVowCardText: { fontSize: 15, lineHeight: 22 },
-  suggestedVowCardButton: {
-    paddingVertical: 12,
-    borderRadius: 12,
+  suggestedCategory: { marginBottom: 12 },
+  suggestedAccordionHeader: {
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 8,
   },
-  suggestedVowCardButtonText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+  suggestedAccordionTitle: { fontSize: 16, fontWeight: '700', flex: 1, paddingRight: 8 },
+  suggestedVowRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    borderWidth: 1,
+    marginBottom: 8,
+    marginLeft: 4,
+  },
+  suggestedVowRowText: { fontSize: 15, lineHeight: 22, flex: 1, paddingRight: 10 },
   categoryLabel: { fontSize: 14, fontWeight: '700', marginBottom: 8 },
   suggestedItem: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 14, borderRadius: 10, borderWidth: 1, marginBottom: 8 },
   suggestedItemText: { fontSize: 15 },

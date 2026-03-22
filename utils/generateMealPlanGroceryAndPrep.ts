@@ -901,7 +901,7 @@ function categorizeFood(name: string): FoodKind {
   return 'other';
 }
 
-function groceryCategoryFromFood(foodName: string): string {
+export function groceryCategoryFromFood(foodName: string): string {
   const kind = categorizeFood(foodName);
   const map: Record<string, string> = {
     grain: 'Pantry',
@@ -913,18 +913,56 @@ function groceryCategoryFromFood(foodName: string): string {
   return map[kind] ?? 'Other';
 }
 
-export async function generateGroceryListFromPlan(db: any, planId: number): Promise<void> {
-  let rows: { meal_type: string; food_name: string; brand?: string | null; serving_size?: string | null }[] =
-    await db
-      .getAllAsync(
-        `SELECT pm.meal_type, fi.food_name, fi.brand, fi.serving_size
+const GROCERY_JSON_CATEGORY_ORDER = ['Produce', 'Meat & Fish', 'Dairy', 'Pantry', 'Other'] as const;
+
+/**
+ * Scale a leading decimal number in a serving string (e.g. "2 cups" → "6 cups" for factor 3).
+ * If no leading number, prefixes "factor× ".
+ */
+export function scaleNumericPrefixInString(s: string, factor: number): string {
+  if (factor <= 1) return s;
+  const t = s.trim();
+  const m = t.match(/^(\d+(?:\.\d+)?)(\s*)(.*)$/);
+  if (!m) return `${factor}× ${t}`;
+  const num = parseFloat(m[1]) * factor;
+  const rounded = Math.round(num * 1000) / 1000;
+  const numStr = Number.isInteger(rounded) ? String(Math.round(rounded)) : String(rounded);
+  return `${numStr}${m[2]}${m[3]}`;
+}
+
+export function formatGroceryItemLine(
+  foodName: string,
+  servingSize: string | null | undefined,
+  familySize: number,
+): string {
+  const name = String(foodName ?? '').trim();
+  const ss = servingSize?.trim();
+  const n = Math.max(1, Math.min(8, familySize));
+  if (!ss) {
+    if (n > 1) return `${name} (×${n})`;
+    return name;
+  }
+  const scaled = n > 1 ? scaleNumericPrefixInString(ss, n) : ss;
+  return `${name} — ${scaled}`;
+}
+
+export type GroceryListJsonEntry = { category: string; item: string; checked: boolean };
+
+/** Load food rows used to build a grocery list for one meal plan (PlannedMeals + FoodItems, or MealPlanItems). */
+export async function fetchMealPlanFoodRowsForGrocery(
+  db: any,
+  planId: number,
+): Promise<{ food_name: string; serving_size?: string | null }[]> {
+  let rows: { meal_type: string; food_name: string; serving_size?: string | null }[] = await db
+    .getAllAsync(
+      `SELECT pm.meal_type, fi.food_name, fi.serving_size
      FROM PlannedMeals pm
      JOIN FoodItems fi ON fi.meal_id = pm.meal_id
      WHERE pm.meal_plan_id = ?
      ORDER BY pm.meal_order, fi.food_id`,
-        [planId],
-      )
-      .catch(() => []);
+      [planId],
+    )
+    .catch(() => []);
   if (rows.length === 0) {
     const fallback = (await db
       .getAllAsync(
@@ -934,6 +972,15 @@ export async function generateGroceryListFromPlan(db: any, planId: number): Prom
       .catch(() => [])) as { meal_type: string | null; food_name: string }[];
     rows = fallback.map((r) => ({ meal_type: r.meal_type || 'Other', food_name: r.food_name }));
   }
+  return rows.map((r) => ({ food_name: r.food_name, serving_size: r.serving_size ?? null }));
+}
+
+/** Build grocery JSON using the same categorization as per-plan generation; optional family size scales servings. */
+export function buildGroceryListJsonFromPlanFoodRows(
+  rows: { food_name: string; serving_size?: string | null }[],
+  options?: { familySize?: number },
+): GroceryListJsonEntry[] {
+  const familySize = Math.max(1, Math.min(8, options?.familySize ?? 1));
   const seen = new Set<string>();
   const byCategory: Record<string, string[]> = {
     Produce: [],
@@ -943,17 +990,45 @@ export async function generateGroceryListFromPlan(db: any, planId: number): Prom
     Other: [],
   };
   for (const r of rows) {
-    const item = r.food_name + (r.serving_size ? ` — ${r.serving_size}` : '');
+    const item = formatGroceryItemLine(r.food_name, r.serving_size, familySize);
     if (seen.has(item)) continue;
     seen.add(item);
     const cat = groceryCategoryFromFood(r.food_name);
     if (byCategory[cat]) byCategory[cat].push(item);
     else byCategory['Other'].push(item);
   }
-  const list: { category: string; item: string; checked: boolean }[] = [];
-  for (const cat of ['Produce', 'Meat & Fish', 'Dairy', 'Pantry', 'Other']) {
+  const list: GroceryListJsonEntry[] = [];
+  for (const cat of GROCERY_JSON_CATEGORY_ORDER) {
     for (const item of byCategory[cat]) list.push({ category: cat, item, checked: false });
   }
+  return list;
+}
+
+/** Categorized grocery JSON from unique food names only (e.g. Nutrition tracker foods). */
+export function buildGroceryListJsonFromUniqueFoodNames(names: string[]): GroceryListJsonEntry[] {
+  const unique = dedupeFoodNamesCaseInsensitive(names);
+  const byCategory: Record<string, string[]> = {
+    Produce: [],
+    'Meat & Fish': [],
+    Dairy: [],
+    Pantry: [],
+    Other: [],
+  };
+  for (const name of unique) {
+    const cat = groceryCategoryFromFood(name);
+    if (byCategory[cat]) byCategory[cat].push(name);
+    else byCategory['Other'].push(name);
+  }
+  const list: GroceryListJsonEntry[] = [];
+  for (const cat of GROCERY_JSON_CATEGORY_ORDER) {
+    for (const item of byCategory[cat]) list.push({ category: cat, item, checked: false });
+  }
+  return list;
+}
+
+export async function generateGroceryListFromPlan(db: any, planId: number): Promise<void> {
+  const rows = await fetchMealPlanFoodRowsForGrocery(db, planId);
+  const list = buildGroceryListJsonFromPlanFoodRows(rows, { familySize: 1 });
   await db.runAsync('UPDATE MealPlans SET grocery_list = ? WHERE meal_plan_id = ?', [
     JSON.stringify(list),
     planId,
@@ -1052,13 +1127,13 @@ export async function generatePrepGuideFromPlan(db: any, planId: number): Promis
     )
     .catch(() => []);
   if (rows.length === 0) {
-    rows = (await db
+    const fallback = (await db
       .getAllAsync(
         'SELECT meal_type, food_name FROM MealPlanItems WHERE meal_plan_id = ? ORDER BY sort_order, item_id',
         [planId],
       )
       .catch(() => [])) as { meal_type: string | null; food_name: string }[];
-    rows = rows.map((r) => ({ meal_type: r.meal_type || 'Meal', food_name: r.food_name }));
+    rows = fallback.map((r) => ({ meal_type: r.meal_type || 'Meal', food_name: r.food_name }));
   }
   const text = buildPrepGuideTextFromUniqueFoodNames(rows.map((r) => r.food_name));
   await db.runAsync('UPDATE MealPlans SET prep_guide = ? WHERE meal_plan_id = ?', [text || null, planId]);
