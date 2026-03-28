@@ -17,7 +17,7 @@ import {
   TextInput,
   Alert,
   Share,
-  ActivityIndicator,
+  ActivityIndicator,``
   Dimensions,
   Keyboard,
   KeyboardAvoidingView,
