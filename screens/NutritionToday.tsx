@@ -8,11 +8,13 @@ import {
   Text,
   StyleSheet,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   ScrollView,
   ActivityIndicator,
   Alert,
   Modal,
   TextInput,
+  Pressable,
 } from 'react-native';
 import { useTheme } from '../context/ThemeContext';
 import { useSQLiteContext, type SQLiteDatabase } from 'expo-sqlite';
@@ -20,6 +22,8 @@ import Ionicons from 'react-native-vector-icons/Ionicons';
 import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import { initMealPlansDb, type DayOfWeek } from '../utils/initMealPlansDb';
 import { initNutritionDb } from '../utils/nutritionDb';
+import { foodItemServingToTrackerFields } from '../utils/foodItemServingToTrackerRow';
+import { isPieceServingUnit } from '../utils/getRelevantUnits';
 import AddFoodModal from './AddFoodModal';
 
 function favoriteSignature(name: string, brand: string | null): string {
@@ -27,7 +31,7 @@ function favoriteSignature(name: string, brand: string | null): string {
 }
 
 const SAGE = '#7C9A7E';
-const UNIT_OPTIONS = ['g', 'oz', 'serving', 'cup', 'tbsp', 'tsp', 'ml', 'lb'];
+const UNIT_OPTIONS = ['g', 'oz', 'serving', 'whole', 'medium', 'large', 'small', 'cup', 'tbsp', 'tsp', 'ml', 'lb'];
 const MEAL_ORDER: string[] = ['Breakfast', 'Snack', 'Lunch', 'Dinner'];
 
 function getMondayIso(iso: string): string {
@@ -85,10 +89,11 @@ async function ensureDailyLogAndPrefillFoods(
     [mealPlanId]
   ).catch(() => []);
   for (const f of foods) {
+    const { quantity, unitToken } = foodItemServingToTrackerFields(f.serving_size);
     await db.runAsync(
       `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type, serving_size, quantity, calories, protein, carbs, fat)
-       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
-      [logId, f.food_name, f.brand, f.meal_type, f.serving_size, f.calories ?? 0, f.protein ?? 0, f.carbs ?? 0, f.fat ?? 0]
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [logId, f.food_name, f.brand, f.meal_type, unitToken, quantity, f.calories ?? 0, f.protein ?? 0, f.carbs ?? 0, f.fat ?? 0]
     ).catch(() => {});
   }
 }
@@ -98,6 +103,11 @@ function gramsPerUnit(unit: string): number {
     case 'g': return 1;
     case 'oz': return 28.35;
     case 'serving': return 100;
+    case 'whole':
+    case 'medium':
+    case 'large':
+    case 'small':
+      return 100;
     case 'cup': return 240;
     case 'tbsp': return 15;
     case 'tsp': return 5;
@@ -112,6 +122,14 @@ function computedMacrosFromPer100(
   quantity: number,
   unit: string
 ): { calories: number; protein: number; carbs: number; fat: number } {
+  if (isPieceServingUnit(unit)) {
+    return {
+      calories: Math.round(per100.calories * quantity),
+      protein: Math.round(per100.protein * quantity * 10) / 10,
+      carbs: Math.round(per100.carbs * quantity * 10) / 10,
+      fat: Math.round(per100.fat * quantity * 10) / 10,
+    };
+  }
   const grams = quantity * gramsPerUnit(unit);
   const factor = grams / 100;
   return {
@@ -180,6 +198,24 @@ export type LoggedFood = {
   fat: number;
 };
 
+type MealMacroTotals = { calories: number; protein: number; carbs: number; fat: number };
+
+function sumMealNutrition(foodsInMeal: LoggedFood[]): MealMacroTotals {
+  return foodsInMeal.reduce(
+    (acc, f) => ({
+      calories: acc.calories + (Number(f.calories) || 0),
+      protein: acc.protein + (Number(f.protein) || 0),
+      carbs: acc.carbs + (Number(f.carbs) || 0),
+      fat: acc.fat + (Number(f.fat) || 0),
+    }),
+    { calories: 0, protein: 0, carbs: 0, fat: 0 },
+  );
+}
+
+function formatMealTotalsLine(t: MealMacroTotals): string {
+  return `${Math.round(t.calories)} cal · ${Math.round(t.protein)}g P · ${Math.round(t.carbs)}g C · ${Math.round(t.fat)}g F`;
+}
+
 type PlanInfo = { meal_plan_id: number; name: string };
 
 type NutritionTodayProps = {
@@ -208,6 +244,7 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
   const [unitDropdownOpen, setUnitDropdownOpen] = useState(false);
   const [planDebug, setPlanDebug] = useState<{ scheduleRows: number; dayOfWeek: string; source: string; planName: string } | null>(null);
   const [favoritedSignatures, setFavoritedSignatures] = useState<Set<string>>(new Set());
+  const [foodForActions, setFoodForActions] = useState<LoggedFood | null>(null);
 
   const loadFavoritedSignatures = useCallback(async () => {
     try {
@@ -390,19 +427,15 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
       // 1) Use DayActivePlan override for this exact date (user explicitly set plan active)
       let override: { meal_plan_id: number; plan_name: string }[] = [];
       console.log('[loadState] selectedDate:', selectedDate);
-      try {
-        override = await db.getAllAsync(
-          `SELECT p.meal_plan_id, p.plan_name FROM DayActivePlan d JOIN MealPlans p ON p.meal_plan_id = d.meal_plan_id WHERE d.date = ?`,
-          [selectedDate]
-        );
-      } catch (e) {
-        try {
-          override = await db.getAllAsync(
-            `SELECT p.meal_plan_id, p.name AS plan_name FROM DayActivePlan d JOIN MealPlans p ON p.meal_plan_id = d.meal_plan_id WHERE d.date = ?`,
-            [selectedDate]
-          );
-        } catch (_) {}
-      }
+      override = await db
+        .getAllAsync(
+          `SELECT p.meal_plan_id, COALESCE(p.plan_name, p.name) AS plan_name
+           FROM DayActivePlan d
+           JOIN MealPlans p ON p.meal_plan_id = d.meal_plan_id
+           WHERE d.date = ?`,
+          [selectedDate],
+        )
+        .catch(() => []);
       if (override.length > 0) {
         const displayName = override.length > 1
           ? override.map((o) => o.plan_name).join(', ')
@@ -466,16 +499,18 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
                 )
                 .catch(() => []);
               for (const f of foods) {
+                const { quantity, unitToken } = foodItemServingToTrackerFields(f.serving_size);
                 await db
                   .runAsync(
                     `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type, serving_size, quantity, calories, protein, carbs, fat)
-                     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     [
                       logId,
                       f.food_name,
                       f.brand,
                       f.meal_type,
-                      f.serving_size,
+                      unitToken,
+                      quantity,
                       f.calories ?? 0,
                       f.protein ?? 0,
                       f.carbs ?? 0,
@@ -637,11 +672,16 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
         args
       );
     }
-    setEditModalVisible(false);
-    setEditingFood(null);
-    setEditPer100(null);
+    closeEditModal();
     loadLoggedFoods();
   };
+
+  const closeEditModal = useCallback(() => {
+    setEditModalVisible(false);
+    setEditingFood(null);
+    setUnitDropdownOpen(false);
+    setEditPer100(null);
+  }, []);
 
   const confirmDelete = (food: LoggedFood) => {
     const mealLabel = food.meal_type || 'meal';
@@ -662,7 +702,25 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
     );
   };
 
-  const foodsByMealType = useMemo(() => {
+  const closeFoodActionsModal = useCallback(() => {
+    setFoodForActions(null);
+  }, []);
+
+  const runFoodActionEdit = () => {
+    if (!foodForActions) return;
+    const f = foodForActions;
+    setFoodForActions(null);
+    openEdit(f);
+  };
+
+  const runFoodActionDelete = () => {
+    if (!foodForActions) return;
+    const f = foodForActions;
+    setFoodForActions(null);
+    confirmDelete(f);
+  };
+
+  const { foodsByMealType, mealSubtotals } = useMemo(() => {
     const normalized = (m: string | null) => (m || 'Lunch').toLowerCase();
     const breakfast: LoggedFood[] = [];
     const snack: LoggedFood[] = [];
@@ -675,7 +733,16 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
       else if (key === 'lunch') lunch.push(f);
       else if (key === 'dinner') dinner.push(f);
     }
-    return { breakfast, snack, lunch, dinner };
+    const byMeal = { breakfast, snack, lunch, dinner };
+    return {
+      foodsByMealType: byMeal,
+      mealSubtotals: {
+        breakfast: sumMealNutrition(breakfast),
+        snack: sumMealNutrition(snack),
+        lunch: sumMealNutrition(lunch),
+        dinner: sumMealNutrition(dinner),
+      },
+    };
   }, [foods]);
 
   if (loading) {
@@ -717,6 +784,9 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
       {MEAL_TYPES.map((mealType) => (
         <View key={mealType} style={[styles.mealSection, { backgroundColor: theme.card, borderColor: theme.border }]}>
           <Text style={[styles.mealSectionTitle, { color: theme.text }]}>{MEAL_LABELS[mealType].toUpperCase()}</Text>
+          <Text style={[styles.mealTotalsLine, { color: theme.textSecondary ?? '#888' }]}>
+            {formatMealTotalsLine(mealSubtotals[mealType])}
+          </Text>
           {foodsByMealType[mealType]?.length > 0 ? (
             foodsByMealType[mealType].map((food) => (
               <FoodRow
@@ -727,6 +797,7 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
                 onToggleFavorite={() => toggleFavoriteForFood(food)}
                 onEdit={() => openEdit(food)}
                 onDelete={() => confirmDelete(food)}
+                onOpenActionsMenu={() => setFoodForActions(food)}
               />
             ))
           ) : (
@@ -762,8 +833,55 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
         onClose={() => setShowAddModal(false)}
         onFoodAdded={loadLoggedFoods}
       />
-      <Modal visible={editModalVisible} transparent animationType="slide">
+      <Modal
+        visible={foodForActions != null}
+        transparent
+        animationType="fade"
+        onRequestClose={closeFoodActionsModal}
+      >
+        <View style={styles.foodActionsModalOverlay}>
+          <TouchableWithoutFeedback onPress={closeFoodActionsModal}>
+            <View style={StyleSheet.absoluteFillObject} />
+          </TouchableWithoutFeedback>
+          <View style={[styles.foodActionsModalCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text style={[styles.foodActionsModalTitle, { color: theme.text }]} numberOfLines={2}>
+              {foodForActions?.food_name}
+            </Text>
+            {!!foodForActions?.brand && (
+              <Text style={[styles.foodActionsModalSubtitle, { color: theme.textSecondary ?? '#888' }]} numberOfLines={1}>
+                {foodForActions.brand}
+              </Text>
+            )}
+            <TouchableOpacity
+              style={[styles.foodActionsModalRow, { borderColor: theme.border }]}
+              onPress={runFoodActionEdit}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="create-outline" size={22} color={SAGE} style={styles.foodActionsModalIcon} />
+              <Text style={[styles.foodActionsModalRowText, { color: theme.text }]}>Edit</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.foodActionsModalRow, styles.foodActionsModalRowLast, { borderColor: theme.border }]}
+              onPress={runFoodActionDelete}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="trash-outline" size={22} color="#C0392B" style={styles.foodActionsModalIcon} />
+              <Text style={[styles.foodActionsModalRowText, { color: '#C0392B' }]}>Delete</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={editModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={closeEditModal}
+      >
         <View style={styles.modalOverlay}>
+          <TouchableWithoutFeedback onPress={closeEditModal}>
+            <View style={styles.modalBackdropTap} />
+          </TouchableWithoutFeedback>
           <View style={[styles.modalBox, { backgroundColor: theme.background }]}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Edit food</Text>
             <Text style={[styles.modalLabel, { color: theme.text }]}>Food name</Text>
@@ -822,7 +940,7 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
               </View>
             </View>
             <View style={styles.modalActions}>
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.card }]} onPress={() => { setEditModalVisible(false); setEditingFood(null); setUnitDropdownOpen(false); setEditPer100(null); }}>
+              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.card }]} onPress={closeEditModal}>
                 <Text style={[styles.modalBtnText, { color: theme.text }]}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity style={[styles.modalBtn, { backgroundColor: SAGE }]} onPress={saveEdit}>
@@ -843,6 +961,7 @@ function FoodRow({
   onToggleFavorite,
   onEdit,
   onDelete,
+  onOpenActionsMenu,
 }: {
   food: LoggedFood;
   theme: any;
@@ -850,6 +969,7 @@ function FoodRow({
   onToggleFavorite: () => void;
   onEdit: () => void;
   onDelete: () => void;
+  onOpenActionsMenu: () => void;
 }) {
   let swipeRef: Swipeable | null = null;
   const renderLeftActions = () => (
@@ -870,10 +990,14 @@ function FoodRow({
       friction={2}
     >
       <View style={[styles.foodRow, styles.foodRowWithHeart, { backgroundColor: theme.background, borderColor: theme.border }]}>
-        <View style={styles.foodRowContent}>
+        <Pressable
+          style={({ pressed }) => [styles.foodRowContent, pressed && { opacity: 0.85 }]}
+          onLongPress={onOpenActionsMenu}
+          delayLongPress={400}
+        >
           <Text style={[styles.foodRowName, { color: theme.text }]} numberOfLines={1}>{food.food_name}{food.brand ? ` · ${food.brand}` : ''}</Text>
           <Text style={[styles.foodRowMacros, { color: theme.text }]}>{Math.round(food.calories)} cal · {Math.round(food.protein)}P / {Math.round(food.carbs)}C / {Math.round(food.fat)}F</Text>
-        </View>
+        </Pressable>
         <TouchableOpacity style={styles.heartBtn} onPress={onToggleFavorite} hitSlop={8}>
           <Ionicons name={isFavorited ? 'heart' : 'heart-outline'} size={22} color={isFavorited ? SAGE : (theme.textSecondary || '#999')} />
         </TouchableOpacity>
@@ -901,7 +1025,12 @@ const styles = StyleSheet.create({
   foodsCard: { padding: 16, borderRadius: 12, borderWidth: 1 },
   emptyText: { fontSize: 14, opacity: 0.8 },
   mealSection: { padding: 14, borderRadius: 12, borderWidth: 1, marginBottom: 14 },
-  mealSectionTitle: { fontSize: 16, fontWeight: '700', marginBottom: 10 },
+  mealSectionTitle: { fontSize: 16, fontWeight: '700', marginBottom: 4 },
+  mealTotalsLine: {
+    fontSize: 13,
+    fontFamily: 'Jost_400Regular',
+    marginBottom: 10,
+  },
   emptyMealText: { fontSize: 14, opacity: 0.8, marginBottom: 10 },
   addFoodBtn: {
     flexDirection: 'row',
@@ -922,7 +1051,35 @@ const styles = StyleSheet.create({
   editBtn: { backgroundColor: '#E67E22', justifyContent: 'center', alignItems: 'center', width: 72 },
   deleteBtn: { backgroundColor: '#C0392B', justifyContent: 'center', alignItems: 'center', width: 72 },
   swipeBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
+  foodActionsModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 28,
+  },
+  foodActionsModalCard: {
+    borderRadius: 14,
+    borderWidth: 1,
+    overflow: 'hidden',
+    maxWidth: 400,
+    width: '100%',
+    alignSelf: 'center',
+  },
+  foodActionsModalTitle: { fontSize: 17, fontWeight: '700', paddingHorizontal: 16, paddingTop: 16, paddingBottom: 4 },
+  foodActionsModalSubtitle: { fontSize: 14, paddingHorizontal: 16, paddingBottom: 8 },
+  foodActionsModalRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderTopWidth: 1,
+  },
+  foodActionsModalRowLast: { marginBottom: 4 },
+  foodActionsModalIcon: { marginRight: 12 },
+  foodActionsModalRowText: { fontSize: 16, fontWeight: '600' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' },
+  modalBackdropTap: { flex: 1 },
   modalBox: { borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, paddingBottom: 32 },
   modalTitle: { fontSize: 20, fontWeight: '700', marginBottom: 16 },
   modalLabel: { fontSize: 14, fontWeight: '600', marginBottom: 6, marginTop: 10 },

@@ -1,5 +1,6 @@
 /**
  * Vows and VowCheckIns tables for MyVow feature.
+ * Creates/migrates schema only — does not modify or clear existing vow or check-in rows.
  */
 export async function initVowsDb(db: {
   runAsync: (sql: string, params?: (string | number | null)[]) => Promise<void>;

@@ -29,6 +29,8 @@ import {
   generatePrepGuideFromPlan,
 } from '../utils/generateMealPlanGroceryAndPrep';
 import { initNutritionDb } from '../utils/nutritionDb';
+import { foodItemServingToTrackerFields } from '../utils/foodItemServingToTrackerRow';
+import { useDrawerMenu } from '../context/DrawerMenuContext';
 
 const SAGE = '#7C9A7E';
 const DAYS: DayOfWeek[] = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
@@ -266,6 +268,7 @@ export default function MealPlanDetail() {
   const db = useSQLiteContext();
   const navigation = useNavigation();
   const route = useRoute();
+  const drawerMenu = useDrawerMenu();
   const { meal_plan_id, name } = (route.params || {}) as RouteParams;
 
   const [scheduledDays, setScheduledDays] = useState<Set<string>>(new Set());
@@ -276,6 +279,8 @@ export default function MealPlanDetail() {
   const [groceryExpanded, setGroceryExpanded] = useState(false);
   const [prepExpanded, setPrepExpanded] = useState(false);
   const [planMeals, setPlanMeals] = useState<PlanMeal[]>([]);
+  /** True when this plan has DayActivePlan rows strictly after today (tomorrow+). */
+  const [hasFutureActiveAssignments, setHasFutureActiveAssignments] = useState(false);
 
   const planNutritionTotals = useMemo(() => {
     let calories = 0;
@@ -437,6 +442,20 @@ export default function MealPlanDetail() {
     }
   }, [db, meal_plan_id]);
 
+  const loadFutureActiveFlag = useCallback(async () => {
+    if (!meal_plan_id) return;
+    const today = new Date().toISOString().split('T')[0];
+    try {
+      const row = await db.getFirstAsync<{ x: number }>(
+        'SELECT 1 AS x FROM DayActivePlan WHERE meal_plan_id = ? AND date > ? LIMIT 1',
+        [meal_plan_id, today],
+      );
+      setHasFutureActiveAssignments(!!row);
+    } catch {
+      setHasFutureActiveAssignments(false);
+    }
+  }, [db, meal_plan_id]);
+
   const loadSchedule = useCallback(async () => {
     if (!meal_plan_id) return;
     await initMealPlansDb(db);
@@ -499,6 +518,16 @@ export default function MealPlanDetail() {
     useCallback(() => {
       loadPlanDetails();
     }, [loadPlanDetails])
+  );
+
+  useEffect(() => {
+    loadFutureActiveFlag();
+  }, [loadFutureActiveFlag]);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadFutureActiveFlag();
+    }, [loadFutureActiveFlag])
   );
 
   useEffect(() => {
@@ -565,6 +594,33 @@ export default function MealPlanDetail() {
     } catch (e) {
       console.warn('syncDayActivePlanFromScheduleForPlan', e);
     }
+  };
+
+  const setAsInactive = () => {
+    if (!meal_plan_id) return;
+    Alert.alert(
+      'Set as Inactive',
+      'This will remove the meal plan from tomorrow onwards. Foods you have already logged will not be affected. Continue?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          onPress: async () => {
+            try {
+              const today = new Date().toISOString().split('T')[0];
+              await db.runAsync('DELETE FROM DayActivePlan WHERE meal_plan_id = ? AND date > ?', [
+                meal_plan_id,
+                today,
+              ]);
+              setHasFutureActiveAssignments(false);
+            } catch (e) {
+              console.warn('setAsInactive', e);
+              Alert.alert('Error', e instanceof Error ? e.message : 'Failed to update active plan.');
+            }
+          },
+        },
+      ],
+    );
   };
 
   const setAsActive = () => {
@@ -690,16 +746,18 @@ export default function MealPlanDetail() {
               // Step 6: INSERT each food into LoggedFoods for today
               let count = 0;
               for (const food of foods) {
+                const { quantity, unitToken } = foodItemServingToTrackerFields(food.serving_size);
                 await db.runAsync(
                   `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type,
                    serving_size, quantity, calories, protein, carbs, fat)
-                   VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                   [
                     logRow.log_id,
                     food.food_name,
                     food.brand,
                     food.meal_type,
-                    food.serving_size,
+                    unitToken,
+                    quantity,
                     food.calories ?? 0,
                     food.protein ?? 0,
                     food.carbs ?? 0,
@@ -709,6 +767,8 @@ export default function MealPlanDetail() {
                 count += 1;
               }
               console.log('[SetAsActive] Step 6: LoggedFoods inserted for today =', count);
+
+              await loadFutureActiveFlag();
 
               // Step 7: Navigate back to meal plan list
               navigation.navigate('Nutrition' as never, { activeTab: 'plans' } as never);
@@ -734,9 +794,21 @@ export default function MealPlanDetail() {
   return (
     <ScrollView style={[styles.container, { backgroundColor: theme.background }]} contentContainerStyle={styles.content}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Ionicons name="arrow-back" size={24} color={theme.text} />
-        </TouchableOpacity>
+        <View style={styles.headerLeftCluster}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
+            <Ionicons name="arrow-back" size={24} color={theme.text} />
+          </TouchableOpacity>
+          {drawerMenu ? (
+            <TouchableOpacity
+              onPress={drawerMenu.openDrawer}
+              style={styles.menuBtn}
+              accessibilityLabel="Open menu"
+              hitSlop={{ top: 10, bottom: 10, left: 6, right: 10 }}
+            >
+              <Ionicons name="menu-outline" size={28} color={SAGE} />
+            </TouchableOpacity>
+          ) : null}
+        </View>
         <Text style={[styles.planName, { color: theme.text }]} numberOfLines={2}>
           {name}
         </Text>
@@ -793,13 +865,30 @@ export default function MealPlanDetail() {
             <Text style={[styles.quickBtnText, { color: scheduleMatches(WEEKEND_DAYS) ? '#fff' : theme.text }]}>Weekends</Text>
           </TouchableOpacity>
         </View>
-        <TouchableOpacity style={[styles.quickBtn, { borderColor: theme.border, alignSelf: 'flex-start' }]} onPress={setManualOnly}>
-          <Text style={[styles.quickBtnText, { color: theme.text }]}>Manual only</Text>
+        <TouchableOpacity
+          style={[
+            styles.quickBtn,
+            {
+              borderColor: theme.border,
+              alignSelf: 'flex-start',
+              backgroundColor: scheduledDays.size === 0 ? SAGE : theme.card,
+            },
+          ]}
+          onPress={setManualOnly}
+        >
+          <Text style={[styles.quickBtnText, { color: scheduledDays.size === 0 ? '#fff' : theme.text }]}>
+            Manual only
+          </Text>
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity style={[styles.setActiveBtn, { backgroundColor: SAGE }]} onPress={setAsActive}>
-        <Text style={styles.setActiveBtnText}>Set as Active</Text>
+      <TouchableOpacity
+        style={[styles.setActiveBtn, { backgroundColor: SAGE }]}
+        onPress={hasFutureActiveAssignments ? setAsInactive : setAsActive}
+      >
+        <Text style={styles.setActiveBtnText}>
+          {hasFutureActiveAssignments ? 'Set as Inactive' : 'Set as Active'}
+        </Text>
       </TouchableOpacity>
 
       <View style={[styles.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
@@ -897,7 +986,9 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   content: { padding: 20, paddingBottom: 40 },
   header: { flexDirection: 'row', alignItems: 'center', marginBottom: 24 },
-  backBtn: { marginRight: 12 },
+  headerLeftCluster: { flexDirection: 'row', alignItems: 'center', marginRight: 8 },
+  backBtn: { marginRight: 4 },
+  menuBtn: { padding: 2 },
   planName: { fontSize: 22, fontWeight: '700', flex: 1, flexShrink: 1 },
   headerActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 4 },
   headerIconBtn: { padding: 6 },

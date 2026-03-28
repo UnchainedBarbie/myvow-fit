@@ -31,6 +31,7 @@ import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { initVowsDb, type VowRow, type VowCheckInRow } from '../utils/initVowsDb';
+import { getLocalWeekMondaySundayYmd, localTodayYmd } from '../utils/localDateYmd';
 
 const SAGE = '#7C9A7E';
 const SAGE_LIGHT = 'rgba(124, 154, 126, 0.15)';
@@ -177,10 +178,6 @@ function sortWriteCategories(cats: string[]): string[] {
   );
 }
 
-function todayYmd() {
-  return new Date().toISOString().split('T')[0];
-}
-
 // Circular progress ring (0–100). Always visible. Uses SVG for a proper arc.
 function ProgressRingSvg({ progress, label, color, theme }: { progress: number; label: string; color: string; theme: any }) {
   const p = Math.min(100, Math.max(0, progress));
@@ -249,16 +246,8 @@ export default function MyVow() {
 
   const loadWeeklyReport = useCallback(
     async (allVows: VowRow[]) => {
-      // Current week Monday–Sunday
-      const today = new Date();
-      const day = today.getDay(); // 0 = Sun, 1 = Mon
-      const mondayOffset = day === 0 ? -6 : 1 - day;
-      const monday = new Date(today);
-      monday.setDate(today.getDate() + mondayOffset);
-      const sunday = new Date(monday);
-      sunday.setDate(monday.getDate() + 6);
-      const weekStart = monday.toISOString().slice(0, 10);
-      const weekEnd = sunday.toISOString().slice(0, 10);
+      // Counts are read from persisted VowCheckIns only (not reset on launch); recomputed when screen loads.
+      const { weekStartYmd: weekStart, weekEndYmd: weekEnd } = getLocalWeekMondaySundayYmd();
 
       const rows = await db.getAllAsync<{ vow_id: number; count: number }>(
         'SELECT vow_id, COUNT(*) as count FROM VowCheckIns WHERE check_in_date BETWEEN ? AND ? GROUP BY vow_id',
@@ -287,6 +276,7 @@ export default function MyVow() {
 
   const loadVows = useCallback(async () => {
     await initVowsDb(db);
+    // Status and completion come from stored Vows rows; weekly counts aggregate persisted VowCheckIns (see loadWeeklyReport).
     const all = await db.getAllAsync<VowRow>(
       'SELECT vow_id, title, category, frequency_per_week, why_text, status, created_at, completed_at, broken_at FROM Vows ORDER BY created_at DESC'
     );
@@ -351,7 +341,7 @@ export default function MyVow() {
   };
 
   const checkInToday = async (vow: VowRow) => {
-    const date = todayYmd();
+    const date = localTodayYmd();
     const now = new Date().toISOString();
     const existing = await db.getAllAsync<{ check_in_id: number }>(
       'SELECT check_in_id FROM VowCheckIns WHERE vow_id = ? AND check_in_date = ?',

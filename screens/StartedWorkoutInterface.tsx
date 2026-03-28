@@ -1,46 +1,54 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { 
-  View, 
-  Text, 
-  StyleSheet, 
-  TouchableOpacity, 
-  TouchableWithoutFeedback,
-  ScrollView, 
-  ActivityIndicator,
-  TextInput,
-  Alert,
-  FlatList,
-  Vibration,
-  Platform,
-  Switch,
-  Modal,
-  AppState,
-  Linking,
-  StatusBar
-} from 'react-native';
-import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
-import Ionicons from 'react-native-vector-icons/Ionicons';
-import { useTheme } from '../context/ThemeContext';
-import { useTranslation } from 'react-i18next';
-import { useSQLiteContext } from 'expo-sqlite';
-import { StartWorkoutStackParamList } from '../App';
-import * as Notifications from 'expo-notifications';
+import { RouteProp, useNavigation, useRoute } from '@react-navigation/native';
+import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
-import { useSettings } from '../context/SettingsContext';
-import { loadRestTimerPreferences, saveRestTimerPreferences } from '../utils/startedWorkoutPreferenceUtils';
-import { showCelebrationNotification } from '../utils/notificationUtils';
-import { Audio, InterruptionModeIOS, InterruptionModeAndroid } from 'expo-av';
-import { 
-  useTimerPersistence, 
-  createTimerState, 
-  updateTimerState, 
-  timerCalculations,
-  TimerState 
-} from '../utils/timerPersistenceUtils';
+import * as Notifications from 'expo-notifications';
+import { useSQLiteContext } from 'expo-sqlite';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import {
+  ActivityIndicator,
+  Alert,
+  AppState,
+  FlatList,
+  Linking,
+  Modal,
+  Pressable,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Switch,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  TouchableWithoutFeedback,
+  Vibration,
+  View
+} from 'react-native';
 import { AutoSizeText, ResizeTextMode } from 'react-native-auto-size-text';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import { WorkoutLogStackParamList } from '../App';
+import { useSettings } from '../context/SettingsContext';
+import { useTheme } from '../context/ThemeContext';
+import {
+  clearActiveWorkoutSession,
+  saveActiveWorkoutSession,
+} from '../utils/activeWorkoutSession';
+import { showCelebrationNotification } from '../utils/notificationUtils';
+import { loadRestTimerPreferences, saveRestTimerPreferences } from '../utils/startedWorkoutPreferenceUtils';
+import {
+  createTimerState,
+  mergeExerciseSetsWithSnapshot,
+  PersistedTimerPayload,
+  timerCalculations,
+  TimerState,
+  timerStateUtils,
+  updateTimerState,
+  useTimerPersistence,
+} from '../utils/timerPersistenceUtils';
+import { formatWorkoutHeaderTitle, sortWorkoutPlanExercisesForDisplay } from '../utils/workoutDisplayUtils';
 
 type StartedWorkoutRouteProps = RouteProp<
-  StartWorkoutStackParamList,
+  WorkoutLogStackParamList,
   'StartedWorkoutInterface'
 >;
 
@@ -66,9 +74,91 @@ interface ExerciseSet {
   reps_done: string;
   weight: string;
   set_logged: boolean;
+  /** Set when user saves duration from cardio timer modal (shows Logged line even if minutes equal goal). */
+  cardio_duration_saved_from_timer?: boolean;
   web_link: string | null;
   muscle_group: string | null;
   exercise_notes: string | null;
+}
+
+function sortLoggedExercisesForWorkout<
+  T extends { exercise_name: string; muscle_group: string | null }
+>(list: T[]): T[] {
+  return sortWorkoutPlanExercisesForDisplay(list);
+}
+
+/** Empty weight → 0 (bodyweight). Returns null if invalid. */
+function parseWeightForLog(raw: string): number | null {
+  const t = raw.trim().replace(',', '.');
+  if (t === '') return 0;
+  const n = parseFloat(t);
+  if (Number.isNaN(n) || n < 0) return null;
+  return n;
+}
+
+function isValidRepsAndWeight(repsDone: string, weight: string): boolean {
+  const reps = parseInt(repsDone.trim(), 10);
+  if (repsDone.trim() === '' || Number.isNaN(reps) || reps <= 0) return false;
+  return parseWeightForLog(weight) !== null;
+}
+
+const CARDIO_NAME_PREFIX = 'Cardio:';
+
+function isCardioExerciseName(name: string): boolean {
+  return name.trimStart().startsWith(CARDIO_NAME_PREFIX);
+}
+
+/** Duration/timer UI for a set: whole cardio workout log, or legacy "Cardio:"-prefixed names in a strength log. */
+function isCardioSetUI(exerciseName: string, logWorkoutType: 'strength' | 'cardio'): boolean {
+  return logWorkoutType === 'cardio' || isCardioExerciseName(exerciseName);
+}
+
+/** Minutes stored in reps_goal / reps_done (Sage convention). */
+function isValidCardioMinutes(mins: string): boolean {
+  const n = parseFloat(mins.trim().replace(',', '.'));
+  return !Number.isNaN(n) && n > 0;
+}
+
+function isValidCardioSet(repsDone: string, weight: string): boolean {
+  if (!isValidCardioMinutes(repsDone)) return false;
+  return parseWeightForLog(weight) !== null;
+}
+
+/** Show a value on the "Logged" line: set is saved, timer modal save, or reps differ from goal. Hides goal-only autofill. */
+function shouldShowCardioLoggedMinutesDisplay(set: ExerciseSet): boolean {
+  if (!isValidCardioMinutes(set.reps_done)) return false;
+  if (set.set_logged) return true;
+  if (set.cardio_duration_saved_from_timer) return true;
+  const r = parseFloat(set.reps_done.trim().replace(',', '.'));
+  const g = parseFloat(String(set.reps_goal).trim().replace(',', '.'));
+  if (!Number.isFinite(r)) return false;
+  if (!Number.isFinite(g)) return true;
+  return Math.abs(r - g) > 1e-4;
+}
+
+function formatCardioCountdownMMSS(totalSec: number): string {
+  const s = Math.max(0, totalSec);
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, '0')}`;
+}
+
+function formatElapsedMinutesForCardio(m: number): string {
+  if (!Number.isFinite(m) || m <= 0) return '0';
+  const rounded = Math.round(m * 100) / 100;
+  if (Number.isInteger(rounded)) return String(rounded);
+  return String(rounded);
+}
+
+/** Display logged/planned minute strings as "X min" (not "reps"). */
+function formatCardioMinutesLine(raw: string): string {
+  const t = raw.trim().replace(',', '.');
+  if (!t) return '';
+  const n = parseFloat(t);
+  if (!Number.isFinite(n)) return `${raw.trim()} min`;
+  const rounded = Math.round(n * 100) / 100;
+  const s = Number.isInteger(rounded) ? String(rounded) : String(rounded);
+  return `${s} min`;
 }
 
 export default function StartedWorkoutInterface() {
@@ -79,7 +169,8 @@ export default function StartedWorkoutInterface() {
   const db = useSQLiteContext();
   const { notificationPermissionGranted, weightFormat } = useSettings();
   
-  const { workout_log_id } = route.params;
+  const { workout_log_id, resume: isResumeParam } = route.params;
+  const isResume = isResumeParam === true;
   
   // States for workout data
   const [loading, setLoading] = useState(true);
@@ -88,10 +179,13 @@ export default function StartedWorkoutInterface() {
     workout_date: number;
     day_name: string;
   } | null>(null);
+  /** From Workout_Log.workout_type — drives simple timer vs exercise list for cardio. */
+  const [workoutLogType, setWorkoutLogType] = useState<'strength' | 'cardio'>('strength');
+  const workoutLogTypeRef = useRef<'strength' | 'cardio'>('strength');
   const [exercises, setExercises] = useState<Exercise[]>([]);
   
   // Workout flow states
-  const [restTime, setRestTime] = useState('30');
+  const [restTime, setRestTime] = useState('60');
   const [exerciseRestTime, setExerciseRestTime] = useState('60');
   const [isExerciseListModalVisible, setIsExerciseListModalVisible] = useState(false);
   const [autoFillWeight, setAutoFillWeight] = useState(true);
@@ -105,24 +199,87 @@ export default function StartedWorkoutInterface() {
   
   // Sets data for tracking workout
   const [allSets, setAllSets] = useState<ExerciseSet[]>([]);
-  
+  const allSetsRef = useRef<ExerciseSet[]>([]);
+  useEffect(() => {
+    allSetsRef.current = allSets;
+  }, [allSets]);
+
   // State for notes modal
   const [isNotesModalVisible, setIsNotesModalVisible] = useState(false);
   const [notesModalContent, setNotesModalContent] = useState('');
   const [notesModalTitle, setNotesModalTitle] = useState('');
 
+  const [cardioModalVisible, setCardioModalVisible] = useState(false);
+  const [cardioCountdownSec, setCardioCountdownSec] = useState(0);
+  const [cardioTimerRunning, setCardioTimerRunning] = useState(false);
+  /** Optional typed minutes in the cardio modal (used if valid; otherwise elapsed timer). */
+  const [cardioManualMinutes, setCardioManualMinutes] = useState('');
+  /** True after user taps Start at least once this modal open; drives Start vs Resume label. */
+  const [cardioCountdownSessionStarted, setCardioCountdownSessionStarted] =
+    useState(false);
+  const cardioInitialTotalSecRef = useRef(0);
+  const cardioCountdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // Timer state using the new utility
   const [timerState, setTimerState] = useState<TimerState>(createTimerState());
   const [isCompletingSet, setIsCompletingSet] = useState(false);
+
+  const timerStateRef = useRef<TimerState>(timerState);
+  useEffect(() => {
+    timerStateRef.current = timerState;
+  }, [timerState]);
+
+  const persistWorkoutTimerBlob = useCallback(async () => {
+    const ts = timerStateRef.current;
+    if (!ts.workoutStarted || ts.workoutStage === 'completed') return;
+    const setsSnapshot = allSetsRef.current.map((s) => ({
+      exercise_name: s.exercise_name,
+      set_number: s.set_number,
+      weight: s.weight,
+      reps_done: s.reps_done,
+      set_logged: s.set_logged,
+      ...(s.cardio_duration_saved_from_timer != null
+        ? { cardio_duration_saved_from_timer: s.cardio_duration_saved_from_timer }
+        : {}),
+    }));
+    try {
+      const cardioPaused =
+        workoutLogTypeRef.current === 'cardio' && isCardioTimerPausedRef.current;
+      await timerStateUtils.saveTimerState(ts, {
+        workoutLogId: workout_log_id,
+        setsSnapshot: setsSnapshot.length > 0 ? setsSnapshot : undefined,
+        ...(cardioPaused ? { cardioTimerPaused: true } : {}),
+      });
+    } catch (e) {
+      console.error('Error persisting workout timer on blur/unmount:', e);
+    }
+  }, [workout_log_id]);
+
+  useEffect(() => {
+    const subBlur = navigation.addListener('blur', () => {
+      void persistWorkoutTimerBlob();
+    });
+    return () => {
+      void persistWorkoutTimerBlob();
+      subBlur();
+    };
+  }, [navigation, persistWorkoutTimerBlob]);
   
   // Timer refs for intervals
   const workoutTimerRef = useRef<NodeJS.Timeout | null>(null);
   const restTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const restTimerEndAtRef = useRef<number | null>(null);
   const weightMapRef = useRef(new Map<string, string>());
   const repsMapRef = useRef(new Map<string, string>());
   // Rest seconds at moment user tapped Start Workout (so rest timer uses their chosen value)
   const restSecondsForWorkoutRef = useRef<{ setRestSeconds: number; exerciseRestSeconds: number } | null>(null);
-  
+
+  const [isCardioTimerPaused, setIsCardioTimerPaused] = useState(false);
+  const isCardioTimerPausedRef = useRef(false);
+  useEffect(() => {
+    isCardioTimerPausedRef.current = isCardioTimerPaused;
+  }, [isCardioTimerPaused]);
+
   const updateExerciseLoggedStatus = (exerciseId: number, currentSets: ExerciseSet[]) => {
     const exerciseSets = currentSets.filter(s => s.exercise_id === exerciseId);
     const allSetsLogged = exerciseSets.every(s => s.set_logged);
@@ -137,31 +294,89 @@ export default function StartedWorkoutInterface() {
   };
   
   // Handle timer restoration from background
-  const handleTimerRestore = (savedState: TimerState, elapsedSeconds: number) => {
+  const handleTimerRestore = (
+    savedState: TimerState,
+    elapsedSeconds: number,
+    rawPayload?: PersistedTimerPayload,
+  ) => {
     console.log('=== RESTORING TIMER STATE ===');
     console.log('Saved state:', savedState);
     console.log('Elapsed seconds:', elapsedSeconds);
-    
-    // Restore workout timer
+
+    if (rawPayload?.cardioTimerPaused === true) {
+      setIsCardioTimerPaused(true);
+
+      setTimerState((prev) =>
+        updateTimerState(prev, {
+          workoutDuration: savedState.workoutDuration,
+          exerciseSegmentDuration: savedState.exerciseSegmentDuration ?? 0,
+          workoutStartTime: savedState.workoutStartTime,
+          currentSetIndex: savedState.currentSetIndex,
+          workoutStage: savedState.workoutStage,
+          workoutStarted: savedState.workoutStarted,
+          isResting: savedState.isResting,
+          restRemaining: savedState.restRemaining,
+          restStartTime: savedState.restStartTime,
+          isExerciseRest: savedState.isExerciseRest,
+        }),
+      );
+      stopWorkoutTimer();
+
+      if (
+        savedState.isResting &&
+        savedState.restRemaining !== null &&
+        savedState.restRemaining > 0
+      ) {
+        const newRestTime = Math.max(0, savedState.restRemaining - elapsedSeconds);
+        if (newRestTime <= 0) {
+          stopRestTimer();
+          handleRestComplete(savedState.isExerciseRest);
+        } else {
+          setTimerState((prev) =>
+            updateTimerState(prev, {
+              restRemaining: newRestTime,
+              isResting: true,
+              isExerciseRest: savedState.isExerciseRest,
+              restStartTime: Date.now(),
+            }),
+          );
+          stopRestTimer();
+          startRestTimer(newRestTime);
+        }
+      } else {
+        stopRestTimer();
+      }
+      return;
+    }
+
+    // Restore workout timer (was running while app backgrounded)
     if (savedState.workoutStartTime) {
       const newDuration = savedState.workoutDuration + elapsedSeconds;
-      const newStartTime = Date.now() - (newDuration * 1000);
-      
-      setTimerState(prev => updateTimerState(prev, {
-        workoutDuration: newDuration,
-        workoutStartTime: newStartTime,
-        currentSetIndex: savedState.currentSetIndex,
-        workoutStage: savedState.workoutStage,
-        workoutStarted: savedState.workoutStarted
-      }));
-      
-      // Restart workout timer
+      const newStartTime = Date.now() - newDuration * 1000;
+
+      setTimerState((prev) =>
+        updateTimerState(prev, {
+          workoutDuration: newDuration,
+          exerciseSegmentDuration: savedState.exerciseSegmentDuration ?? 0,
+          workoutStartTime: newStartTime,
+          currentSetIndex: savedState.currentSetIndex,
+          workoutStage: savedState.workoutStage,
+          workoutStarted: savedState.workoutStarted,
+        }),
+      );
+
       stopWorkoutTimer();
       startWorkoutTimer();
+      setIsCardioTimerPaused(false);
     }
-    
+
     // Restore rest timer if needed
-    if (savedState.isResting && savedState.restRemaining !== null && savedState.restRemaining > 0) {
+    if (
+      !rawPayload?.cardioTimerPaused &&
+      savedState.isResting &&
+      savedState.restRemaining !== null &&
+      savedState.restRemaining > 0
+    ) {
       const newRestTime = Math.max(0, savedState.restRemaining - elapsedSeconds);
       
       if (newRestTime <= 0) {
@@ -184,16 +399,34 @@ export default function StartedWorkoutInterface() {
   };
   
   // Setup timer persistence
-  useTimerPersistence(timerState, {
-    onRestore: handleTimerRestore,
-    onError: (error) => {
-      console.error('Timer persistence error:', error);
-      Alert.alert('Timer Error', 'There was an issue with timer persistence.');
-    }
-  }, {
-    enabled: timerState.workoutStarted,
-    debugMode: __DEV__
-  });
+  useTimerPersistence(
+    timerState,
+    {
+      onRestore: handleTimerRestore,
+      onError: (error) => {
+        console.error('Timer persistence error:', error);
+        Alert.alert('Timer Error', 'There was an issue with timer persistence.');
+      },
+    },
+    {
+      enabled: timerState.workoutStarted,
+      debugMode: __DEV__,
+      workoutLogId: workout_log_id,
+      getSetsSnapshot: () =>
+        allSetsRef.current.map((s) => ({
+          exercise_name: s.exercise_name,
+          set_number: s.set_number,
+          weight: s.weight,
+          reps_done: s.reps_done,
+          set_logged: s.set_logged,
+          ...(s.cardio_duration_saved_from_timer != null
+            ? { cardio_duration_saved_from_timer: s.cardio_duration_saved_from_timer }
+            : {}),
+        })),
+      getCardioTimerPaused: () =>
+        workoutLogTypeRef.current === 'cardio' && isCardioTimerPausedRef.current,
+    },
+  );
   
   // Handle AppState changes for notifications
   useEffect(() => {
@@ -341,32 +574,6 @@ export default function StartedWorkoutInterface() {
     };
   }, [timerState.workoutStarted, enableNotifications]);
 
-  // Handle back press when workout is started
-  useEffect(() => {
-    const unsubscribe = navigation.addListener('beforeRemove', (e) => {
-      if (!timerState.workoutStarted || timerState.workoutStage === 'completed') {
-        return;
-      }
-
-      e.preventDefault();
-
-      Alert.alert(
-        t('exitWorkout'),
-        t('exitWorkoutMessage'),
-        [
-          { text: t('Cancel'), style: 'cancel', onPress: () => {} },
-          {
-            text: t('exit'),
-            style: 'destructive',
-            onPress: () => navigation.dispatch(e.data.action),
-          },
-        ]
-      );
-    });
-
-    return unsubscribe;
-  }, [navigation, timerState.workoutStarted, timerState.workoutStage, t]);
-  
   const showNotes = (notes: string, exerciseName: string) => {
     setNotesModalContent(notes);
     setNotesModalTitle(exerciseName);
@@ -391,36 +598,121 @@ export default function StartedWorkoutInterface() {
     }
   };
   
+  /**
+   * Workout_Log rows are created when scheduling/logging (not in this screen):
+   * - LogWorkout: INSERT with workout_type from Workouts
+   * - WorkoutDetails (add to calendar): same
+   * - recurringWorkoutUtils.scheduleWorkout: INSERT with workout_type from Workouts
+   */
   const fetchWorkoutDetails = async (
     shouldAutoFill: boolean, 
     shouldAutoFillReps: boolean, 
     shouldUseLogsForReps: boolean
   ) => {
+    let persistedPayload: Awaited<ReturnType<typeof timerStateUtils.loadTimerState>> = null;
     try {
       setLoading(true);
-      
+      setWorkoutLogType('strength');
+      workoutLogTypeRef.current = 'strength';
+
+      await db
+        .runAsync("ALTER TABLE Workout_Log ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';")
+        .catch(() => {});
+
       const workoutResult = await db.getAllAsync<{
         workout_name: string;
         workout_date: number;
         day_name: string;
+        workout_type?: string | null;
       }>(
-        `SELECT workout_name, workout_date, day_name 
+        `SELECT workout_name, workout_date, day_name, workout_type
          FROM Workout_Log 
          WHERE workout_log_id = ?;`,
         [workout_log_id]
       );
       
       if (workoutResult.length > 0) {
-        setWorkout(workoutResult[0]);
-        
-        const exercisesResult = await db.getAllAsync<Omit<Exercise, 'exercise_fully_logged'>>(
+        const wo = { ...workoutResult[0] };
+        let normalizedLogType: 'strength' | 'cardio' =
+          (wo.workout_type || 'strength').toLowerCase() === 'cardio' ? 'cardio' : 'strength';
+
+        // Canonical type lives on Workouts (Days has no workout_type). Fix logs created before recurring passed workout_type.
+        const planWtRows = await db.getAllAsync<{ workout_type: string | null }>(
+          'SELECT workout_type FROM Workouts WHERE workout_name = ? ORDER BY workout_id DESC LIMIT 1;',
+          [wo.workout_name],
+        );
+        const planWorkoutType =
+          (planWtRows[0]?.workout_type || 'strength').toLowerCase() === 'cardio'
+            ? 'cardio'
+            : 'strength';
+        if (planWorkoutType === 'cardio' && normalizedLogType !== 'cardio') {
+          await db.runAsync(
+            'UPDATE Workout_Log SET workout_type = ? WHERE workout_log_id = ?;',
+            ['cardio', workout_log_id],
+          );
+          wo.workout_type = 'cardio';
+          normalizedLogType = 'cardio';
+        }
+
+        setWorkout(wo);
+        setWorkoutLogType(normalizedLogType);
+        workoutLogTypeRef.current = normalizedLogType;
+
+        let exercisesResultRaw = await db.getAllAsync<Omit<Exercise, 'exercise_fully_logged'>>(
           `SELECT exercise_name, sets, reps, logged_exercise_id, web_link, muscle_group, exercise_notes, rest_seconds
            FROM Logged_Exercises 
-           WHERE workout_log_id = ?;`,
+           WHERE workout_log_id = ?
+           ORDER BY logged_exercise_id ASC;`,
           [workout_log_id]
         );
-        
-        setExercises(exercisesResult.map(e => ({ ...e, exercise_fully_logged: false })));
+
+        if (exercisesResultRaw.length === 0 && normalizedLogType === 'cardio') {
+          const planRows = await db.getAllAsync<{
+            exercise_name: string;
+            sets: number;
+            reps: number;
+            web_link: string | null;
+            muscle_group: string | null;
+            exercise_notes: string | null;
+            rest_seconds: number | null;
+          }>(
+            `SELECT e.exercise_name, e.sets, e.reps, e.web_link, e.muscle_group, e.exercise_notes, e.rest_seconds
+             FROM Exercises e
+             INNER JOIN Days d ON e.day_id = d.day_id
+             INNER JOIN Workouts w ON d.workout_id = w.workout_id
+             WHERE w.workout_name = ? AND d.day_name = ?;`,
+            [wo.workout_name, wo.day_name]
+          );
+          const sortedPlan = sortWorkoutPlanExercisesForDisplay(planRows);
+          if (sortedPlan.length > 0) {
+            await db.withTransactionAsync(async () => {
+              for (const ex of sortedPlan) {
+                await db.runAsync(
+                  `INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
+                  [
+                    workout_log_id,
+                    ex.exercise_name,
+                    ex.sets,
+                    ex.reps,
+                    ex.web_link ?? null,
+                    ex.muscle_group ?? null,
+                    ex.exercise_notes ?? null,
+                    ex.rest_seconds ?? null,
+                  ]
+                );
+              }
+            });
+            exercisesResultRaw = await db.getAllAsync<Omit<Exercise, 'exercise_fully_logged'>>(
+              `SELECT exercise_name, sets, reps, logged_exercise_id, web_link, muscle_group, exercise_notes, rest_seconds
+               FROM Logged_Exercises 
+               WHERE workout_log_id = ?
+               ORDER BY logged_exercise_id ASC;`,
+              [workout_log_id]
+            );
+          }
+        }
+
+        const exercisesResult = sortLoggedExercisesForWorkout(exercisesResultRaw);
 
         // Sync rest time from workout plan: use first exercise's rest_seconds if set (so edits in plan are reflected)
         const firstRest = exercisesResult[0]?.rest_seconds;
@@ -486,11 +778,130 @@ export default function StartedWorkoutInterface() {
             });
           }
         });
-        
-        setAllSets(setsData);
+
+        let finalSets = setsData;
+        if (isResume) {
+          persistedPayload = await timerStateUtils.loadTimerState();
+          if (
+            persistedPayload?.workoutLogId === workout_log_id &&
+            persistedPayload.setsSnapshot &&
+            persistedPayload.setsSnapshot.length > 0
+          ) {
+            finalSets = mergeExerciseSetsWithSnapshot(setsData, persistedPayload.setsSnapshot);
+          }
+        }
+
+        setExercises(
+          exercisesResult.map((e) => {
+            const exSets = finalSets.filter((s) => s.exercise_id === e.logged_exercise_id);
+            return {
+              ...e,
+              exercise_fully_logged:
+                exSets.length > 0 && exSets.every((s) => s.set_logged),
+            };
+          }),
+        );
+        setAllSets(finalSets);
+        allSetsRef.current = finalSets;
+
+        if (!isResume && finalSets.length === 0) {
+          setIsCardioTimerPaused(false);
+          setTimerState((prev) =>
+            updateTimerState(prev, {
+              workoutStage: 'exercise',
+              workoutStarted: false,
+              workoutDuration: 0,
+              exerciseSegmentDuration: 0,
+              workoutStartTime: null,
+              restStartTime: null,
+              isResting: false,
+              restRemaining: null,
+              isExerciseRest: false,
+              currentSetIndex: 0,
+            }),
+          );
+        }
       }
-      
+
       setLoading(false);
+
+      if (isResume && workoutResult.length > 0) {
+        saveActiveWorkoutSession(workout_log_id).catch(() => {});
+        const prefs = await loadRestTimerPreferences();
+        const setRs = parseInt(prefs.restTimeBetweenSets, 10);
+        const exRs = parseInt(prefs.restTimeBetweenExercises, 10);
+        restSecondsForWorkoutRef.current = {
+          setRestSeconds: !Number.isNaN(setRs) && setRs >= 0 ? setRs : 60,
+          exerciseRestSeconds: !Number.isNaN(exRs) && exRs >= 0 ? exRs : 60,
+        };
+
+        const resumedFinalSets =
+          allSetsRef.current.length > 0 ? allSetsRef.current : [];
+
+        const clampResumeSetIndex = (sets: ExerciseSet[], persistedIndex: number): number => {
+          if (sets.length === 0) return 0;
+          let idx = Math.max(0, Math.min(persistedIndex, sets.length - 1));
+          if (sets[idx]?.set_logged) {
+            const next = sets.findIndex((s) => !s.set_logged);
+            idx = next >= 0 ? next : Math.max(0, sets.length - 1);
+          }
+          return idx;
+        };
+
+        let persisted = persistedPayload;
+        if (!persisted) {
+          persisted = await timerStateUtils.loadTimerState();
+        }
+
+        const canRestoreTimer =
+          persisted &&
+          persisted.workoutLogId === workout_log_id &&
+          timerStateUtils.isValidTimerState(persisted) &&
+          persisted.workoutStarted &&
+          persisted.workoutStage !== 'completed' &&
+          persisted.workoutStage !== 'overview';
+
+        queueMicrotask(() => {
+          if (canRestoreTimer && persisted) {
+            const elapsed = timerStateUtils.calculateElapsedTime(persisted.timestamp);
+            const baseTimer = timerStateUtils.toTimerState(persisted);
+            const fixedIndex = clampResumeSetIndex(resumedFinalSets, baseTimer.currentSetIndex);
+            handleTimerRestore(
+              { ...baseTimer, currentSetIndex: fixedIndex },
+              elapsed,
+              persisted,
+            );
+          } else {
+            const firstUnlogged = resumedFinalSets.findIndex((s) => !s.set_logged);
+            const idx = firstUnlogged >= 0 ? firstUnlogged : 0;
+            setTimerState((prev) =>
+              updateTimerState(prev, {
+                workoutStarted: true,
+                workoutStage: 'exercise',
+                currentSetIndex: idx,
+                workoutStartTime: Date.now(),
+                workoutDuration: 0,
+                exerciseSegmentDuration: 0,
+                isResting: false,
+                restRemaining: null,
+                isExerciseRest: false,
+              }),
+            );
+            stopWorkoutTimer();
+            setIsCardioTimerPaused(false);
+            workoutTimerRef.current = setInterval(() => {
+              setTimerState((prev) =>
+                updateTimerState(prev, {
+                  workoutDuration: prev.workoutDuration + 1,
+                }),
+              );
+            }, 1000);
+          }
+        });
+
+        await timerStateUtils.clearTimerState();
+        return;
+      }
     } catch (error) {
       console.error('Error fetching workout details:', error);
       setLoading(false);
@@ -499,13 +910,17 @@ export default function StartedWorkoutInterface() {
   
   // Timer functions
   const startWorkoutTimer = () => {
-    const startTime = Date.now() - (timerState.workoutDuration * 1000);
-    setTimerState(prev => updateTimerState(prev, { workoutStartTime: startTime }));
-    
+    setTimerState((prev) => {
+      const startTime = Date.now() - prev.workoutDuration * 1000;
+      return updateTimerState(prev, { workoutStartTime: startTime });
+    });
+
     workoutTimerRef.current = setInterval(() => {
-      setTimerState(prev => updateTimerState(prev, {
-        workoutDuration: prev.workoutDuration + 1
-      }));
+      setTimerState((prev) =>
+        updateTimerState(prev, {
+          workoutDuration: prev.workoutDuration + 1,
+        }),
+      );
     }, 1000);
   };
   
@@ -515,34 +930,49 @@ export default function StartedWorkoutInterface() {
       workoutTimerRef.current = null;
     }
   };
-  
+
+  const handleCardioTimerPause = () => {
+    stopWorkoutTimer();
+    setIsCardioTimerPaused(true);
+  };
+
+  const handleCardioTimerResume = () => {
+    setIsCardioTimerPaused(false);
+    startWorkoutTimer();
+  };
+
   const startRestTimer = (seconds: number) => {
-    // We're explicitly setting a number here, not null
+    const endAt = Date.now() + seconds * 1000;
+    restTimerEndAtRef.current = endAt;
+
     setTimerState(prev => updateTimerState(prev, {
-      restRemaining: seconds,  // This is a number
+      restRemaining: seconds,
       restStartTime: Date.now(),
       isResting: true
     }));
-    
+
+    stopRestTimer();
     restTimerRef.current = setInterval(() => {
+      const end = restTimerEndAtRef.current;
+      if (end == null) {
+        stopRestTimer();
+        return;
+      }
+      const remaining = Math.max(0, Math.ceil((end - Date.now()) / 1000));
       setTimerState(prev => {
-        if (prev.restRemaining === null) {
+        if (!prev.isResting) return prev;
+        if (remaining <= 0) {
           stopRestTimer();
-          return prev;
-        }
-        const newRestTime = prev.restRemaining - 1;
-        
-        if (newRestTime <= 0) {
-          stopRestTimer();
-          handleRestComplete(prev.isExerciseRest);
+          restTimerEndAtRef.current = null;
+          const wasExerciseRest = prev.isExerciseRest;
+          setTimeout(() => handleRestComplete(wasExerciseRest), 0);
           return updateTimerState(prev, {
-            restRemaining: null,  // Only set to null when complete
+            restRemaining: null,
             isResting: false,
             isExerciseRest: false
           });
         }
-        
-        return updateTimerState(prev, { restRemaining: newRestTime });
+        return updateTimerState(prev, { restRemaining: remaining });
       });
     }, 1000);
   };
@@ -607,6 +1037,7 @@ export default function StartedWorkoutInterface() {
         return {
           ...set,
           reps_done: newReps,
+          cardio_duration_saved_from_timer: false,
         };
       })
     );
@@ -631,6 +1062,7 @@ export default function StartedWorkoutInterface() {
           return {
             ...set,
             reps_done: newReps,
+            cardio_duration_saved_from_timer: false,
           };
         })
       );
@@ -668,10 +1100,14 @@ export default function StartedWorkoutInterface() {
     }
 
     restSecondsForWorkoutRef.current = { setRestSeconds, exerciseRestSeconds };
-    
+
+    saveActiveWorkoutSession(workout_log_id).catch(() => {});
+
+    setIsCardioTimerPaused(false);
+
     setTimerState(prev => updateTimerState(prev, {
       workoutStarted: true,
-      workoutStage: 'exercise'
+      workoutStage: 'exercise',
     }));
     
     startWorkoutTimer();
@@ -705,11 +1141,6 @@ export default function StartedWorkoutInterface() {
       }
     }
   };
-  
-  const isDifferentExercise = (currentIndex: number, nextIndex: number): boolean => {
-    if (nextIndex >= allSets.length) return false;
-    return allSets[currentIndex].exercise_name !== allSets[nextIndex].exercise_name;
-  };
 
   const muscleGroupData = [
     { label: t('Unspecified'), value: null },
@@ -726,6 +1157,244 @@ export default function StartedWorkoutInterface() {
     { label: t('Calves'), value: 'calves' },
     { label: t('Quads'), value: 'quads' },
   ];
+
+  useEffect(() => {
+    const configureAudio = async () => {
+      try {
+        await Audio.setAudioModeAsync({
+          playsInSilentModeIOS: true,
+          interruptionModeIOS: InterruptionModeIOS.MixWithOthers,
+          interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
+          playThroughEarpieceAndroid: false,
+        });
+      } catch (error) {
+        console.error('Error configuring audio mode: ', error);
+      }
+    };
+    configureAudio();
+  }, []);
+
+  async function playSound() {
+    try {
+      const { sound } = await Audio.Sound.createAsync(
+        require('../assets/sounds/switch.mp3'),
+      );
+      sound.setOnPlaybackStatusUpdate(async (status) => {
+        if (status.isLoaded && status.didJustFinish) {
+          await sound.unloadAsync();
+        }
+      });
+      await sound.playAsync();
+    } catch (error) {
+      console.log('Error playing sound', error);
+    }
+  }
+
+  const stopCardioCountdown = useCallback(() => {
+    if (cardioCountdownIntervalRef.current) {
+      clearInterval(cardioCountdownIntervalRef.current);
+      cardioCountdownIntervalRef.current = null;
+    }
+  }, []);
+
+  const resetCardioModalTimerState = useCallback(() => {
+    stopCardioCountdown();
+    setCardioTimerRunning(false);
+    setCardioCountdownSessionStarted(false);
+    setCardioCountdownSec(0);
+    cardioInitialTotalSecRef.current = 0;
+  }, [stopCardioCountdown]);
+
+  const triggerCardioIntervalComplete = useCallback(() => {
+    if (enableVibration) {
+      Vibration.vibrate([0, 400, 200, 400]);
+    }
+    void playSound();
+    Alert.alert(
+      t('cardioIntervalFinishedTitle') || 'Interval finished',
+      t('cardioIntervalFinishedMessage') ||
+        'Tap Log Set to save this interval.',
+    );
+  }, [enableVibration, t]);
+
+  const proceedAfterSetLogged = useCallback(
+    (updatedSets: ExerciseSet[], currentSetIndex: number) => {
+      const findNextUnloggedSet = (startIndex: number) => {
+        for (let i = startIndex; i < updatedSets.length; i++) {
+          if (!updatedSets[i].set_logged) {
+            return i;
+          }
+        }
+        return -1;
+      };
+
+      const nextSetIndex = findNextUnloggedSet(currentSetIndex + 1);
+
+      if (nextSetIndex !== -1) {
+        const differentExercise =
+          updatedSets[currentSetIndex].exercise_name !==
+          updatedSets[nextSetIndex].exercise_name;
+        const completedSet = updatedSets[currentSetIndex];
+        const completedExercise = exercises.find(
+          (ex) => ex.logged_exercise_id === completedSet?.exercise_id,
+        );
+        const planRestSeconds = completedExercise?.rest_seconds ?? null;
+        const stored = restSecondsForWorkoutRef.current;
+        const fallbackRest = differentExercise
+          ? stored?.exerciseRestSeconds ?? parseInt(exerciseRestTime, 10)
+          : stored?.setRestSeconds ?? parseInt(restTime, 10);
+        const restSeconds =
+          planRestSeconds != null && planRestSeconds > 0 ? planRestSeconds : fallbackRest;
+
+        setTimerState((prev) =>
+          updateTimerState(prev, {
+            workoutStage: 'rest',
+            isExerciseRest: differentExercise,
+            currentSetIndex: nextSetIndex,
+          }),
+        );
+
+        setIsCompletingSet(false);
+        startRestTimer(restSeconds);
+      } else {
+        const anyUnlogged = updatedSets.some((s) => !s.set_logged);
+        if (anyUnlogged) {
+          Alert.alert(t('unsavedSetsTitle'), t('unsavedSetsMessage'), [
+            {
+              text: t('Yes'),
+              style: 'destructive',
+              onPress: () => {
+                setTimerState((prev) =>
+                  updateTimerState(prev, { workoutStage: 'completed' }),
+                );
+                stopWorkoutTimer();
+              },
+            },
+            {
+              text: t('No'),
+              style: 'cancel',
+              onPress: () => {
+                const firstUnloggedIndex = findNextUnloggedSet(0);
+                if (firstUnloggedIndex !== -1) {
+                  setTimerState((prev) =>
+                    updateTimerState(prev, {
+                      workoutStage: 'exercise',
+                      currentSetIndex: firstUnloggedIndex,
+                    }),
+                  );
+                }
+                setIsCompletingSet(false);
+              },
+            },
+          ], { onDismiss: () => setIsCompletingSet(false) });
+        } else {
+          setTimerState((prev) =>
+            updateTimerState(prev, { workoutStage: 'completed' }),
+          );
+          stopWorkoutTimer();
+        }
+      }
+    },
+    [exercises, exerciseRestTime, restTime, t, startRestTimer, stopWorkoutTimer],
+  );
+
+  const openCardioModal = useCallback(() => {
+    const idx = timerStateRef.current.currentSetIndex;
+    const cs = allSetsRef.current[idx];
+    if (!cs || !isCardioSetUI(cs.exercise_name, workoutLogType)) return;
+    stopCardioCountdown();
+    const plannedMin = Math.max(1 / 60, Number(cs.reps_goal) || 0);
+    const totalSec = Math.max(1, Math.round(plannedMin * 60));
+    cardioInitialTotalSecRef.current = totalSec;
+    setCardioCountdownSec(totalSec);
+    setCardioTimerRunning(false);
+    setCardioCountdownSessionStarted(false);
+    setCardioManualMinutes(
+      isValidCardioMinutes(cs.reps_done)
+        ? cs.reps_done.trim().replace(',', '.')
+        : '',
+    );
+    setCardioModalVisible(true);
+  }, [stopCardioCountdown, workoutLogType]);
+
+  const handleCardioStartPauseResume = useCallback(() => {
+    if (cardioCountdownSec <= 0) return;
+    if (cardioTimerRunning) {
+      stopCardioCountdown();
+      setCardioTimerRunning(false);
+      return;
+    }
+    stopCardioCountdown();
+    setCardioCountdownSessionStarted(true);
+    setCardioTimerRunning(true);
+    cardioCountdownIntervalRef.current = setInterval(() => {
+      setCardioCountdownSec((prev) => {
+        if (prev <= 0) {
+          return 0;
+        }
+        const next = prev - 1;
+        const initial = cardioInitialTotalSecRef.current;
+        if (next === 0) {
+          stopCardioCountdown();
+          setCardioTimerRunning(false);
+          triggerCardioIntervalComplete();
+        }
+        return next;
+      });
+    }, 1000);
+  }, [
+    cardioCountdownSec,
+    cardioTimerRunning,
+    stopCardioCountdown,
+    triggerCardioIntervalComplete,
+  ]);
+
+  const closeCardioModal = useCallback(() => {
+    resetCardioModalTimerState();
+    setCardioModalVisible(false);
+  }, [resetCardioModalTimerState]);
+
+  const handleCardioLogSetFromModal = useCallback(() => {
+    const manualRaw = cardioManualMinutes.trim().replace(',', '.');
+    let minsStr: string;
+    if (isValidCardioMinutes(manualRaw)) {
+      minsStr = manualRaw;
+    } else {
+      const initial = cardioInitialTotalSecRef.current;
+      const elapsedSec = Math.max(0, initial - cardioCountdownSec);
+      const elapsedMin = elapsedSec / 60;
+      minsStr = formatElapsedMinutesForCardio(elapsedMin);
+    }
+    if (!isValidCardioMinutes(minsStr)) {
+      Alert.alert(
+        t('missingInformation'),
+        t('cardioLogSetNeedTimer') ||
+          'Enter minutes above or start the timer and let it run before saving.',
+      );
+      return;
+    }
+    const idx = timerStateRef.current.currentSetIndex;
+    resetCardioModalTimerState();
+    setCardioModalVisible(false);
+    setAllSets((prev) => {
+      if (idx < 0 || idx >= prev.length) return prev;
+      const next = [...prev];
+      next[idx] = {
+        ...next[idx],
+        reps_done: minsStr.trim().replace(',', '.'),
+        weight: '0',
+        set_logged: false,
+        cardio_duration_saved_from_timer: true,
+      };
+      return next;
+    });
+  }, [cardioCountdownSec, cardioManualMinutes, t, resetCardioModalTimerState]);
+
+  useEffect(() => {
+    return () => {
+      stopCardioCountdown();
+    };
+  }, [stopCardioCountdown]);
   
   // Rest of the render functions remain the same...
   const renderOverview = () => {
@@ -739,8 +1408,14 @@ export default function StartedWorkoutInterface() {
           <Text style={[styles.buttonText, { color: theme.buttonText }]}>{t('startWorkout')}</Text>
         </TouchableOpacity>
         <View style={[styles.workoutHeaderCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
-          <Text style={[styles.workoutName, { color: theme.text }]}>{workout?.workout_name}</Text>
-          <Text style={[styles.workoutDay, { color: theme.text }]}>{workout?.day_name}</Text>
+          {workout && workout.workout_name.trim() === workout.day_name.trim() ? (
+            <Text style={[styles.workoutName, { color: theme.text }]}>{workout.workout_name}</Text>
+          ) : (
+            <>
+              <Text style={[styles.workoutName, { color: theme.text }]}>{workout?.workout_name}</Text>
+              <Text style={[styles.workoutDay, { color: theme.text }]}>{workout?.day_name}</Text>
+            </>
+          )}
           <View style={styles.workoutStats}>
             <View style={styles.statItem}>
               <Text style={[styles.statValue, { color: theme.text }]}>{exercises.length}</Text>
@@ -754,79 +1429,109 @@ export default function StartedWorkoutInterface() {
             </View>
           </View>
         </View>
+
+        <View
+          style={[
+            styles.timerDisplay,
+            {
+              backgroundColor: theme.card,
+              borderColor: theme.border,
+              alignSelf: 'stretch',
+              marginTop: 8,
+            },
+          ]}
+        >
+          <Text style={[styles.timerLabel, { color: theme.text }]}>{t('workoutTime')}</Text>
+          <Text style={[styles.workoutTimerText, { color: theme.text }]}>
+            {timerCalculations.formatTime(timerState.workoutDuration)}
+          </Text>
+          <Text style={[styles.exerciseDetails, { color: theme.textSecondary, marginTop: 6, textAlign: 'center' }]}>
+            {t('workoutTimeOverviewHint')}
+          </Text>
+        </View>
         
-        <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('exercises')}</Text>
-        <FlatList
-          data={exercises}
-          keyExtractor={(item) => item.logged_exercise_id.toString()}
-          renderItem={({ item }) => {
-            const muscleGroupInfo = muscleGroupData.find(mg => mg.value === item.muscle_group);
-            return (
-              <View style={[styles.exerciseItem, { backgroundColor: theme.card, borderColor: theme.border }]}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1,}}>
-                    <Text style={[styles.exerciseName, { color: theme.text, marginRight: 8 }]}>{item.exercise_name}</Text>
-                    {muscleGroupInfo && muscleGroupInfo.value && (
-                      <View style={[styles.muscleGroupBadgeOverview, { backgroundColor: theme.card, borderColor: theme.border }]}>
-                        <Text style={[styles.muscleGroupBadgeText, { color: theme.text }]}>
-                          {t(muscleGroupInfo.label)}
-                        </Text>
+        {exercises.length > 0 && (
+          <>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('exercises')}</Text>
+            <FlatList
+              data={exercises}
+              keyExtractor={(item) => item.logged_exercise_id.toString()}
+              renderItem={({ item }) => {
+                const muscleGroupInfo = muscleGroupData.find(mg => mg.value === item.muscle_group);
+                return (
+                  <View style={[styles.exerciseItem, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1,}}>
+                        <Text style={[styles.exerciseName, { color: theme.text, marginRight: 8 }]}>{item.exercise_name}</Text>
+                        {muscleGroupInfo && muscleGroupInfo.value && (
+                          <View style={[styles.muscleGroupBadgeOverview, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                            <Text style={[styles.muscleGroupBadgeText, { color: theme.text }]}>
+                              {t(muscleGroupInfo.label)}
+                            </Text>
+                          </View>
+                        )}
                       </View>
-                    )}
+                      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                        {item.exercise_notes && (
+                          <TouchableOpacity onPress={() => showNotes(item.exercise_notes!, item.exercise_name)} style={{ marginLeft: 10 }}>
+                            <Ionicons name="bookmark-outline" size={22} color={theme.text} />
+                          </TouchableOpacity>
+                        )}
+                        {item.web_link && (
+                          <TouchableOpacity onPress={() => handleLinkPress(item.web_link)} style={{ marginLeft: 10 }}>
+                            <Ionicons name="link-outline" size={22} color={theme.text} />
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    </View>
+                    <Text style={[styles.exerciseDetails, { color: theme.text, marginTop: 4 }]}>
+                      {isCardioSetUI(item.exercise_name, workoutLogType)
+                        ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
+                        : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
+                    </Text>
                   </View>
-                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                    {item.exercise_notes && (
-                      <TouchableOpacity onPress={() => showNotes(item.exercise_notes!, item.exercise_name)} style={{ marginLeft: 10 }}>
-                        <Ionicons name="bookmark-outline" size={22} color={theme.text} />
-                      </TouchableOpacity>
-                    )}
-                    {item.web_link && (
-                      <TouchableOpacity onPress={() => handleLinkPress(item.web_link)} style={{ marginLeft: 10 }}>
-                        <Ionicons name="link-outline" size={22} color={theme.text} />
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                </View>
-                <Text style={[styles.exerciseDetails, { color: theme.text, marginTop: 4 }]}>
-                  {item.sets} {t('Sets')} × {item.reps} {t('Reps')}
-                </Text>
-              </View>
-            )
-          }}
-          scrollEnabled={false}
-          style={styles.exercisesList}
-        />
+                )
+              }}
+              scrollEnabled={false}
+              style={styles.exercisesList}
+            />
+          </>
+        )}
         
         <View style={styles.setupSection}>
-          <Text style={[styles.setupLabel, { color: theme.text }]}>{t('restTimeBetweenSets')}:</Text>
-          <TextInput
-            style={[styles.restTimeInput, { 
-              backgroundColor: theme.card,
-              color: theme.text,
-              borderColor: theme.border
-            }]}
-            value={restTime}
-            onChangeText={setRestTime}
-            keyboardType="number-pad"
-            maxLength={4}
-            placeholderTextColor={theme.type === 'dark' ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)'}
-          />
+          {exercises.length > 0 && (
+            <>
+              <Text style={[styles.setupLabel, { color: theme.text }]}>{t('restTimeBetweenSets')}:</Text>
+              <TextInput
+                style={[styles.restTimeInput, { 
+                  backgroundColor: theme.card,
+                  color: theme.text,
+                  borderColor: theme.border
+                }]}
+                value={restTime}
+                onChangeText={setRestTime}
+                keyboardType="number-pad"
+                maxLength={4}
+                placeholderTextColor={theme.type === 'dark' ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)'}
+              />
+              
+              <Text style={[styles.setupLabel, { color: theme.text }]}>{t('restTimeBetweenExercises')}:</Text>
+              <TextInput
+                style={[styles.restTimeInput, { 
+                  backgroundColor: theme.card,
+                  color: theme.text,
+                  borderColor: theme.border
+                }]}
+                value={exerciseRestTime}
+                onChangeText={setExerciseRestTime}
+                keyboardType="number-pad"
+                maxLength={4}
+                placeholderTextColor={theme.type === 'dark' ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)'}
+              />
+            </>
+          )}
           
-          <Text style={[styles.setupLabel, { color: theme.text }]}>{t('restTimeBetweenExercises')}:</Text>
-          <TextInput
-            style={[styles.restTimeInput, { 
-              backgroundColor: theme.card,
-              color: theme.text,
-              borderColor: theme.border
-            }]}
-            value={exerciseRestTime}
-            onChangeText={setExerciseRestTime}
-            keyboardType="number-pad"
-            maxLength={4}
-            placeholderTextColor={theme.type === 'dark' ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)'}
-          />
-          
-          <Text style={[styles.setupLabel, { color: theme.text, marginTop: 15 }]}>{t('workoutSettings')}:</Text>
+          <Text style={[styles.setupLabel, { color: theme.text, marginTop: exercises.length > 0 ? 15 : 0 }]}>{t('workoutSettings')}:</Text>
           
           <View style={[styles.toggleRow, { 
             backgroundColor: theme.type === 'dark' ? '#121212' : '#f0f0f0',
@@ -914,7 +1619,52 @@ export default function StartedWorkoutInterface() {
   
   // ... (rest of the render functions remain the same)
   
+  const renderEmptyExercisesActiveWorkout = () => (
+    <View style={styles.emptyActiveWorkoutContainer}>
+      <Text style={[styles.emptyActiveWorkoutTimer, { color: theme.text }]}>
+        {timerCalculations.formatTime(timerState.workoutDuration)}
+      </Text>
+      {!timerState.workoutStarted ? (
+        <TouchableOpacity
+          style={[styles.completeButton, { backgroundColor: theme.buttonBackground, marginTop: 24, alignSelf: 'stretch' }]}
+          onPress={startWorkout}
+        >
+          <Text style={[styles.buttonText, { color: theme.buttonText }]}>{t('startWorkout')}</Text>
+        </TouchableOpacity>
+      ) : (
+        <View style={styles.emptyActiveWorkoutButtonRow}>
+          <TouchableOpacity
+            style={[
+              styles.emptyActiveWorkoutSecondaryButton,
+              { borderColor: theme.border, backgroundColor: theme.card },
+            ]}
+            onPress={isCardioTimerPaused ? handleCardioTimerResume : handleCardioTimerPause}
+            activeOpacity={0.85}
+          >
+            <Text style={[styles.buttonText, { color: theme.text }]}>
+              {isCardioTimerPaused ? t('resumeTimer') : t('pauseTimer')}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.emptyActiveWorkoutPrimaryInRow,
+              { backgroundColor: theme.buttonBackground },
+            ]}
+            onPress={handleFinishWorkout}
+            activeOpacity={0.85}
+          >
+            <Text style={[styles.buttonText, { color: theme.buttonText }]}>{t('completeWorkout')}</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+    </View>
+  );
+
   const renderExerciseScreen = () => {
+    if (allSets.length === 0) {
+      return renderEmptyExercisesActiveWorkout();
+    }
+
     const currentSet = allSets[timerState.currentSetIndex];
     if (!currentSet) return null;
     
@@ -930,6 +1680,22 @@ export default function StartedWorkoutInterface() {
     const isLastExercise = currentExerciseIndex === exercises.length - 1;
     const isLastSetOfExercise = currentSet.set_number === currentSet.total_sets;
     const isLastStructuralSet = isLastExercise && isLastSetOfExercise;
+    const isCardio = isCardioSetUI(currentSet.exercise_name, workoutLogType);
+    const canCompleteStrength =
+      !!allSets[timerState.currentSetIndex] &&
+      isValidRepsAndWeight(
+        allSets[timerState.currentSetIndex].reps_done,
+        allSets[timerState.currentSetIndex].weight,
+      );
+    const canCompleteCardio =
+      !!allSets[timerState.currentSetIndex] &&
+      isValidCardioSet(
+        allSets[timerState.currentSetIndex].reps_done,
+        allSets[timerState.currentSetIndex].weight || '0',
+      );
+    const canCompleteSet = isCardio ? canCompleteCardio : canCompleteStrength;
+    const showCardioWholeWorkoutControls =
+      workoutLogType === 'cardio' && allSets.length > 0;
 
     return (
       <View style={styles.exerciseScreenContainer}>
@@ -939,6 +1705,37 @@ export default function StartedWorkoutInterface() {
             {timerCalculations.formatTime(timerState.workoutDuration)}
           </Text>
         </View>
+
+        {showCardioWholeWorkoutControls ? (
+          <View
+            style={{
+              flexDirection: 'row',
+              marginTop: 12,
+              marginBottom: 18,
+              alignSelf: 'stretch',
+              justifyContent: 'center',
+              gap: 12,
+            }}
+          >
+            <TouchableOpacity
+              style={[
+                styles.secondaryButton,
+                {
+                  backgroundColor: theme.card,
+                  borderColor: theme.border,
+                  flex: 1,
+                  maxWidth: 220,
+                },
+              ]}
+              onPress={isCardioTimerPaused ? handleCardioTimerResume : handleCardioTimerPause}
+              activeOpacity={0.85}
+            >
+              <Text style={[styles.secondaryButtonText, { color: theme.text }]}>
+                {isCardioTimerPaused ? t('resumeTimer') : t('pauseTimer')}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
         
         <View style={[styles.currentExerciseCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
           <Text style={[styles.currentExerciseName, { color: theme.text }]}>
@@ -965,13 +1762,62 @@ export default function StartedWorkoutInterface() {
             )}
           </View>
           
-          <Text style={[styles.setInfo, { color: theme.text }]}>
-           {currentSet.set_number}/{currentSet.total_sets}
-          </Text>
-          <Text style={[styles.repInfo, { color: theme.text }]}>
-            {t('goal')}: {currentSet.reps_goal} {t('Reps')}
-          </Text>
+          {isCardio ? (
+            <Pressable
+              onPress={openCardioModal}
+              style={({ pressed }) => [
+                { alignSelf: 'stretch', opacity: pressed ? 0.75 : 1 },
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel={
+                t('cardioDurationTapLabel') || 'Duration — tap to open timer'
+              }
+            >
+              <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 6 }]}>
+                {t('cardioDurationTapLabel') || 'Duration — tap to open timer'}
+              </Text>
+              <Text style={[styles.repInfo, { color: theme.text }]}>
+                {t('goal')}:{' '}
+                <Text style={{ fontWeight: '700', textDecorationLine: 'underline' }}>
+                  {formatCardioMinutesLine(String(currentSet.reps_goal))}
+                </Text>
+              </Text>
+              <Text style={[styles.repInfo, { color: theme.text, marginTop: 8 }]}>
+                {t('loggedMinutesLabel') || 'Logged'}:{' '}
+                {shouldShowCardioLoggedMinutesDisplay(currentSet) ? (
+                  <Text style={{ fontWeight: '700', textDecorationLine: 'underline' }}>
+                    {formatCardioMinutesLine(currentSet.reps_done)}
+                  </Text>
+                ) : (
+                  <Text style={{ color: theme.textSecondary, fontStyle: 'italic', fontWeight: '400' }}>
+                    {t('cardioLoggedMinutesEmpty') || '—'}
+                  </Text>
+                )}
+              </Text>
+              {!currentSet.set_logged ? (
+                shouldShowCardioLoggedMinutesDisplay(currentSet) ? (
+                  <Text style={[styles.repInfo, { color: theme.textSecondary, marginTop: 6, fontSize: 13 }]}>
+                    {t('cardioMinutesReadyHint')}
+                  </Text>
+                ) : (
+                  <Text style={[styles.repInfo, { color: theme.textSecondary, marginTop: 6, fontStyle: 'italic', fontSize: 13 }]}>
+                    {t('cardioNoDurationLogged') || 'No minutes logged yet — tap above for timer'}
+                  </Text>
+                )
+              ) : null}
+            </Pressable>
+          ) : (
+            <>
+              <Text style={[styles.setInfo, { color: theme.text }]}>
+                {currentSet.set_number}/{currentSet.total_sets}
+              </Text>
+              <Text style={[styles.repInfo, { color: theme.text }]}>
+                {t('goal')}: {currentSet.reps_goal} {t('Reps')}
+              </Text>
+            </>
+          )}
           
+          {!isCardio ? (
           <View style={styles.inputContainer}>
             <View style={styles.inputGroup}>
               <Text style={[styles.inputLabel, { color: theme.text }]}>{t('repsDone')}</Text>
@@ -1007,9 +1853,6 @@ export default function StartedWorkoutInterface() {
                 }]}
                 value={currentSet.weight}
                 onChangeText={(text) => {
-
-
-
                   const updatedSets = [...allSets];
                   updatedSets[timerState.currentSetIndex] = {
                     ...updatedSets[timerState.currentSetIndex],
@@ -1018,11 +1861,12 @@ export default function StartedWorkoutInterface() {
                   setAllSets(updatedSets);
                 }}
                 keyboardType="decimal-pad"
-                placeholder="> 0.0"
+                placeholder="0+"
                 placeholderTextColor={theme.type === 'dark' ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)'}
               />
             </View>
           </View>
+          ) : null}
         </View>
         
         <View style={styles.controlsContainer}>
@@ -1030,102 +1874,57 @@ export default function StartedWorkoutInterface() {
             <TouchableOpacity
                 style={[styles.completeButton, { 
                 backgroundColor: 
-                    !allSets[timerState.currentSetIndex] || allSets[timerState.currentSetIndex].reps_done === '' || parseInt(allSets[timerState.currentSetIndex].reps_done) <= 0 || allSets[timerState.currentSetIndex].weight === '' || parseFloat(allSets[timerState.currentSetIndex].weight) <= 0
+                    !canCompleteSet
                     ? theme.inactivetint 
                     : theme.buttonBackground
                 }]}
                 onPress={() => {
                 const pressCurrentSet = allSets[timerState.currentSetIndex];
-                if (!pressCurrentSet || pressCurrentSet.reps_done === '' || parseInt(pressCurrentSet.reps_done) <= 0 || pressCurrentSet.weight === '' || parseFloat(pressCurrentSet.weight) <= 0) {
-                    Alert.alert(t('missingInformation'), t('enterRepsAndWeight'));
+                if (!pressCurrentSet) return;
+                const pressIsCardio = isCardioSetUI(pressCurrentSet.exercise_name, workoutLogType);
+                const valid = pressIsCardio
+                  ? isValidCardioSet(
+                      pressCurrentSet.reps_done,
+                      pressCurrentSet.weight || '0',
+                    )
+                  : isValidRepsAndWeight(
+                      pressCurrentSet.reps_done,
+                      pressCurrentSet.weight,
+                    );
+                if (!valid) {
+                    Alert.alert(
+                      t('missingInformation'),
+                      pressIsCardio
+                        ? t('enterCardioMinutes') ||
+                          'Enter a valid duration in minutes (open the timer from the duration label if needed).'
+                        : t('enterRepsAndWeight'),
+                    );
                     return;
                 }
-                
+
                 setIsCompletingSet(true);
 
-                const updatedSets = [...allSets];
                 const currentSetIndex = timerState.currentSetIndex;
-                const currentSet = { ...updatedSets[currentSetIndex], set_logged: true };
-                updatedSets[currentSetIndex] = currentSet;
-                
-                setAllSets(updatedSets);
-                updateExerciseLoggedStatus(currentSet.exercise_id, updatedSets);
-                
-                const findNextUnloggedSet = (startIndex: number) => {
-                    for (let i = startIndex; i < updatedSets.length; i++) {
-                    if (!updatedSets[i].set_logged) {
-                        return i;
-                    }
-                    }
-                    return -1;
-                };
-
-                let nextSetIndex = findNextUnloggedSet(currentSetIndex + 1);
-
-                if (nextSetIndex !== -1) {
-                    const differentExercise = isDifferentExercise(currentSetIndex, nextSetIndex);
-                    // Rest duration: prefer plan's rest_seconds for the exercise we just completed
-                    const completedSet = updatedSets[currentSetIndex];
-                    const completedExercise = exercises.find(ex => ex.logged_exercise_id === completedSet?.exercise_id);
-                    const planRestSeconds = completedExercise?.rest_seconds ?? null;
-                    const stored = restSecondsForWorkoutRef.current;
-                    const fallbackRest = differentExercise
-                      ? (stored?.exerciseRestSeconds ?? parseInt(exerciseRestTime))
-                      : (stored?.setRestSeconds ?? parseInt(restTime));
-                    const restSeconds = (planRestSeconds != null && planRestSeconds > 0) ? planRestSeconds : fallbackRest;
-
-                    setTimerState(prev => updateTimerState(prev, {
-                    workoutStage: 'rest',
-                    isExerciseRest: differentExercise,
-                    currentSetIndex: nextSetIndex 
-                    }));
-                    
-                    setIsCompletingSet(false);
-                    startRestTimer(restSeconds);
-                    
-                } else {
-                    // No more unlogged sets after current one
-                    const anyUnlogged = updatedSets.some(s => !s.set_logged);
-                    if (anyUnlogged) {
-                    Alert.alert(
-                        t('unsavedSetsTitle'),
-                        t('unsavedSetsMessage'),
-                        [
-                        {
-                            text: t('Yes'),
-                            style: 'destructive',
-                            onPress: () => {
-                            setTimerState(prev => updateTimerState(prev, { workoutStage: 'completed' }));
-                            stopWorkoutTimer();
-                            },
-                        },
-                        {
-                            text: t('No'),
-                            style: 'cancel',
-                            onPress: () => {
-                            const firstUnloggedIndex = findNextUnloggedSet(0);
-                            if (firstUnloggedIndex !== -1) {
-                                setTimerState(prev => updateTimerState(prev, {
-                                workoutStage: 'exercise',
-                                currentSetIndex: firstUnloggedIndex
-                                }));
-                            }
-                            setIsCompletingSet(false);
-                            },
-                        },
-                        ],
-                        { onDismiss: () => setIsCompletingSet(false) }
-                    );
-                    } else {
-                    // All sets are logged
-                    setTimerState(prev => updateTimerState(prev, { workoutStage: 'completed' }));
-                    stopWorkoutTimer();
-                    }
-                }
+                setAllSets((prev) => {
+                  if (currentSetIndex < 0 || currentSetIndex >= prev.length) return prev;
+                  const next = [...prev];
+                  const base = next[currentSetIndex];
+                  const logged = {
+                    ...base,
+                    set_logged: true,
+                    ...(pressIsCardio ? { weight: base.weight?.trim() || '0' } : {}),
+                  };
+                  next[currentSetIndex] = logged;
+                  queueMicrotask(() => {
+                    updateExerciseLoggedStatus(logged.exercise_id, next);
+                    proceedAfterSetLogged(next, currentSetIndex);
+                  });
+                  return next;
+                });
                 }}
                 disabled={
                     isCompletingSet ||
-                    !allSets[timerState.currentSetIndex] || allSets[timerState.currentSetIndex].reps_done === '' || parseInt(allSets[timerState.currentSetIndex].reps_done) <= 0 || allSets[timerState.currentSetIndex].weight === '' || parseFloat(allSets[timerState.currentSetIndex].weight) <= 0
+                    !canCompleteSet
                 }
             >
                 <Text style={[styles.buttonText, { color: theme.buttonText }]}>
@@ -1172,7 +1971,7 @@ export default function StartedWorkoutInterface() {
         
         <View style={styles.progressContainer}>
           <Text style={[styles.progressText, { color: theme.text }]}>
-          %{Math.round(progress)}
+            {Math.round(progress)}%
           </Text>
           <View style={[styles.progressBar, { backgroundColor: theme.border }]}>
             <View 
@@ -1195,6 +1994,7 @@ export default function StartedWorkoutInterface() {
     const nextSet = allSets[timerState.currentSetIndex];
     
     const muscleGroupInfo = nextSet ? muscleGroupData.find(mg => mg.value === nextSet.muscle_group) : null;
+    const nextIsCardio = nextSet ? isCardioSetUI(nextSet.exercise_name, workoutLogType) : false;
 
     let previousSetReps = null;
     let previousSetWeight = null;
@@ -1218,9 +2018,17 @@ export default function StartedWorkoutInterface() {
           
           <TouchableOpacity
               style={[styles.addTimeButton, { backgroundColor: theme.type === 'dark' ? 'rgba(255,255,255,0.15)' : theme.border }]}
-            onPress={() => setTimerState(prev => updateTimerState(prev, { 
-              restRemaining: (prev.restRemaining ?? 0) + 15 
-            }))}
+            onPress={() => {
+              if (restTimerEndAtRef.current != null) {
+                restTimerEndAtRef.current += 15000;
+                const sec = Math.max(0, Math.ceil((restTimerEndAtRef.current - Date.now()) / 1000));
+                setTimerState(prev => updateTimerState(prev, { restRemaining: sec }));
+              } else {
+                setTimerState(prev => updateTimerState(prev, {
+                  restRemaining: (prev.restRemaining ?? 0) + 15
+                }));
+              }
+            }}
           >
             <Text style={[styles.addTimeButtonText, { color: theme.type === 'dark' ? 'white' : 'rgba(255, 255, 255, 0.8)' }]}>{t('addTime')}</Text>
           </TouchableOpacity>
@@ -1265,7 +2073,11 @@ export default function StartedWorkoutInterface() {
             {(previousSetReps || previousSetWeight) && (
               <Text style={[styles.upNextSetInfo, { color: theme.text }]}>
                 {t('lastWorkoutInfo')}:{' '}
-                {previousSetReps ? `${previousSetReps} ${t('Reps')}` : ''}
+                {previousSetReps
+                  ? nextIsCardio
+                    ? formatCardioMinutesLine(previousSetReps)
+                    : `${previousSetReps} ${t('Reps')}`
+                  : ''}
                 {previousSetReps && previousSetWeight ? ' / ' : ''}
                 {previousSetWeight ? `${previousSetWeight} ${weightFormat}` : ''}
               </Text>
@@ -1316,8 +2128,12 @@ export default function StartedWorkoutInterface() {
         console.log('Saving completed sets:', loggedSets.length);
         for (let i = 0; i < loggedSets.length; i++) {
           const set = loggedSets[i];
-          const w = parseFloat(set.weight);
-          const reps = parseInt(set.reps_done, 10);
+          const wParsed = parseWeightForLog(set.weight);
+          const w = wParsed ?? 0;
+          const repsParsed = parseFloat(
+            set.reps_done.trim().replace(',', '.'),
+          );
+          const reps = Number.isNaN(repsParsed) ? 0 : repsParsed;
           const prevMax = prevMaxByExercise[set.exercise_name] ?? 0;
           if (w > prevMax) prs.push({ exercise_name: set.exercise_name, weight: w, reps });
 
@@ -1345,6 +2161,9 @@ export default function StartedWorkoutInterface() {
 
         await db.runAsync('COMMIT;');
         console.log('Workout save completed successfully!');
+
+        await clearActiveWorkoutSession();
+        await timerStateUtils.clearTimerState();
 
         if (prs.length > 0) {
           const first = prs[0];
@@ -1442,7 +2261,9 @@ export default function StartedWorkoutInterface() {
             onStartShouldSetResponder={() => true}
           >
             <View style={[styles.modalHeader, { borderBottomColor: theme.border }]}>
-              <Text style={[styles.modalTitle, { color: theme.text }]}>{workout?.day_name }</Text>
+              <Text style={[styles.modalTitle, { color: theme.text }]}>
+                {formatWorkoutHeaderTitle(workout?.workout_name, workout?.day_name)}
+              </Text>
               <TouchableOpacity onPress={() => setIsExerciseListModalVisible(false)} style={styles.modalCloseButton}>
                 <Ionicons name="close-outline" size={28} color={theme.text} />
               </TouchableOpacity>
@@ -1543,7 +2364,9 @@ export default function StartedWorkoutInterface() {
                         </View>
                       </View>
                       <Text style={[detailStyle, { marginTop: 4 }]}>
-                        {item.sets} {t('Sets')} × {item.reps} {t('Reps')}
+                        {isCardioSetUI(item.exercise_name, workoutLogType)
+                          ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
+                          : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
                       </Text>
                     </View>
                   </TouchableComponent>
@@ -1602,48 +2425,149 @@ export default function StartedWorkoutInterface() {
     );
   };
 
+  const renderCardioModal = () => {
+    const cs = allSets[timerState.currentSetIndex];
+    const title = (() => {
+      if (!cs) return t('completeSet');
+      if (isCardioExerciseName(cs.exercise_name)) {
+        return (
+          cs.exercise_name.replace(new RegExp(`^\\s*${CARDIO_NAME_PREFIX}`), '').trim() ||
+          cs.exercise_name
+        );
+      }
+      if (workoutLogType === 'cardio') return cs.exercise_name;
+      return t('completeSet');
+    })();
+
+    const timerPrimaryLabel = cardioTimerRunning
+      ? t('pauseTimer')
+      : cardioCountdownSessionStarted && cardioCountdownSec > 0
+        ? t('resumeTimer')
+        : cardioCountdownSec > 0
+          ? t('startTimer')
+          : '—';
+
+    return (
+      <Modal
+        visible={cardioModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={closeCardioModal}
+      >
+        {cardioModalVisible ? (
+          <StatusBar
+            backgroundColor={
+              theme.type === 'light' ? 'rgba(0, 0, 0, 0.5)' : 'black'
+            }
+            barStyle="light-content"
+          />
+        ) : null}
+        <TouchableOpacity
+          style={styles.modalOverlay}
+          activeOpacity={1}
+          onPressOut={closeCardioModal}
+        >
+          <View
+            style={[
+              styles.modalContainer,
+              { backgroundColor: theme.card, borderColor: theme.border },
+            ]}
+            onStartShouldSetResponder={() => true}
+          >
+            <View
+              style={[
+                styles.modalHeader,
+                { borderBottomColor: theme.border },
+              ]}
+            >
+              <Text style={[styles.modalTitle, { color: theme.text }]}>
+                {title}
+              </Text>
+              <TouchableOpacity
+                onPress={closeCardioModal}
+                style={styles.modalCloseButton}
+                accessibilityLabel="Close"
+              >
+                <Ionicons name="close-outline" size={28} color={theme.text} />
+              </TouchableOpacity>
+            </View>
+            <View style={{ paddingVertical: 8, paddingHorizontal: 4 }}>
+              <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 6 }]}>
+                {t('durationMinutes') || 'Duration (minutes)'}
+              </Text>
+              <TextInput
+                style={[
+                  styles.input,
+                  {
+                    backgroundColor: theme.card,
+                    color: theme.text,
+                    borderColor: theme.border,
+                    marginBottom: 12,
+                  },
+                ]}
+                value={cardioManualMinutes}
+                onChangeText={setCardioManualMinutes}
+                keyboardType="decimal-pad"
+                placeholder="15"
+                placeholderTextColor={
+                  theme.type === 'dark' ? 'rgba(255,255,255,0.45)' : 'rgba(0,0,0,0.35)'
+                }
+                accessibilityLabel={t('durationMinutes') || 'Duration in minutes'}
+              />
+              <Text
+                style={[
+                  styles.cardioModalCountdown,
+                  { color: theme.text },
+                ]}
+              >
+                {formatCardioCountdownMMSS(cardioCountdownSec)}
+              </Text>
+              <TouchableOpacity
+                style={[
+                  styles.cardioModalPrimaryBtn,
+                  { backgroundColor: theme.buttonBackground },
+                ]}
+                onPress={handleCardioStartPauseResume}
+                disabled={cardioCountdownSec <= 0}
+                activeOpacity={0.85}
+              >
+                <Text
+                  style={[styles.buttonText, { color: theme.buttonText }]}
+                >
+                  {timerPrimaryLabel}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.completeButton,
+                  {
+                    backgroundColor: theme.buttonBackground,
+                    marginTop: 16,
+                  },
+                ]}
+                onPress={handleCardioLogSetFromModal}
+                activeOpacity={0.85}
+              >
+                <Text style={[styles.buttonText, { color: theme.buttonText }]}>
+                  {t('logSet')}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+    );
+  };
+  
   const clearRestTimerState = () => {
-    stopRestTimer(); // Clear the interval
+    restTimerEndAtRef.current = null;
+    stopRestTimer();
     setTimerState(prev => updateTimerState(prev, {
       isResting: false,
       isExerciseRest: false,
       restRemaining: null,
       restStartTime: null
     }));
-  };
-  
-  useEffect(() => {
-    const configureAudio = async () => {
-      try {
-        await Audio.setAudioModeAsync({
-          playsInSilentModeIOS: true,
-          interruptionModeIOS: InterruptionModeIOS.MixWithOthers,
-          interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
-          playThroughEarpieceAndroid: false,
-        });
-      } catch (error) {
-        console.error("Error configuring audio mode: ", error);
-      }
-    };
-
-    configureAudio();
-  }, []);
-
-  const playSound = async () => {
-    
-    try {
-      const { sound } = await Audio.Sound.createAsync(
-         require('../assets/sounds/switch.mp3')
-      );
-      sound.setOnPlaybackStatusUpdate(async (status) => {
-        if (status.isLoaded && status.didJustFinish) {
-          await sound.unloadAsync();
-        }
-      });
-      await sound.playAsync();
-    } catch (error) {
-        console.log('Error playing sound', error);
-    }
   };
 
   const handleSkipToNextExercise = () => {
@@ -1677,16 +2601,33 @@ export default function StartedWorkoutInterface() {
     }
   };
   const handleFinishWorkout = () => {
+    setIsCardioTimerPaused(false);
     const currentSetIndex = timerState.currentSetIndex;
-    const currentSet = allSets[currentSetIndex];
 
-    if (currentSet && currentSet.reps_done !== '' && parseInt(currentSet.reps_done) > 0 && currentSet.weight !== '' && parseFloat(currentSet.weight) > 0) {
-      const updatedSets = [...allSets];
-      updatedSets[currentSetIndex] = { ...currentSet, set_logged: true };
-      setAllSets(updatedSets);
-      updateExerciseLoggedStatus(currentSet.exercise_id, updatedSets);
-    }
-    
+    setAllSets((prev) => {
+      const currentSet = prev[currentSetIndex];
+      if (currentSet) {
+        const currentIsCardio = isCardioSetUI(currentSet.exercise_name, workoutLogType);
+        const valid = currentIsCardio
+          ? isValidCardioSet(currentSet.reps_done, currentSet.weight || '0')
+          : isValidRepsAndWeight(currentSet.reps_done, currentSet.weight);
+        if (valid) {
+          const next = [...prev];
+          const logged = {
+            ...currentSet,
+            set_logged: true,
+            ...(currentIsCardio ? { weight: currentSet.weight?.trim() || '0' } : {}),
+          };
+          next[currentSetIndex] = logged;
+          queueMicrotask(() => {
+            updateExerciseLoggedStatus(logged.exercise_id, next);
+          });
+          return next;
+        }
+      }
+      return prev;
+    });
+
     stopWorkoutTimer();
     setTimerState(prev => updateTimerState(prev, { workoutStage: 'completed' }));
   };
@@ -1712,7 +2653,9 @@ export default function StartedWorkoutInterface() {
           <Ionicons name="arrow-back" size={24} color={theme.text} />
         </TouchableOpacity>
         <Text style={[styles.title, { color: theme.text }]}>
-          {timerState.workoutStarted ? (workout ? `${workout.workout_name} - ${workout.day_name}` : 'Workout') : t("startWorkout")}
+          {timerState.workoutStarted
+            ? (workout ? formatWorkoutHeaderTitle(workout.workout_name, workout.day_name) : 'Workout')
+            : t('startWorkout')}
         </Text>
         {timerState.workoutStarted ? (
           <TouchableOpacity 
@@ -1742,6 +2685,7 @@ export default function StartedWorkoutInterface() {
       </ScrollView>
       {renderExerciseListModal()}
       {renderNotesModal()}
+      {renderCardioModal()}
     </View>
   );
 }
@@ -2112,6 +3056,43 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 24,
   },
+
+  emptyActiveWorkoutContainer: {
+    width: '100%',
+    alignItems: 'center',
+    paddingVertical: 32,
+    paddingHorizontal: 16,
+  },
+  emptyActiveWorkoutTimer: {
+    fontSize: 56,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+  },
+  emptyActiveWorkoutButtonRow: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    gap: 12,
+    marginTop: 24,
+    alignSelf: 'stretch',
+    width: '100%',
+  },
+  emptyActiveWorkoutSecondaryButton: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+  },
+  emptyActiveWorkoutPrimaryInRow: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 12,
+  },
   
   // Completed screen styles
   completedContainer: {
@@ -2245,5 +3226,20 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
     marginBottom: 10,
+  },
+  cardioModalCountdown: {
+    fontSize: 48,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginVertical: 16,
+    fontVariant: ['tabular-nums'],
+  },
+  cardioModalPrimaryBtn: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    marginBottom: 8,
   },
 });

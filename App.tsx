@@ -1,11 +1,11 @@
   // App.tsx
-  import React, {useState, useEffect, useRef } from 'react';
+  import React, { useState, useEffect, useRef, useCallback } from 'react';
   import { View, ActivityIndicator, StatusBar, StyleSheet, Text, Platform, TouchableOpacity } from 'react-native'; // Import Platform
 import * as FileSystem from 'expo-file-system/legacy';
 import { SQLiteProvider, useSQLiteContext } from 'expo-sqlite';
 import { Asset } from 'expo-asset';
   import { createStackNavigator } from '@react-navigation/stack';
-  import { NavigationContainer, NavigationContainerRef } from '@react-navigation/native';
+  import { NavigationContainer } from '@react-navigation/native';
   import Ionicons from 'react-native-vector-icons/Ionicons';
   import Home from './screens/Home'; // Assuming you have a Home screen component
   import Workouts from './screens/Workouts';
@@ -35,7 +35,9 @@ import Nutrition from './screens/Nutrition';
   import { SettingsProvider, useSettings } from './context/SettingsContext';
   import { ThemeProvider, useTheme } from './context/ThemeContext';
   import { ProfileProvider } from './context/ProfileContext';
-  import HeaderAvatar from './components/HeaderAvatar';
+  import { DrawerMenuProvider } from './context/DrawerMenuContext';
+  import AppDrawer from './components/AppDrawer';
+  import { rootNavigationRef } from './utils/rootNavigationRef';
   import EditWorkout from './screens/EditWorkout';
   import AllLogs from './screens/AllLogs';
   import BodyWeightLogs from './screens/BodyWeightLogs';
@@ -47,7 +49,7 @@ import * as Notifications from 'expo-notifications';
   import { checkAndSyncPermissions } from './utils/notificationUtils';
   import { AppState } from 'react-native';
 import GraphsWorkoutDetails from './screens/GraphsWorkoutDetails';
-import { initNutritionDb } from './utils/nutritionDb';
+import { initNutritionDb, migrateLoggedFoodsAddLogIdColumnSafe } from './utils/nutritionDb';
 import { initMealPlansDb } from './utils/initMealPlansDb';
 import { addRecurringTable, createUpdateTriggers } from './utils/addRecurringTable';
 import { initWorkoutDb } from './utils/initWorkoutDb';
@@ -64,6 +66,7 @@ async function onSqliteInit(db: { runAsync: (sql: string) => Promise<void> }) {
   // Do NOT drop DayActivePlan here — that wiped every user's active plan/day assignments on each
   // app launch. Ensure tables via idempotent CREATE IF NOT EXISTS only.
   await initMealPlansDb(db as any);
+  await migrateLoggedFoodsAddLogIdColumnSafe(db as any);
 
   // Allow INSERT OR REPLACE on Workout_Log for duplicate (workout_date, day_name, workout_name)
   await db.runAsync(
@@ -180,7 +183,7 @@ import {
     ManageRecurringWorkouts: undefined;
     RecurringWorkoutDetails: { recurring_workout_id: number };
     EditRecurringWorkout: { recurring_workout_id: number };
-    StartedWorkoutInterface: { workout_log_id: number };
+    StartedWorkoutInterface: { workout_log_id: number; resume?: boolean };
     LogWeights: { workout_log_id?: number };
   };
 
@@ -194,7 +197,7 @@ import {
 
   export type StartWorkoutStackParamList = {
     StartWorkout: { fromNotification?: boolean } | undefined;
-    StartedWorkoutInterface: { workout_log_id: number };
+    StartedWorkoutInterface: { workout_log_id: number; resume?: boolean };
   }
 
   function WorkoutStack() {
@@ -420,7 +423,7 @@ function NutritionDbInitializer() {
 }
 
 // Define AppContent here
-const AppContent = () => {
+const AppContent = ({ onOpenMainDrawer }: { onOpenMainDrawer: () => void }) => {
   const { theme } = useTheme();
   const { notificationPermissionGranted, setNotificationPermissionGranted } =
     useSettings();
@@ -447,22 +450,24 @@ const AppContent = () => {
         <SQLiteProvider databaseName={SQLITE_DATABASE_NAME} useSuspense onInit={onSqliteInit}>
           <RecurringWorkoutManager />
           <NutritionDbInitializer />
-          <ProfileProvider>
+          <DrawerMenuProvider onOpen={onOpenMainDrawer}>
+          <>
           <Stack.Navigator
-            screenOptions={({ navigation }) => ({
+            screenOptions={{
               headerStyle: { backgroundColor: theme.background },
               headerTintColor: theme.text,
               headerTitleAlign: 'center',
               headerLeft: () => (
                 <TouchableOpacity
-                  onPress={() => navigation.navigate('Home')}
+                  onPress={onOpenMainDrawer}
                   style={{ paddingLeft: 16 }}
+                  accessibilityLabel="Open menu"
+                  hitSlop={{ top: 12, bottom: 12, right: 12, left: 8 }}
                 >
-                  <Ionicons name="home-outline" size={24} color="#7C9A7E" />
+                  <Ionicons name="menu-outline" size={28} color="#7C9A7E" />
                 </TouchableOpacity>
               ),
-              headerRight: () => <HeaderAvatar />,
-            })}
+            }}
           >
             <Stack.Screen
               name="Home"
@@ -493,20 +498,36 @@ const AppContent = () => {
             <Stack.Screen name="MyVow" component={MyVow} options={{ headerTitle: 'MyVow Fit' }} />
             <Stack.Screen name="Settings" component={Settings} options={{ headerTitle: 'Settings' }} />
           </Stack.Navigator>
-          </ProfileProvider>
+          </>
+          </DrawerMenuProvider>
         </SQLiteProvider>
       </React.Suspense>
     </>
   );
 };
 
-
+/** Drawer modal lives above NavigationContainer so it is not trapped under native-stack layers (e.g. MealPlanDetail). */
+function NavigationWithDrawer() {
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const openMainDrawer = useCallback(() => setDrawerOpen(true), []);
+  return (
+    <ProfileProvider>
+      <AppDrawer visible={drawerOpen} onClose={() => setDrawerOpen(false)} />
+      <NavigationContainer ref={rootNavigationRef}>
+        <SettingsProvider>
+          <I18nextProvider i18n={i18n}>
+            <AppContent onOpenMainDrawer={openMainDrawer} />
+          </I18nextProvider>
+        </SettingsProvider>
+      </NavigationContainer>
+    </ProfileProvider>
+  );
+}
 
   export default function App() {
     const [dbLoaded, setDbLoaded] = useState(false);
     const [onboardingResolved, setOnboardingResolved] = useState(false);
     const [showOnboarding, setShowOnboarding] = useState(false);
-    const navigationRef = useRef<NavigationContainerRef<any>>(null);
     const [fontsLoaded] = useFonts({
       'CormorantGaramond-Regular': require('./assets/fonts/CormorantGaramond-Regular.ttf'),
       'CormorantGaramond-Bold': require('./assets/fonts/CormorantGaramond-Bold.ttf'),
@@ -590,13 +611,7 @@ const AppContent = () => {
         {showOnboarding ? (
           <Onboarding onComplete={() => setShowOnboarding(false)} />
         ) : (
-        <NavigationContainer ref={navigationRef}>
-          <SettingsProvider>
-          <I18nextProvider i18n={i18n}>
-          <AppContent/>
-          </I18nextProvider>
-          </SettingsProvider>
-        </NavigationContainer>
+        <NavigationWithDrawer />
         )}
       </GestureHandlerRootView>
       </SafeAreaProvider>

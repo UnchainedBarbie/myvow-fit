@@ -9,7 +9,10 @@ const TIMER_STATE_KEY = '@workout_timer_state';
 // Type definitions
 export interface TimerState {
   workoutStartTime: number | null;
+  /** Cumulative active time (cardio: sum of started segments; used for completion_time). */
   workoutDuration: number;
+  /** Cardio: seconds for the current exercise only; resets when moving to the next exercise. */
+  exerciseSegmentDuration: number;
   restStartTime: number | null;
   restRemaining: number | null;
   isResting: boolean;
@@ -19,14 +22,74 @@ export interface TimerState {
   workoutStarted: boolean;
 }
 
+/** In-progress set logging (Weight_Log is only written on workout completion). */
+export type SetProgressSnapshot = {
+  exercise_name: string;
+  set_number: number;
+  weight: string;
+  reps_done: string;
+  set_logged: boolean;
+  /** True when duration was saved from the cardio timer modal (even if it equals goal). */
+  cardio_duration_saved_from_timer?: boolean;
+};
+
+export type PersistedTimerPayload = TimerState & {
+  timestamp: number;
+  workoutLogId?: number | null;
+  setsSnapshot?: SetProgressSnapshot[];
+  /** Cardio: timer interval stopped; do not add background elapsed to duration. */
+  cardioTimerPaused?: boolean;
+};
+
 export interface TimerCallbacks {
-  onRestore: (savedState: TimerState, elapsedSeconds: number) => void;
+  onRestore: (
+    savedState: TimerState,
+    elapsedSeconds: number,
+    rawPayload?: PersistedTimerPayload,
+  ) => void;
   onError?: (error: Error) => void;
 }
 
 export interface TimerPersistenceOptions {
   enabled?: boolean;
   debugMode?: boolean;
+  /** When set, stored with timer blob so resume can verify the same workout. */
+  workoutLogId?: number;
+  /** Persists in-memory set progress when the app backgrounds. */
+  getSetsSnapshot?: () => SetProgressSnapshot[];
+  /** When true, saved on background so restore does not count background time toward duration. */
+  getCardioTimerPaused?: () => boolean;
+}
+
+export function mergeExerciseSetsWithSnapshot<
+  T extends {
+    exercise_name: string;
+    set_number: number;
+    weight: string;
+    reps_done: string;
+    set_logged: boolean;
+  },
+>(sets: T[], snapshot: SetProgressSnapshot[]): T[] {
+  const map = new Map(
+    snapshot.map((s) => [`${s.exercise_name}\0${s.set_number}`, s] as const),
+  );
+  return sets.map((row) => {
+    const snap = map.get(`${row.exercise_name}\0${row.set_number}`);
+    if (!snap) return row;
+    const merged = {
+      ...row,
+      weight: snap.weight,
+      reps_done: snap.reps_done,
+      set_logged: snap.set_logged,
+    };
+    if ('cardio_duration_saved_from_timer' in snap) {
+      return {
+        ...merged,
+        cardio_duration_saved_from_timer: snap.cardio_duration_saved_from_timer,
+      };
+    }
+    return merged;
+  });
 }
 
 // Utility functions for timer state management
@@ -34,15 +97,27 @@ export const timerStateUtils = {
   /**
    * Save timer state to AsyncStorage
    */
-  saveTimerState: async (timerState: TimerState): Promise<void> => {
+  saveTimerState: async (
+    timerState: TimerState,
+    extra?: {
+      workoutLogId?: number;
+      setsSnapshot?: SetProgressSnapshot[];
+      cardioTimerPaused?: boolean;
+    },
+  ): Promise<void> => {
     try {
-      const stateWithTimestamp = {
+      const stateWithTimestamp: PersistedTimerPayload = {
         ...timerState,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        ...(extra?.workoutLogId != null ? { workoutLogId: extra.workoutLogId } : {}),
+        ...(extra?.setsSnapshot != null && extra.setsSnapshot.length > 0
+          ? { setsSnapshot: extra.setsSnapshot }
+          : {}),
+        ...(extra?.cardioTimerPaused === true ? { cardioTimerPaused: true } : {}),
       };
-      
+
       await AsyncStorage.setItem(TIMER_STATE_KEY, JSON.stringify(stateWithTimestamp));
-      
+
       if (__DEV__) {
         console.log('Timer state saved:', stateWithTimestamp);
       }
@@ -55,20 +130,20 @@ export const timerStateUtils = {
   /**
    * Load timer state from AsyncStorage
    */
-  loadTimerState: async (): Promise<(TimerState & { timestamp: number }) | null> => {
+  loadTimerState: async (): Promise<PersistedTimerPayload | null> => {
     try {
       const stored = await AsyncStorage.getItem(TIMER_STATE_KEY);
-      
+
       if (!stored) {
         return null;
       }
-      
+
       const parsedState = JSON.parse(stored);
-      
+
       if (__DEV__) {
         console.log('Timer state loaded:', parsedState);
       }
-      
+
       return parsedState;
     } catch (error) {
       console.error('Error loading timer state:', error);
@@ -82,7 +157,6 @@ export const timerStateUtils = {
   clearTimerState: async (): Promise<void> => {
     try {
       await AsyncStorage.removeItem(TIMER_STATE_KEY);
-      
     } catch (error) {
       console.error('Error clearing timer state:', error);
     }
@@ -107,7 +181,23 @@ export const timerStateUtils = {
       typeof state.workoutStarted === 'boolean' &&
       ['overview', 'exercise', 'rest', 'completed'].includes(state.workoutStage)
     );
-  }
+  },
+
+  toTimerState: (payload: PersistedTimerPayload): TimerState => ({
+    workoutStartTime: payload.workoutStartTime,
+    workoutDuration: payload.workoutDuration,
+    exerciseSegmentDuration:
+      typeof payload.exerciseSegmentDuration === 'number'
+        ? payload.exerciseSegmentDuration
+        : 0,
+    restStartTime: payload.restStartTime,
+    restRemaining: payload.restRemaining,
+    isResting: payload.isResting,
+    isExerciseRest: payload.isExerciseRest,
+    currentSetIndex: payload.currentSetIndex,
+    workoutStage: payload.workoutStage,
+    workoutStarted: payload.workoutStarted,
+  }),
 };
 
 /**
@@ -116,109 +206,138 @@ export const timerStateUtils = {
 export const useTimerPersistence = (
   timerState: TimerState,
   callbacks: TimerCallbacks,
-  options: TimerPersistenceOptions = {}
+  options: TimerPersistenceOptions = {},
 ) => {
-  const { enabled = true, debugMode = __DEV__ } = options;
+  const { enabled = true, debugMode = __DEV__, workoutLogId, getSetsSnapshot, getCardioTimerPaused } =
+    options;
   const appState = useRef<AppStateStatus>(AppState.currentState);
   const isRestoringRef = useRef(false);
+  const workoutLogIdRef = useRef(workoutLogId);
+  const getSetsSnapshotRef = useRef(getSetsSnapshot);
+  const getCardioTimerPausedRef = useRef(getCardioTimerPaused);
 
-  const handleAppStateChange = useCallback(async (nextAppState: AppStateStatus) => {
-    if (!enabled || !timerState.workoutStarted || timerState.workoutStage === 'completed') {
-      appState.current = nextAppState;
-      return;
-    }
+  useEffect(() => {
+    workoutLogIdRef.current = workoutLogId;
+  }, [workoutLogId]);
 
-    try {
-      // Going to background
-      if (appState.current === 'active' && nextAppState.match(/inactive|background/)) {
-        if (debugMode) {
-          console.log('=== APP GOING TO BACKGROUND ===');
-          console.log('Saving timer state:', timerState);
-        }
-        
-        await timerStateUtils.saveTimerState(timerState);
+  useEffect(() => {
+    getSetsSnapshotRef.current = getSetsSnapshot;
+  }, [getSetsSnapshot]);
+
+  useEffect(() => {
+    getCardioTimerPausedRef.current = getCardioTimerPaused;
+  }, [getCardioTimerPaused]);
+
+  const handleAppStateChange = useCallback(
+    async (nextAppState: AppStateStatus) => {
+      if (!enabled || !timerState.workoutStarted || timerState.workoutStage === 'completed') {
+        appState.current = nextAppState;
+        return;
       }
-      // Coming to foreground
-      else if (appState.current.match(/inactive|background/) && nextAppState === 'active') {
-        if (debugMode) {
-          console.log('=== APP RETURNING TO FOREGROUND ===');
-        }
-        
-        // Prevent multiple restoration attempts
-        if (isRestoringRef.current) {
+
+      try {
+        // Going to background
+        if (appState.current === 'active' && nextAppState.match(/inactive|background/)) {
           if (debugMode) {
-            console.log('Restoration already in progress, skipping...');
+            console.log('=== APP GOING TO BACKGROUND ===');
+            console.log('Saving timer state:', timerState);
           }
-          return;
+
+          const setsSnapshot = getSetsSnapshotRef.current?.();
+          const cardioPaused = getCardioTimerPausedRef.current?.() === true;
+          await timerStateUtils.saveTimerState(timerState, {
+            workoutLogId: workoutLogIdRef.current,
+            setsSnapshot: setsSnapshot && setsSnapshot.length > 0 ? setsSnapshot : undefined,
+            ...(cardioPaused ? { cardioTimerPaused: true } : {}),
+          });
         }
-        
-        isRestoringRef.current = true;
-        
-        try {
-          const savedState = await timerStateUtils.loadTimerState();
-          
-          if (savedState && timerStateUtils.isValidTimerState(savedState)) {
-            const elapsedSeconds = timerStateUtils.calculateElapsedTime(savedState.timestamp);
-            
+        // Coming to foreground
+        else if (appState.current.match(/inactive|background/) && nextAppState === 'active') {
+          if (debugMode) {
+            console.log('=== APP RETURNING TO FOREGROUND ===');
+          }
+
+          // Prevent multiple restoration attempts
+          if (isRestoringRef.current) {
             if (debugMode) {
-              console.log('Elapsed time in background:', elapsedSeconds, 'seconds');
-              console.log('Restoring state:', savedState);
+              console.log('Restoration already in progress, skipping...');
             }
-            
-            callbacks.onRestore(savedState, elapsedSeconds);
-            await timerStateUtils.clearTimerState();
-          } else if (debugMode) {
-            console.log('No valid saved state found');
+            return;
           }
-        } finally {
-          isRestoringRef.current = false;
+
+          isRestoringRef.current = true;
+
+          try {
+            const savedState = await timerStateUtils.loadTimerState();
+
+            if (savedState && timerStateUtils.isValidTimerState(savedState)) {
+              const elapsedSeconds = timerStateUtils.calculateElapsedTime(savedState.timestamp);
+
+              if (debugMode) {
+                console.log('Elapsed time in background:', elapsedSeconds, 'seconds');
+                console.log('Restoring state:', savedState);
+              }
+
+              callbacks.onRestore(
+                timerStateUtils.toTimerState(savedState),
+                elapsedSeconds,
+                savedState,
+              );
+              await timerStateUtils.clearTimerState();
+            } else if (debugMode) {
+              console.log('No valid saved state found');
+            }
+          } finally {
+            isRestoringRef.current = false;
+          }
         }
+      } catch (error) {
+        const errorObj = error instanceof Error ? error : new Error(String(error));
+        console.error('Error in app state change handler:', errorObj);
+
+        if (callbacks.onError) {
+          callbacks.onError(errorObj);
+        }
+
+        isRestoringRef.current = false;
       }
-    } catch (error) {
-      const errorObj = error instanceof Error ? error : new Error(String(error));
-      console.error('Error in app state change handler:', errorObj);
-      
-      if (callbacks.onError) {
-        callbacks.onError(errorObj);
-      }
-      
-      isRestoringRef.current = false;
-    }
-    
-    appState.current = nextAppState;
-  }, [timerState, callbacks, enabled, debugMode]);
+
+      appState.current = nextAppState;
+    },
+    [timerState, callbacks, enabled, debugMode],
+  );
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', handleAppStateChange);
-    
+
     return () => {
       subscription.remove();
-      // Clean up any stored state when component unmounts
-      if (enabled) {
-        timerStateUtils.clearTimerState().catch(error => {
-          console.error('Error cleaning up timer state on unmount:', error);
-        });
-      }
+      // Do not clear timer blob on unmount — StartedWorkoutInterface persists on blur/unmount
+      // and clears explicitly when the workout is saved or the user abandons it.
     };
   }, [handleAppStateChange, enabled]);
 
   // Return utility functions for manual control
   return {
-    saveState: () => timerStateUtils.saveTimerState(timerState),
+    saveState: () =>
+      timerStateUtils.saveTimerState(timerState, {
+        workoutLogId: workoutLogIdRef.current,
+        setsSnapshot: getSetsSnapshotRef.current?.(),
+        ...(getCardioTimerPausedRef.current?.() === true ? { cardioTimerPaused: true } : {}),
+      }),
     clearState: timerStateUtils.clearTimerState,
-    loadState: timerStateUtils.loadTimerState
+    loadState: timerStateUtils.loadTimerState,
   };
 };
 
 /**
  * Helper function to create timer state object
  */
-export const createTimerState = (
-  overrides: Partial<TimerState> = {}
-): TimerState => {
+export const createTimerState = (overrides: Partial<TimerState> = {}): TimerState => {
   return {
     workoutStartTime: null,
     workoutDuration: 0,
+    exerciseSegmentDuration: 0,
     restStartTime: null,
     restRemaining: 0,
     isResting: false,
@@ -226,20 +345,17 @@ export const createTimerState = (
     currentSetIndex: 0,
     workoutStage: 'overview',
     workoutStarted: false,
-    ...overrides
+    ...overrides,
   };
 };
 
 /**
  * Helper function to update timer state immutably
  */
-export const updateTimerState = (
-  currentState: TimerState,
-  updates: Partial<TimerState>
-): TimerState => {
+export const updateTimerState = (currentState: TimerState, updates: Partial<TimerState>): TimerState => {
   return {
     ...currentState,
-    ...updates
+    ...updates,
   };
 };
 
@@ -271,9 +387,9 @@ export const timerCalculations = {
     const hrs = Math.floor(seconds / 3600);
     const mins = Math.floor((seconds % 3600) / 60);
     const secs = seconds % 60;
-    
+
     return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-  }
+  },
 };
 
 export default {
@@ -281,5 +397,5 @@ export default {
   timerStateUtils,
   createTimerState,
   updateTimerState,
-  timerCalculations
+  timerCalculations,
 };

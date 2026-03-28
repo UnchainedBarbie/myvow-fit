@@ -29,11 +29,19 @@ import { LineChart } from 'react-native-chart-kit';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { showCelebrationNotification } from '../utils/notificationUtils';
+import { formatLocalYmd, getLocalWeekMondaySundayYmd } from '../utils/localDateYmd';
 
 const SAGE = '#7C9A7E';
 const CREAM = '#FDF8F0';
+const WEEKLY_SUMMARY_MODAL_BG = '#F5F0E8';
+const SAGE_WORKER_URL = 'https://myvow-fit-api.allison-spink.workers.dev';
+const WEEKLY_SUMMARY_SYSTEM_PROMPT =
+  'You are Sage, a warm and motivating fitness coach. Give a concise, encouraging weekly summary based on the data provided. Keep it under 150 words.';
+const WEEKLY_SUMMARY_API_ERROR =
+  'Sage is taking a break — try again in a moment.';
 
 const USER_HEIGHT_KEY = '@user_height_inches';
 const USER_STARTING_WEIGHT_KEY = '@user_starting_weight';
@@ -88,18 +96,226 @@ function formatDateYMD(dateStr: string): string {
   return m && day ? `${Number(m)}/${Number(day)}` : d;
 }
 
-function getThisWeekRange(): { weekStart: string; weekEnd: string } {
-  const d = new Date();
-  const day = d.getDay();
-  const mondayOffset = day === 0 ? -6 : 1 - day;
-  const monday = new Date(d);
-  monday.setDate(d.getDate() + mondayOffset);
-  const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
+/** Monday 00:00:00 through end of today (local), for weekly progress summaries. */
+function getMondayToTodayProgressRange(): {
+  weekStartYmd: string;
+  todayYmd: string;
+  startTs: number;
+  endTs: number;
+} {
+  const now = new Date();
+  const dow = now.getDay();
+  const mondayOffset = dow === 0 ? -6 : 1 - dow;
+  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() + mondayOffset);
+  monday.setHours(0, 0, 0, 0);
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
   return {
-    weekStart: monday.toISOString().slice(0, 10),
-    weekEnd: sunday.toISOString().slice(0, 10),
+    weekStartYmd: formatLocalYmd(monday),
+    todayYmd: formatLocalYmd(now),
+    startTs: Math.floor(monday.getTime() / 1000),
+    endTs: Math.floor(end.getTime() / 1000),
   };
+}
+
+type WeeklySummaryPayload = {
+  periodLabel: string;
+  workoutsScheduled: number;
+  workoutsLogged: number;
+  vowCheckInsCompleted: number;
+  avgDailyCalories: number | null;
+  daysWithCalorieLogs: number;
+  prExercisesThisWeek: string[];
+  strengthRecordsThisWeek: { exercise_name: string; weight: number; reps: number | null }[];
+};
+
+async function gatherWeeklySummaryData(db: {
+  getAllAsync: (sql: string, params?: (string | number)[]) => Promise<any[]>;
+}): Promise<WeeklySummaryPayload> {
+  const { weekStartYmd, todayYmd, startTs, endTs } = getMondayToTodayProgressRange();
+  const periodLabel = `${weekStartYmd} through ${todayYmd}`;
+
+  let workoutsScheduled = 0;
+  let workoutsLogged = 0;
+  try {
+    const sched = await db.getAllAsync<{ n: number }>(
+      'SELECT COUNT(*) as n FROM Workout_Log WHERE workout_date BETWEEN ? AND ?;',
+      [startTs, endTs]
+    );
+    workoutsScheduled = sched[0]?.n ?? 0;
+    const logged = await db.getAllAsync<{ n: number }>(
+      `SELECT COUNT(DISTINCT wl.workout_log_id) as n
+       FROM Weight_Log wl
+       INNER JOIN Workout_Log w ON w.workout_log_id = wl.workout_log_id
+       WHERE w.workout_date BETWEEN ? AND ?;`,
+      [startTs, endTs]
+    );
+    workoutsLogged = logged[0]?.n ?? 0;
+  } catch (e) {
+    console.warn('weekly summary workouts:', e);
+  }
+
+  let vowCheckInsCompleted = 0;
+  try {
+    const vows = await db.getAllAsync<{ n: number }>(
+      'SELECT COUNT(*) as n FROM VowCheckIns WHERE check_in_date >= ? AND check_in_date <= ?;',
+      [weekStartYmd, todayYmd]
+    );
+    vowCheckInsCompleted = vows[0]?.n ?? 0;
+  } catch {
+    /* table may not exist yet */
+  }
+
+  let avgDailyCalories: number | null = null;
+  let daysWithCalorieLogs = 0;
+  try {
+    const calRows = await db.getAllAsync<{ daily_total: number }>(
+      `SELECT SUM(COALESCE(lf.calories, 0) * COALESCE(lf.quantity, 1)) as daily_total
+       FROM DailyLog dl
+       INNER JOIN LoggedFoods lf ON lf.log_id = dl.log_id
+       WHERE dl.log_date >= ? AND dl.log_date <= ?
+       GROUP BY dl.log_date
+       HAVING SUM(COALESCE(lf.calories, 0) * COALESCE(lf.quantity, 1)) > 0;`,
+      [weekStartYmd, todayYmd]
+    );
+    daysWithCalorieLogs = calRows.length;
+    if (calRows.length > 0) {
+      const sum = calRows.reduce((a, r) => a + (Number(r.daily_total) || 0), 0);
+      avgDailyCalories = Math.round(sum / calRows.length);
+    }
+  } catch {
+    /* nutrition tables may be missing */
+  }
+
+  const prExercisesThisWeek: string[] = [];
+  try {
+    const prNames = await db.getAllAsync<{ exercise_name: string }>(
+      `WITH week_sets AS (
+         SELECT wl.exercise_name, wl.weight_logged, w.workout_date
+         FROM Weight_Log wl
+         INNER JOIN Workout_Log w ON w.workout_log_id = wl.workout_log_id
+         WHERE w.workout_date BETWEEN ? AND ?
+           AND wl.exercise_name NOT LIKE 'Warm-up:%'
+           AND wl.exercise_name NOT LIKE 'Cool-down:%'
+       ),
+       prior_max AS (
+         SELECT wl.exercise_name, MAX(wl.weight_logged) as max_w
+         FROM Weight_Log wl
+         INNER JOIN Workout_Log w ON w.workout_log_id = w.workout_log_id
+         WHERE w.workout_date < ?
+         GROUP BY wl.exercise_name
+       )
+       SELECT DISTINCT ws.exercise_name
+       FROM week_sets ws
+       LEFT JOIN prior_max p ON p.exercise_name = ws.exercise_name
+       WHERE ws.weight_logged > COALESCE(p.max_w, 0);`,
+      [startTs, endTs, startTs]
+    );
+    prNames.forEach((r) => prExercisesThisWeek.push(r.exercise_name));
+  } catch (e) {
+    console.warn('weekly summary PRs:', e);
+  }
+
+  const strengthRecordsThisWeek: { exercise_name: string; weight: number; reps: number | null }[] = [];
+  try {
+    const sr = await db.getAllAsync<{
+      exercise_name: string;
+      weight: number | null;
+      reps: number | null;
+    }>(
+      `SELECT exercise_name, weight, reps FROM StrengthRecords
+       WHERE log_date >= ? AND log_date <= ? AND weight IS NOT NULL
+       ORDER BY log_date ASC;`,
+      [weekStartYmd, todayYmd]
+    );
+    for (const r of sr) {
+      if (r.weight == null) continue;
+      if (r.exercise_name.startsWith('Warm-up:') || r.exercise_name.startsWith('Cool-down:')) continue;
+      strengthRecordsThisWeek.push({
+        exercise_name: r.exercise_name,
+        weight: r.weight,
+        reps: r.reps,
+      });
+    }
+  } catch {
+    /* StrengthRecords may be missing */
+  }
+
+  return {
+    periodLabel,
+    workoutsScheduled,
+    workoutsLogged,
+    vowCheckInsCompleted,
+    avgDailyCalories,
+    daysWithCalorieLogs,
+    prExercisesThisWeek,
+    strengthRecordsThisWeek,
+  };
+}
+
+function weeklyPayloadToUserMessage(data: WeeklySummaryPayload): string {
+  const lines: string[] = [
+    `Weekly progress data (${data.periodLabel}, Monday through today):`,
+    `- Workouts logged vs scheduled: ${data.workoutsLogged} logged / ${data.workoutsScheduled} scheduled on the calendar`,
+    `- Vow check-ins completed this period: ${data.vowCheckInsCompleted}`,
+  ];
+  if (data.avgDailyCalories != null && data.daysWithCalorieLogs > 0) {
+    lines.push(
+      `- Nutrition: average daily calories logged ≈ ${data.avgDailyCalories} kcal (across ${data.daysWithCalorieLogs} day(s) with food logs)`
+    );
+  } else {
+    lines.push('- Nutrition: no calorie logs found for this period');
+  }
+  if (data.prExercisesThisWeek.length > 0) {
+    lines.push(
+      `- New weight PRs (from workout exercise logs vs prior max): ${data.prExercisesThisWeek.join(', ')}`
+    );
+  } else {
+    lines.push('- New weight PRs from workout logs: none detected this period');
+  }
+  if (data.strengthRecordsThisWeek.length > 0) {
+    const bits = data.strengthRecordsThisWeek.map(
+      (r) => `${r.exercise_name} (${r.weight} lb${r.reps != null ? ` × ${r.reps}` : ''})`
+    );
+    lines.push(`- Strength records / PRs logged in MyStrength this period: ${bits.join('; ')}`);
+  } else {
+    lines.push('- Strength records logged in MyStrength this period: none');
+  }
+  return lines.join('\n');
+}
+
+function parseSageWorkerText(data: unknown): string {
+  const d = data as { content?: { type?: string; text?: string }[] };
+  const blocks = Array.isArray(d?.content) ? d.content : [];
+  return blocks
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text)
+    .join('\n')
+    .trim();
+}
+
+async function fetchWeeklySummaryFromSage(userMessage: string): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  try {
+    const response = await fetch(SAGE_WORKER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 600,
+        system: WEEKLY_SUMMARY_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: userMessage }],
+      }),
+    });
+    if (!response.ok) {
+      console.warn('Weekly summary API:', await response.text());
+      return { ok: false, error: WEEKLY_SUMMARY_API_ERROR };
+    }
+    const json = await response.json();
+    const text = parseSageWorkerText(json);
+    return { ok: true, text: text || 'Here is your week in review — keep showing up for yourself.' };
+  } catch (e) {
+    console.warn('Weekly summary fetch:', e);
+    return { ok: false, error: WEEKLY_SUMMARY_API_ERROR };
+  }
 }
 
 /** If the two most recent body logs show weight loss, show a congrats notification. */
@@ -192,7 +408,9 @@ export default function MyProgress() {
   const navigation = useNavigation<any>();
   const { theme } = useTheme();
   const { profileSavedTrigger } = useProfile();
-  const { width } = useWindowDimensions();
+  const { width, height: windowHeight } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
+  const bodyLogModalScrollMax = Math.min(windowHeight * 0.48, 360);
   const chartWidth = Math.max(width - 48, 280);
   /** Chart width inside metric detail modal: overlay padding 24*2 + box padding 20*2 */
   const chartWidthModal = Math.max(width - 88, 260);
@@ -219,6 +437,8 @@ export default function MyProgress() {
   const [logWater, setLogWater] = useState('');
   const [logFat, setLogFat] = useState('');
   const [logNotes, setLogNotes] = useState('');
+  /** Log MyBody modal: lift footer only so Cancel/Save sit above keyboard (no KeyboardAvoidingView on the sheet). */
+  const [bodyLogKeyboardInset, setBodyLogKeyboardInset] = useState(0);
   const [userHeightInches, setUserHeightInches] = useState<string>('');
 
   // Editable card values (synced from latestBody, saved on blur)
@@ -241,6 +461,37 @@ export default function MyProgress() {
   /** Which metric tile detail is open: chart + history for that metric. */
   const [metricDetailModal, setMetricDetailModal] = useState<'heaviest' | 'volume' | 'estimated1RM' | null>(null);
 
+  const [weeklySummaryVisible, setWeeklySummaryVisible] = useState(false);
+  const [weeklySummaryLoading, setWeeklySummaryLoading] = useState(false);
+  const [weeklySummaryText, setWeeklySummaryText] = useState('');
+  const [weeklySummaryError, setWeeklySummaryError] = useState<string | null>(null);
+  const weeklySummaryInFlight = useRef(false);
+
+  const handleOpenWeeklySummary = useCallback(async () => {
+    if (weeklySummaryInFlight.current) return;
+    weeklySummaryInFlight.current = true;
+    setWeeklySummaryVisible(true);
+    setWeeklySummaryLoading(true);
+    setWeeklySummaryText('');
+    setWeeklySummaryError(null);
+    try {
+      const payload = await gatherWeeklySummaryData(db);
+      const userMsg = weeklyPayloadToUserMessage(payload);
+      const result = await fetchWeeklySummaryFromSage(userMsg);
+      if (result.ok) {
+        setWeeklySummaryText(result.text);
+      } else {
+        setWeeklySummaryError(result.error);
+      }
+    } catch (e) {
+      console.error('Weekly summary:', e);
+      setWeeklySummaryError(WEEKLY_SUMMARY_API_ERROR);
+    } finally {
+      setWeeklySummaryLoading(false);
+      weeklySummaryInFlight.current = false;
+    }
+  }, [db]);
+
   const loadStarting = useCallback(async () => {
     const [sw, sd] = await Promise.all([
       AsyncStorage.getItem(USER_STARTING_WEIGHT_KEY),
@@ -253,6 +504,23 @@ export default function MyProgress() {
   useEffect(() => {
     loadStarting();
   }, [profileSavedTrigger, loadStarting]);
+
+  useEffect(() => {
+    if (!logModalVisible) {
+      setBodyLogKeyboardInset(0);
+      return;
+    }
+    const showEvt = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvt = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const showSub = Keyboard.addListener(showEvt, (e) => {
+      setBodyLogKeyboardInset(e.endCoordinates?.height ?? 0);
+    });
+    const hideSub = Keyboard.addListener(hideEvt, () => setBodyLogKeyboardInset(0));
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, [logModalVisible]);
 
   const loadBody = useCallback(async () => {
     setBodyLoading(true);
@@ -278,7 +546,7 @@ export default function MyProgress() {
       );
       setBodyHistory(rows);
 
-      const { weekStart, weekEnd } = getThisWeekRange();
+      const { weekStartYmd: weekStart, weekEndYmd: weekEnd } = getLocalWeekMondaySundayYmd();
       const weekRows = await db.getAllAsync<BodyMetricRow>(
         'SELECT * FROM BodyMetrics WHERE log_date >= ? AND log_date <= ? ORDER BY log_date DESC;',
         [weekStart, weekEnd]
@@ -311,7 +579,12 @@ export default function MyProgress() {
         ...fromWeight.map((r) => r.exercise_name),
         ...fromRecords.map((r) => r.exercise_name),
       ]);
-      const names = Array.from(nameSet).sort().map((exercise_name) => ({ exercise_name }));
+      const names = Array.from(nameSet)
+        .filter(
+          (n) => !n.startsWith('Warm-up:') && !n.startsWith('Cool-down:')
+        )
+        .sort()
+        .map((exercise_name) => ({ exercise_name }));
 
       const records = await db.getAllAsync<StrengthRecordRow>(
         'SELECT * FROM StrengthRecords ORDER BY exercise_name, one_rep_max DESC;'
@@ -346,7 +619,7 @@ export default function MyProgress() {
       const list = names.map((n) => ({
         exercise_name: n.exercise_name,
         maxWeight: maxWeightByExercise.get(n.exercise_name) ?? 0,
-        oneRM: maxORMByExercise.get(n.exercise_name) ?? 0,
+        oneRM: Math.round(maxORMByExercise.get(n.exercise_name) ?? 0),
       }));
       setStrengthExercises(list);
     } catch (e) {
@@ -623,6 +896,17 @@ export default function MyProgress() {
 
   return (
     <View style={[styles.container, { backgroundColor: theme.background || CREAM }]}>
+      <View style={styles.weeklySummaryRow}>
+        <TouchableOpacity
+          style={[styles.weeklySummaryButton, { backgroundColor: SAGE }]}
+          onPress={handleOpenWeeklySummary}
+          activeOpacity={0.85}
+        >
+          <Ionicons name="sparkles-outline" size={18} color="#FFFFFF" style={styles.weeklySummaryIcon} />
+          <Text style={styles.weeklySummaryButtonText}>Weekly Summary</Text>
+        </TouchableOpacity>
+      </View>
+
       <View style={[styles.tabRow, { borderBottomColor: 'rgba(0,0,0,0.1)' }]}>
         <TouchableOpacity
           style={[styles.tab, activeTab === 'body' && styles.tabActive]}
@@ -882,7 +1166,7 @@ export default function MyProgress() {
                       <View style={[styles.historyRow, { backgroundColor: theme.card, borderLeftColor: SAGE }]}>
                         <Text style={[styles.historyDate, { color: theme.text }]}>Current PR</Text>
                         <Text style={[styles.historyDetail, { color: theme.text }]}>
-                          {currentPR.weight} × {currentPR.reps} — Est. 1RM: {currentPR.one_rep_max.toFixed(0)}
+                          {currentPR.weight} × {currentPR.reps} — Est. 1RM: {Math.round(currentPR.one_rep_max)}
                         </Text>
                       </View>
                     );
@@ -938,194 +1222,269 @@ export default function MyProgress() {
 
       <Modal visible={logModalVisible} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
-          <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            style={[styles.modalBox, { backgroundColor: theme.card }]}
-          >
-            <Text style={[styles.modalTitle, { color: theme.text }]}>Log MyBody metrics</Text>
-            <Text style={[styles.modalHint, { color: theme.textSecondary }]}>
-              {logEntryDate
-                ? `Logging for ${new Date(logEntryDate + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}. Enter what your scale shows — no date input needed.`
-                : 'Enter what your scale shows. Not all fields required.'}
-            </Text>
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Weight (lbs)"
-              placeholderTextColor={theme.textSecondary}
-              value={logWeight}
-              onChangeText={setLogWeight}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Muscle mass (%)"
-              placeholderTextColor={theme.textSecondary}
-              value={logMuscle}
-              onChangeText={setLogMuscle}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Bone mass (%)"
-              placeholderTextColor={theme.textSecondary}
-              value={logBone}
-              onChangeText={setLogBone}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Body water (%)"
-              placeholderTextColor={theme.textSecondary}
-              value={logWater}
-              onChangeText={setLogWater}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Body fat (%)"
-              placeholderTextColor={theme.textSecondary}
-              value={logFat}
-              onChangeText={setLogFat}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Notes"
-              placeholderTextColor={theme.textSecondary}
-              value={logNotes}
-              onChangeText={setLogNotes}
-            />
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={[styles.modalButton, { borderColor: theme.border }]}
-                onPress={() => setLogModalVisible(false)}
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={StyleSheet.absoluteFill} />
+          </TouchableWithoutFeedback>
+          <View style={styles.modalKeyboardAvoiding}>
+            <View
+              style={[
+                styles.modalBox,
+                styles.modalBoxBodyLog,
+                { backgroundColor: theme.card, paddingBottom: 0 },
+              ]}
+            >
+              <View style={styles.modalHeaderRow}>
+                <Text style={[styles.modalTitle, styles.modalTitleFlex, { color: theme.text }]}>Log MyBody metrics</Text>
+                <TouchableOpacity onPress={Keyboard.dismiss} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }} accessibilityLabel="Dismiss keyboard">
+                  <Text style={[styles.modalDoneText, { color: SAGE }]}>Done</Text>
+                </TouchableOpacity>
+              </View>
+              <ScrollView
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode="on-drag"
+                showsVerticalScrollIndicator
+                style={{ maxHeight: bodyLogModalScrollMax }}
+                contentContainerStyle={styles.modalScrollContent}
               >
-                <Text style={[styles.modalButtonText, { color: theme.text }]}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalButton, { backgroundColor: SAGE }]}
-                onPress={saveBodyLog}
+                <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+                  <View>
+                    <Text style={[styles.modalHint, { color: theme.textSecondary }]}>
+                      {logEntryDate
+                        ? `Logging for ${new Date(logEntryDate + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}. Enter what your scale shows — no date input needed.`
+                        : 'Enter what your scale shows. Not all fields required.'}
+                    </Text>
+                  </View>
+                </TouchableWithoutFeedback>
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Weight (lbs)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logWeight}
+                  onChangeText={setLogWeight}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Muscle mass (%)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logMuscle}
+                  onChangeText={setLogMuscle}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Bone mass (%)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logBone}
+                  onChangeText={setLogBone}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Body water (%)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logWater}
+                  onChangeText={setLogWater}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Body fat (%)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logFat}
+                  onChangeText={setLogFat}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Notes"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logNotes}
+                  onChangeText={setLogNotes}
+                  returnKeyType="done"
+                  blurOnSubmit
+                  onSubmitEditing={Keyboard.dismiss}
+                />
+                <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+                  <View style={styles.modalTapBelowInputs} />
+                </TouchableWithoutFeedback>
+              </ScrollView>
+              <View
+                style={[
+                  styles.modalButtons,
+                  styles.modalButtonsSticky,
+                  styles.modalButtonsBodyLogFooter,
+                  { paddingBottom: bodyLogKeyboardInset },
+                ]}
               >
-                <Text style={styles.modalButtonTextWhite}>Save</Text>
-              </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.modalButton, { borderColor: theme.border }]}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    setLogModalVisible(false);
+                  }}
+                >
+                  <Text style={[styles.modalButtonText, { color: theme.text }]}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.modalButton, { backgroundColor: SAGE }]}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    saveBodyLog();
+                  }}
+                >
+                  <Text style={styles.modalButtonTextWhite}>Save</Text>
+                </TouchableOpacity>
+              </View>
             </View>
-          </KeyboardAvoidingView>
+          </View>
         </View>
       </Modal>
 
       <Modal visible={editingBodyLog != null} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
-          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
             <View style={StyleSheet.absoluteFill} />
           </TouchableWithoutFeedback>
           <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            style={[styles.modalBox, { backgroundColor: theme.card }]}
+            behavior="padding"
+            keyboardVerticalOffset={Platform.OS === 'ios' ? Math.max(insets.top, 12) : 0}
+            style={styles.modalKeyboardAvoiding}
           >
-            <Text style={[styles.modalTitle, { color: theme.text }]}>Edit weight log</Text>
-            <TouchableOpacity
-              style={[styles.input, { borderColor: theme.border, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }]}
-              onPress={() => setShowEditDatePicker(true)}
-            >
-              <Text style={[styles.modalHint, { color: theme.text, marginBottom: 0 }]}>
-                {editLogDate
-                  ? new Date(editLogDate + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
-                  : 'Tap to pick date'}
-              </Text>
-              <Ionicons name="calendar-outline" size={20} color={theme.textSecondary} />
-            </TouchableOpacity>
-            {showEditDatePicker && Platform.OS === 'ios' && (
-              <Modal visible transparent animationType="slide">
-                <TouchableOpacity style={{ flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' }} activeOpacity={1} onPress={() => setShowEditDatePicker(false)}>
-                  <View style={[styles.modalBox, { backgroundColor: theme.card, paddingBottom: 24 }]} onStartShouldSetResponder={() => true}>
-                    <TouchableOpacity onPress={() => setShowEditDatePicker(false)} style={{ alignSelf: 'flex-end', padding: 16 }}>
-                      <Text style={{ color: SAGE, fontWeight: '600' }}>Done</Text>
-                    </TouchableOpacity>
-                    <DateTimePicker
-                      value={editLogDate ? new Date(editLogDate + 'T12:00:00') : new Date()}
-                      mode="date"
-                      display="spinner"
-                      onChange={(_, date) => {
-                        if (date) setEditLogDate(date.toISOString().slice(0, 10));
-                      }}
-                      maximumDate={new Date()}
-                    />
-                  </View>
+            <View style={[styles.modalBox, styles.modalBoxBodyLog, { backgroundColor: theme.card }]}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={[styles.modalTitle, styles.modalTitleFlex, { color: theme.text }]}>Edit weight log</Text>
+                <TouchableOpacity onPress={Keyboard.dismiss} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }} accessibilityLabel="Dismiss keyboard">
+                  <Text style={[styles.modalDoneText, { color: SAGE }]}>Done</Text>
                 </TouchableOpacity>
-              </Modal>
-            )}
-            {showEditDatePicker && Platform.OS === 'android' && (
-              <DateTimePicker
-                value={editLogDate ? new Date(editLogDate + 'T12:00:00') : new Date()}
-                mode="date"
-                display="default"
-                onChange={(_, date) => {
-                  if (date) setEditLogDate(date.toISOString().slice(0, 10));
-                  setShowEditDatePicker(false);
-                }}
-                maximumDate={new Date()}
-              />
-            )}
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Weight (lbs)"
-              placeholderTextColor={theme.textSecondary}
-              value={logWeight}
-              onChangeText={setLogWeight}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Muscle mass (%)"
-              placeholderTextColor={theme.textSecondary}
-              value={logMuscle}
-              onChangeText={setLogMuscle}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Bone mass (%)"
-              placeholderTextColor={theme.textSecondary}
-              value={logBone}
-              onChangeText={setLogBone}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Body water (%)"
-              placeholderTextColor={theme.textSecondary}
-              value={logWater}
-              onChangeText={setLogWater}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Body fat (%)"
-              placeholderTextColor={theme.textSecondary}
-              value={logFat}
-              onChangeText={setLogFat}
-              keyboardType="decimal-pad"
-            />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Notes"
-              placeholderTextColor={theme.textSecondary}
-              value={logNotes}
-              onChangeText={setLogNotes}
-            />
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={[styles.modalButton, { borderColor: theme.border }]}
-                onPress={() => setEditingBodyLog(null)}
+              </View>
+              <ScrollView
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode="on-drag"
+                showsVerticalScrollIndicator
+                style={{ maxHeight: bodyLogModalScrollMax }}
+                contentContainerStyle={styles.modalScrollContent}
               >
-                <Text style={[styles.modalButtonText, { color: theme.text }]}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalButton, { backgroundColor: SAGE }]}
-                onPress={updateBodyLog}
-              >
-                <Text style={styles.modalButtonTextWhite}>Save</Text>
-              </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.input, { borderColor: theme.border, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }]}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    setShowEditDatePicker(true);
+                  }}
+                >
+                  <Text style={[styles.modalHint, { color: theme.text, marginBottom: 0 }]}>
+                    {editLogDate
+                      ? new Date(editLogDate + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
+                      : 'Tap to pick date'}
+                  </Text>
+                  <Ionicons name="calendar-outline" size={20} color={theme.textSecondary} />
+                </TouchableOpacity>
+                {showEditDatePicker && Platform.OS === 'android' && (
+                  <DateTimePicker
+                    value={editLogDate ? new Date(editLogDate + 'T12:00:00') : new Date()}
+                    mode="date"
+                    display="default"
+                    onChange={(_, date) => {
+                      if (date) setEditLogDate(date.toISOString().slice(0, 10));
+                      setShowEditDatePicker(false);
+                    }}
+                    maximumDate={new Date()}
+                  />
+                )}
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Weight (lbs)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logWeight}
+                  onChangeText={setLogWeight}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Muscle mass (%)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logMuscle}
+                  onChangeText={setLogMuscle}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Bone mass (%)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logBone}
+                  onChangeText={setLogBone}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Body water (%)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logWater}
+                  onChangeText={setLogWater}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Body fat (%)"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logFat}
+                  onChangeText={setLogFat}
+                  keyboardType="decimal-pad"
+                />
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Notes"
+                  placeholderTextColor={theme.textSecondary}
+                  value={logNotes}
+                  onChangeText={setLogNotes}
+                  returnKeyType="done"
+                  blurOnSubmit
+                  onSubmitEditing={Keyboard.dismiss}
+                />
+                <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+                  <View style={styles.modalTapBelowInputs} />
+                </TouchableWithoutFeedback>
+              </ScrollView>
+              {showEditDatePicker && Platform.OS === 'ios' && (
+                <Modal visible transparent animationType="slide">
+                  <TouchableOpacity style={{ flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' }} activeOpacity={1} onPress={() => setShowEditDatePicker(false)}>
+                    <View style={[styles.modalBox, { backgroundColor: theme.card, paddingBottom: 24 }]} onStartShouldSetResponder={() => true}>
+                      <TouchableOpacity onPress={() => setShowEditDatePicker(false)} style={{ alignSelf: 'flex-end', padding: 16 }}>
+                        <Text style={{ color: SAGE, fontWeight: '600' }}>Done</Text>
+                      </TouchableOpacity>
+                      <DateTimePicker
+                        value={editLogDate ? new Date(editLogDate + 'T12:00:00') : new Date()}
+                        mode="date"
+                        display="spinner"
+                        onChange={(_, date) => {
+                          if (date) setEditLogDate(date.toISOString().slice(0, 10));
+                        }}
+                        maximumDate={new Date()}
+                      />
+                    </View>
+                  </TouchableOpacity>
+                </Modal>
+              )}
+              <View style={[styles.modalButtons, styles.modalButtonsSticky]}>
+                <TouchableOpacity
+                  style={[styles.modalButton, { borderColor: theme.border }]}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    setEditingBodyLog(null);
+                  }}
+                >
+                  <Text style={[styles.modalButtonText, { color: theme.text }]}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.modalButton, { backgroundColor: SAGE }]}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    updateBodyLog();
+                  }}
+                >
+                  <Text style={styles.modalButtonTextWhite}>Save</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           </KeyboardAvoidingView>
         </View>
@@ -1196,12 +1555,119 @@ export default function MyProgress() {
         </View>
       </Modal>
 
+      <Modal
+        visible={weeklySummaryVisible}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setWeeklySummaryVisible(false)}
+      >
+        <View style={styles.weeklySummaryModalOverlay}>
+          <TouchableOpacity
+            style={styles.weeklySummaryModalBackdrop}
+            activeOpacity={1}
+            onPress={() => setWeeklySummaryVisible(false)}
+          />
+          <View style={[styles.weeklySummaryModalSheet, { backgroundColor: WEEKLY_SUMMARY_MODAL_BG, borderColor: SAGE }]}>
+            <View style={styles.weeklySummaryModalHeader}>
+              <Text style={[styles.weeklySummaryModalTitle, { color: SAGE }]}>Weekly Summary</Text>
+              <TouchableOpacity
+                onPress={() => setWeeklySummaryVisible(false)}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                accessibilityLabel="Close weekly summary"
+              >
+                <Ionicons name="close-circle" size={28} color={SAGE} />
+              </TouchableOpacity>
+            </View>
+            {weeklySummaryLoading ? (
+              <ActivityIndicator size="large" color={SAGE} style={styles.weeklySummarySpinner} />
+            ) : weeklySummaryError ? (
+              <Text style={[styles.weeklySummaryErrorText, { color: '#2C2C2C' }]}>{weeklySummaryError}</Text>
+            ) : (
+              <ScrollView
+                style={styles.weeklySummaryScroll}
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+              >
+                <Text style={styles.weeklySummaryBodyText}>{weeklySummaryText}</Text>
+              </ScrollView>
+            )}
+          </View>
+        </View>
+      </Modal>
+
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
+  weeklySummaryRow: {
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: 8,
+  },
+  weeklySummaryButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+  },
+  weeklySummaryIcon: { marginRight: 8 },
+  weeklySummaryButtonText: {
+    fontFamily: 'Jost_600SemiBold',
+    fontSize: 15,
+    color: '#FFFFFF',
+  },
+  weeklySummaryModalOverlay: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+  weeklySummaryModalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  weeklySummaryModalSheet: {
+    width: '100%',
+    maxWidth: 400,
+    maxHeight: '78%',
+    borderRadius: 16,
+    borderWidth: 1,
+    padding: 20,
+    zIndex: 1,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+  },
+  weeklySummaryModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 16,
+  },
+  weeklySummaryModalTitle: {
+    fontFamily: 'CormorantGaramond-Bold',
+    fontSize: 24,
+  },
+  weeklySummarySpinner: { paddingVertical: 32 },
+  weeklySummaryScroll: { maxHeight: 420 },
+  weeklySummaryBodyText: {
+    fontFamily: 'CormorantGaramond-Regular',
+    fontSize: 18,
+    lineHeight: 28,
+    color: '#2C2C2C',
+  },
+  weeklySummaryErrorText: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 15,
+    lineHeight: 22,
+    paddingVertical: 16,
+  },
   tabRow: {
     marginTop: -12,
     flexDirection: 'row',
@@ -1491,10 +1957,53 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
+  modalKeyboardAvoiding: {
+    width: '100%',
+    maxWidth: '100%',
+    zIndex: 1,
+  },
   modalBox: {
     borderRadius: 16,
     padding: 24,
     maxHeight: '80%',
+  },
+  /** MyBody log / edit: column layout; Edit modal may still use KeyboardAvoidingView */
+  modalBoxBodyLog: {
+    maxHeight: '88%',
+    width: '100%',
+    paddingBottom: 16,
+  },
+  modalHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    marginBottom: 4,
+  },
+  modalTitleFlex: {
+    flex: 1,
+    marginBottom: 0,
+  },
+  modalDoneText: {
+    fontFamily: 'Jost_600SemiBold',
+    fontSize: 16,
+  },
+  modalScrollContent: {
+    flexGrow: 0,
+    paddingBottom: 4,
+  },
+  modalTapBelowInputs: {
+    minHeight: 72,
+  },
+  modalButtonsSticky: {
+    marginTop: 8,
+    paddingHorizontal: 0,
+  },
+  /** Log MyBody: no extra gap above keyboard — only keyboard height as bottom padding on the row */
+  modalButtonsBodyLogFooter: {
+    marginTop: 4,
+    marginBottom: 0,
+    paddingTop: 0,
   },
   modalTitle: {
     fontFamily: 'Jost_600SemiBold',

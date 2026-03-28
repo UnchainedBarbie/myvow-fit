@@ -1,6 +1,7 @@
 import { useFocusEffect } from '@react-navigation/native'; // Import useFocusEffect
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { View, ScrollView, Text, StyleSheet, FlatList, TouchableOpacity, Alert, Modal, TextInput, Animated, Linking, Keyboard, TouchableWithoutFeedback, StatusBar, Platform } from 'react-native'; // Import StatusBar
+import { View, ScrollView, Text, StyleSheet, FlatList, TouchableOpacity, Pressable, Alert, Modal, TextInput, Animated, Linking, Keyboard, TouchableWithoutFeedback, StatusBar, Platform } from 'react-native'; // Import StatusBar
+import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { useSQLiteContext } from 'expo-sqlite';
@@ -10,6 +11,15 @@ import { WorkoutStackParamList } from '../App';
 import { StackNavigationProp } from '@react-navigation/stack';
 import { useTranslation } from 'react-i18next';
 import { exportWorkout } from '../utils/workoutSharingUtils';
+import {
+  isWarmupOrCooldownExerciseName,
+  sortWorkoutPlanExercisesForDisplay,
+} from '../utils/workoutDisplayUtils';
+import {
+  ensureCardioExerciseName,
+  formatCardioDistanceForDb,
+} from '../utils/cardioExerciseUtils';
+import { DEFAULT_REST_SECONDS_BETWEEN_SETS } from '../utils/startedWorkoutPreferenceUtils';
 
 type WorkoutListNavigationProp = StackNavigationProp<WorkoutStackParamList, 'WorkoutDetails'>;
 
@@ -29,6 +39,7 @@ export default function WorkoutDetails() {
   const { workout_id } = route.params as { workout_id: number };
 
   const [workoutName, setWorkoutName] = useState('');
+  const [workoutPlanType, setWorkoutPlanType] = useState<'strength' | 'cardio'>('strength');
   const [days, setDays] = useState<Day[]>([]);
   const [showDayModal, setShowDayModal] = useState(false);
   const [dayName, setDayName] = useState('');
@@ -42,6 +53,9 @@ export default function WorkoutDetails() {
   const [exerciseWebLink, setExerciseWebLink] = useState('');
   const [exerciseNotesInput, setExerciseNotesInput] = useState('');
   const [newExerciseMuscleGroup, setNewExerciseMuscleGroup] = useState<string | null>(null);
+  const [exerciseCardioDuration, setExerciseCardioDuration] = useState('');
+  const [exerciseCardioDistance, setExerciseCardioDistance] = useState('');
+  const [exerciseCardioDistUnit, setExerciseCardioDistUnit] = useState<'km' | 'mi'>('km');
   const [showWebLinkModal, setShowWebLinkModal] = useState(false);
   const [editingExercise, setEditingExercise] = useState<{ exercise_id: number; exercise_name: string | null; web_link: string | null; muscle_group: string | null; exercise_notes: string | null; sets: number; reps: number; rest_seconds: number | null } | null>(null);
   const [webLinkInput, setWebLinkInput] = useState('');
@@ -49,8 +63,11 @@ export default function WorkoutDetails() {
   const navigation = useNavigation<WorkoutListNavigationProp>();
   const [isReordering, setIsReordering] = useState(false);
   const [collapsedDayIds, setCollapsedDayIds] = useState<Set<number>>(new Set());
-  const [selectedDayIds, setSelectedDayIds] = useState<Set<number>>(new Set());
+  const [daysToScheduleIds, setDaysToScheduleIds] = useState<Set<number>>(new Set());
   const [showAddToCalendarModal, setShowAddToCalendarModal] = useState(false);
+  const [showEditDayModal, setShowEditDayModal] = useState(false);
+  const [editingDayId, setEditingDayId] = useState<number | null>(null);
+  const [editDayNameInput, setEditDayNameInput] = useState('');
   const [addToCalendarStartDate, setAddToCalendarStartDate] = useState<Date>(() => {
     const d = new Date();
     d.setHours(0, 0, 0, 0);
@@ -69,43 +86,55 @@ export default function WorkoutDetails() {
     });
   }, []);
 
-  const toggleDaySelected = useCallback((dayId: number) => {
-    setSelectedDayIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(dayId)) next.delete(dayId);
-      else next.add(dayId);
-      return next;
-    });
+  const openScheduleModalForDayIds = useCallback((ids: number[]) => {
+    setDaysToScheduleIds(new Set(ids));
+    setShowAddToCalendarModal(true);
   }, []);
 
-  const scheduleSelectedDaysToCalendar = useCallback(async () => {
-    if (selectedDayIds.size === 0 || !workoutName.trim()) return;
-    const orderedDays = days.filter((d) => selectedDayIds.has(d.day_id));
+  const closeAddToCalendarModal = useCallback(() => {
+    setShowAddToCalendarModal(false);
+    setDaysToScheduleIds(new Set());
+  }, []);
+
+  const scheduleDaysToCalendar = useCallback(async () => {
+    if (daysToScheduleIds.size === 0 || !workoutName.trim()) return;
+    const orderedDays = days.filter((d) => daysToScheduleIds.has(d.day_id));
     if (orderedDays.length === 0) return;
     try {
+      // Defensive migration: some older DBs don't have notification_id yet.
+      await db.runAsync('ALTER TABLE Workout_Log ADD COLUMN notification_id TEXT;').catch(() => {});
+      await db.runAsync('ALTER TABLE Workout_Log ADD COLUMN completion_time INTEGER;').catch(() => {});
+      await db.runAsync("ALTER TABLE Workout_Log ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';").catch(() => {});
+      await db.runAsync("ALTER TABLE Workouts ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';").catch(() => {});
+      const wtRows = await db.getAllAsync<{ workout_type: string }>(
+        'SELECT workout_type FROM Workouts WHERE workout_id = ?;',
+        [workout_id],
+      );
+      const workoutType = wtRows[0]?.workout_type === 'cardio' ? 'cardio' : 'strength';
       const baseTimestamp = Math.floor(addToCalendarStartDate.getTime() / 1000);
       for (let i = 0; i < orderedDays.length; i++) {
         const day = orderedDays[i];
         const workoutDate = baseTimestamp + i * 86400;
         const { lastInsertRowId: workoutLogId } = await db.runAsync(
-          'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id) VALUES (?, ?, ?, ?);',
-          [workoutDate, day.day_name, workoutName.trim(), null]
+          'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id, workout_type) VALUES (?, ?, ?, ?, ?);',
+          [workoutDate, day.day_name, workoutName.trim(), null, workoutType]
         );
-        for (const ex of day.exercises) {
-          await db.runAsync(
-            'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
-            [workoutLogId, ex.exercise_name, ex.sets, ex.reps, ex.web_link, ex.muscle_group, ex.exercise_notes, ex.rest_seconds ?? null]
-          );
+        if (workoutType !== 'cardio') {
+          for (const ex of day.exercises) {
+            await db.runAsync(
+              'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+              [workoutLogId, ex.exercise_name, ex.sets, ex.reps, ex.web_link, ex.muscle_group, ex.exercise_notes, ex.rest_seconds ?? null]
+            );
+          }
         }
       }
-      setShowAddToCalendarModal(false);
-      setSelectedDayIds(new Set());
+      closeAddToCalendarModal();
       Alert.alert(t('Success') || 'Success', t('addToCalendarSuccess') || 'Days added to calendar.');
     } catch (e) {
       console.error(e);
       Alert.alert(t('errorTitle'), t('failedToAddToCalendar') || 'Failed to add to calendar.');
     }
-  }, [db, days, workoutName, selectedDayIds, addToCalendarStartDate, t]);
+  }, [db, days, workoutName, daysToScheduleIds, addToCalendarStartDate, t, closeAddToCalendarModal]);
 
   useFocusEffect(
     React.useCallback(() => {
@@ -114,11 +143,15 @@ export default function WorkoutDetails() {
   );
 
   const fetchWorkoutDetails = async () => {
-    const workoutResult = await db.getAllAsync<{ workout_name: string }>(
-      'SELECT workout_name FROM Workouts WHERE workout_id = ?',
+    await db.runAsync("ALTER TABLE Workouts ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';").catch(() => {});
+    const workoutResult = await db.getAllAsync<{ workout_name: string; workout_type?: string | null }>(
+      'SELECT workout_name, workout_type FROM Workouts WHERE workout_id = ?',
       [workout_id]
     );
     setWorkoutName(workoutResult[0]?.workout_name || '');
+    setWorkoutPlanType(
+      (workoutResult[0]?.workout_type || 'strength').toLowerCase() === 'cardio' ? 'cardio' : 'strength',
+    );
     
     const daysResult = await db.getAllAsync<{ day_id: number; day_name: string }>(
       'SELECT day_id, day_name FROM Days WHERE workout_id = ?',
@@ -149,7 +182,14 @@ export default function WorkoutDetails() {
           'SELECT exercise_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order FROM Exercises WHERE day_id = ? ORDER BY COALESCE(sort_order, 999999), exercise_id;',
           [day.day_id]
         );
-        return { ...day, exercises };
+        const sorted = sortWorkoutPlanExercisesForDisplay(exercises);
+        for (let i = 0; i < sorted.length; i++) {
+          await db.runAsync('UPDATE Exercises SET sort_order = ? WHERE exercise_id = ?;', [
+            i,
+            sorted[i].exercise_id,
+          ]);
+        }
+        return { ...day, exercises: sorted };
       })
     );
 
@@ -344,6 +384,68 @@ export default function WorkoutDetails() {
     closeAddDayModal();
   };
 
+  const openEditDayModal = (day: Day) => {
+    setEditingDayId(day.day_id);
+    setEditDayNameInput(day.day_name);
+    setShowEditDayModal(true);
+  };
+
+  const closeEditDayModal = () => {
+    setShowEditDayModal(false);
+    setEditingDayId(null);
+    setEditDayNameInput('');
+  };
+
+  const saveRenamedDay = async () => {
+    if (editingDayId == null) return;
+    const trimmed = editDayNameInput.trim();
+    if (!trimmed) {
+      Alert.alert(t('errorTitle'), t('dayNameValidationError'));
+      return;
+    }
+    try {
+      const before = await db.getAllAsync<{ day_name: string }>('SELECT day_name FROM Days WHERE day_id = ?;', [editingDayId]);
+      const oldName = before[0]?.day_name;
+      if (!oldName || oldName === trimmed) {
+        closeEditDayModal();
+        return;
+      }
+      const currentDate = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+      await db.withTransactionAsync(async () => {
+        await db.runAsync('UPDATE Days SET day_name = ? WHERE day_id = ?;', [trimmed, editingDayId]);
+        await db.runAsync(
+          'UPDATE Workout_Log SET day_name = ? WHERE workout_name = ? AND day_name = ? AND workout_date >= ?;',
+          [trimmed, workoutName.trim(), oldName, currentDate]
+        );
+      });
+      await updateWorkoutLogsForAdditions(workout_id);
+      fetchWorkoutDetails();
+      closeEditDayModal();
+    } catch (error) {
+      console.error('Error renaming day:', error);
+      Alert.alert(t('errorTitle'), 'Could not rename day.');
+    }
+  };
+
+  const showDayRowActions = (day: Day) => {
+    Alert.alert(day.day_name, undefined, [
+      {
+        text: t('addToSchedule') || 'Add to schedule',
+        onPress: () => openScheduleModalForDayIds([day.day_id]),
+      },
+      {
+        text: t('edit'),
+        onPress: () => openEditDayModal(day),
+      },
+      {
+        text: t('Delete'),
+        style: 'destructive',
+        onPress: () => handleDeleteDay(day.day_id, day.day_name, workout_id),
+      },
+      { text: t('alertCancel'), style: 'cancel' },
+    ]);
+  };
+
   const openAddExerciseModal = (day_id: number) => {
     setCurrentDayId(day_id);
     setExerciseName('');
@@ -353,6 +455,9 @@ export default function WorkoutDetails() {
     setExerciseWebLink('');
     setExerciseNotesInput('');
     setNewExerciseMuscleGroup(null);
+    setExerciseCardioDuration('');
+    setExerciseCardioDistance('');
+    setExerciseCardioDistUnit('km');
     setShowExerciseModal(true);
   };
 
@@ -362,8 +467,6 @@ export default function WorkoutDetails() {
   };
 
   const addExercise = async () => {
-    const sets = exerciseSets.trim();
-    const reps = exerciseReps.trim();
     const webLink = exerciseWebLink.trim();
 
     if (!exerciseName.trim()) {
@@ -371,6 +474,77 @@ export default function WorkoutDetails() {
       return;
     }
 
+    if (webLink && !webLink.startsWith('http://') && !webLink.startsWith('https://')) {
+      Alert.alert(
+        t('invalidLinkTitle'),
+        t('invalidLinkMessage')
+      );
+      return;
+    }
+
+    if (currentDayId == null) return;
+
+    const maxOrder = await db.getAllAsync<{ max_sort: number | null }>(
+      'SELECT MAX(sort_order) AS max_sort FROM Exercises WHERE day_id = ?;',
+      [currentDayId]
+    );
+    const nextOrder = (maxOrder[0]?.max_sort ?? -1) + 1;
+
+    if (workoutPlanType === 'cardio') {
+      const durParsed = parseFloat(exerciseCardioDuration.trim().replace(',', '.'));
+      if (!Number.isFinite(durParsed) || durParsed <= 0) {
+        Alert.alert(
+          t('errorTitle'),
+          t('cardioDurationRequired') || 'Enter a duration in minutes greater than zero.',
+        );
+        return;
+      }
+      const durMinutes = Math.max(1 / 60, durParsed);
+      const roundedForDb = Math.max(1, Math.round(durMinutes));
+      const displayName = ensureCardioExerciseName(exerciseName.trim());
+      const distDb = formatCardioDistanceForDb(exerciseCardioDistance, exerciseCardioDistUnit);
+      try {
+        await db.runAsync(
+          `INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, exercise_type, duration_minutes, cardio_distance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+          [
+            currentDayId,
+            displayName,
+            1,
+            roundedForDb,
+            webLink || null,
+            null,
+            exerciseNotesInput.trim(),
+            DEFAULT_REST_SECONDS_BETWEEN_SETS,
+            nextOrder,
+            'cardio',
+            roundedForDb,
+            distDb,
+          ],
+        );
+      } catch {
+        await db.runAsync(
+          'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);',
+          [
+            currentDayId,
+            displayName,
+            1,
+            roundedForDb,
+            webLink || null,
+            null,
+            exerciseNotesInput.trim(),
+            DEFAULT_REST_SECONDS_BETWEEN_SETS,
+            nextOrder,
+          ],
+        );
+      }
+      await updateWorkoutLogsForAdditions(workout_id);
+      fetchWorkoutDetails();
+      closeAddExerciseModal();
+      return;
+    }
+
+    const sets = exerciseSets.trim();
+    const reps = exerciseReps.trim();
     if (!sets || parseInt(sets, 10) <= 0) {
       Alert.alert(t('errorTitle'), t('setsValidationError'));
       return;
@@ -380,30 +554,25 @@ export default function WorkoutDetails() {
       Alert.alert(t('errorTitle'), t('repsValidationError'));
       return;
     }
-    
-    if (webLink && !webLink.startsWith('http://') && !webLink.startsWith('https://')) {
-      Alert.alert(
-        t('invalidLinkTitle'),
-        t('invalidLinkMessage')
-      );
-      return;
-    }
 
     const restSec = exerciseRestSeconds.trim() ? parseInt(exerciseRestSeconds.trim(), 10) : null;
-    if (currentDayId) {
-      const maxOrder = await db.getAllAsync<{ max_sort: number | null }>(
-        'SELECT MAX(sort_order) AS max_sort FROM Exercises WHERE day_id = ?;',
-        [currentDayId]
-      );
-      const nextOrder = (maxOrder[0]?.max_sort ?? -1) + 1;
-      await db.runAsync(
-        'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);',
-        [currentDayId, exerciseName.trim(), parseInt(sets, 10), parseInt(reps, 10), webLink || null, newExerciseMuscleGroup || null, exerciseNotesInput.trim(), restSec, nextOrder]
-      );
-      await updateWorkoutLogsForAdditions(workout_id);
-      fetchWorkoutDetails();
-      closeAddExerciseModal();
-    }
+    await db.runAsync(
+      'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);',
+      [
+        currentDayId,
+        exerciseName.trim(),
+        parseInt(sets, 10),
+        parseInt(reps, 10),
+        webLink || null,
+        newExerciseMuscleGroup || null,
+        exerciseNotesInput.trim(),
+        restSec,
+        nextOrder,
+      ],
+    );
+    await updateWorkoutLogsForAdditions(workout_id);
+    fetchWorkoutDetails();
+    closeAddExerciseModal();
   };
   
   // Function to animate the reordering state change
@@ -737,40 +906,22 @@ export default function WorkoutDetails() {
         <Ionicons name="arrow-back" size={24} color={theme.text} />
       </TouchableOpacity>
 
-      {/* Icon on the right */}
-      <TouchableOpacity
-        style={styles.editIcon}
-        onPress={() => navigation.navigate('EditWorkout', { workout_id: workout_id })}
-      >
-        <Ionicons name="pencil-outline" size={24} color={theme.text} />
-      </TouchableOpacity>
-
       <View style={styles.titleContainer}>
-        {/* This View will stretch and center the text */}
-        <View style={{ flex: 1, alignItems: 'center' }}>
-          <Text style={[styles.title, { color: theme.text }]}>{workoutName}</Text>
+        <View style={styles.titleRow}>
+          <Text style={[styles.title, { color: theme.text }]} numberOfLines={2}>
+            {workoutName}
+          </Text>
+          <TouchableOpacity
+            style={styles.titleShareButton}
+            onPress={() => handleExportWorkout(workout_id)}
+            hitSlop={{ top: 12, bottom: 12, left: 8, right: 12 }}
+            accessibilityRole="button"
+            accessibilityLabel={t('share') || 'Share'}
+          >
+            <Ionicons name="share-outline" size={26} color={theme.text} />
+          </TouchableOpacity>
         </View>
       </View>
-
-      <TouchableOpacity
-        style={styles.exportButton}
-        onPress={() => handleExportWorkout(workout_id)}
-      >
-        <Ionicons name="share-outline" size={28} color={theme.text} />
-      </TouchableOpacity>
-
-      {selectedDayIds.size > 0 && (
-        <TouchableOpacity
-          style={[styles.addToCalendarBar, { backgroundColor: theme.buttonBackground }]}
-          onPress={() => setShowAddToCalendarModal(true)}
-          activeOpacity={0.8}
-        >
-          <Ionicons name="calendar-outline" size={22} color={theme.buttonText ?? '#fff'} />
-          <Text style={[styles.addToCalendarBarText, { color: theme.buttonText ?? '#fff' }]}>
-            {t('addToCalendar') || 'Add to calendar'} ({selectedDayIds.size})
-          </Text>
-        </TouchableOpacity>
-      )}
 
       <FlatList
         data={days}
@@ -779,7 +930,34 @@ export default function WorkoutDetails() {
         keyExtractor={(item) => item.day_id.toString()}
         renderItem={({ item: day, index }) => {
           const isExpanded = !collapsedDayIds.has(day.day_id);
-          const isSelected = selectedDayIds.has(day.day_id);
+          let daySwipeRef: Swipeable | null = null;
+
+          const renderDayLeftActions = () => (
+            <RectButton
+              style={[styles.swipeAction, styles.swipeActionEdit]}
+              onPress={() => {
+                daySwipeRef?.close();
+                requestAnimationFrame(() => openEditDayModal(day));
+              }}
+            >
+              <Ionicons name="create-outline" size={22} color="#fff" />
+              <Text style={styles.swipeActionText}>{t('edit')}</Text>
+            </RectButton>
+          );
+
+          const renderDayRightActions = () => (
+            <RectButton
+              style={[styles.swipeAction, styles.swipeActionDelete]}
+              onPress={() => {
+                daySwipeRef?.close();
+                requestAnimationFrame(() => handleDeleteDay(day.day_id, day.day_name, workout_id));
+              }}
+            >
+              <Ionicons name="trash-outline" size={22} color="#fff" />
+              <Text style={styles.swipeActionText}>{t('Delete')}</Text>
+            </RectButton>
+          );
+
           return (
           <Animated.View
             style={[
@@ -787,28 +965,37 @@ export default function WorkoutDetails() {
               {
                 opacity: fadeAnim,
                 transform: [{ scale: scaleAnim }],
-                backgroundColor: theme.card,
-                borderWidth: 1,
-                borderColor: theme.border,
-                borderRadius: 20,
               }
             ]}
           >
-            <View style={[styles.dayContainer, { padding: 0 }]}>
-              {/* Day Header: checkbox, title, chevron, reorder, add */}
-              <TouchableOpacity
-                onLongPress={() => handleDeleteDay(day.day_id, day.day_name, workout_id)}
+            <Swipeable
+              ref={(r) => {
+                daySwipeRef = r;
+              }}
+              friction={2}
+              overshootLeft={false}
+              overshootRight={false}
+              renderLeftActions={renderDayLeftActions}
+              renderRightActions={renderDayRightActions}
+            >
+            <View
+              style={[
+                styles.dayContainer,
+                {
+                  padding: 0,
+                  backgroundColor: theme.card,
+                  borderWidth: 1,
+                  borderColor: theme.border,
+                  borderRadius: 20,
+                  overflow: 'hidden',
+                },
+              ]}
+            >
+              <Pressable
+                onLongPress={() => showDayRowActions(day)}
                 onPress={() => toggleDayExpanded(day.day_id)}
-                activeOpacity={0.8}
-                style={[styles.dayHeaderRow, { padding: 20 }]}
+                style={({ pressed }) => [styles.dayHeaderRow, { padding: 20, opacity: pressed ? 0.85 : 1 }]}
               >
-                <TouchableOpacity
-                  onPress={(e) => { e.stopPropagation(); toggleDaySelected(day.day_id); }}
-                  style={[styles.dayCheckbox, { borderColor: theme.text, backgroundColor: isSelected ? (theme.buttonBackground || '#7C9A7E') : 'transparent' }]}
-                  hitSlop={8}
-                >
-                  {isSelected && <Ionicons name="checkmark" size={18} color={theme.buttonText ?? '#fff'} />}
-                </TouchableOpacity>
                 <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
                   <AutoSizeText
                     fontSize={18}
@@ -826,7 +1013,6 @@ export default function WorkoutDetails() {
                   />
                 </View>
                 <View style={styles.dayHeaderRightControls}>
-                  {/* Day reordering arrows */}
                   <View style={styles.reorderButtonsContainer}>
                     {index > 0 && (
                       <TouchableOpacity
@@ -847,42 +1033,73 @@ export default function WorkoutDetails() {
                       </TouchableOpacity>
                     )}
                   </View>
-                  
-                  {/* Add Exercise Button */}
-                  <TouchableOpacity 
+
+                  <TouchableOpacity
                     onPress={() => openAddExerciseModal(day.day_id)}
                     disabled={isReordering}
                   >
-                    <Ionicons 
-                      name="add" 
-                      size={28} 
-                      color={isReordering ? theme.border : theme.text} 
+                    <Ionicons
+                      name="add"
+                      size={28}
+                      color={isReordering ? theme.border : theme.text}
                     />
                   </TouchableOpacity>
                 </View>
-              </TouchableOpacity>
+              </Pressable>
 
-              {/* Exercises (collapsible) */}
               {isExpanded && (
               <View style={{ paddingHorizontal: 20, paddingBottom: 20 }}>
               {day.exercises.length > 0 ? (
                 day.exercises.map((exercise, index) => {
                   const muscleGroupInfo = muscleGroupData.find(mg => mg.value === exercise.muscle_group);
-                  return (
+                  const warmupCooldownLocked = isWarmupOrCooldownExerciseName(
+                    exercise.exercise_name,
+                  );
+                  let exerciseSwipeRef: Swipeable | null = null;
+
+                  const renderExerciseDeleteActions = () => (
+                    <RectButton
+                      style={[styles.swipeAction, styles.swipeActionDelete]}
+                      onPress={() => {
+                        exerciseSwipeRef?.close();
+                        requestAnimationFrame(() =>
+                          handleDeleteExercise(day.day_id, exercise.exercise_name, workout_id),
+                        );
+                      }}
+                    >
+                      <Ionicons name="trash-outline" size={20} color="#fff" />
+                      <Text style={styles.swipeActionText}>{t('Delete')}</Text>
+                    </RectButton>
+                  );
+
+                  const exerciseRow = (
                     <View
-                      key={exercise.exercise_id}
                       style={[
-                        styles.exerciseContainer, 
-                        { 
-                          backgroundColor: theme.card, 
-                          borderColor: theme.border 
-                        }
+                        styles.exerciseContainer,
+                        {
+                          backgroundColor: theme.card,
+                          borderColor: theme.border,
+                        },
                       ]}
                     >
                       <TouchableOpacity
                         style={{ flex: 1, flexDirection: 'row', alignItems: 'center', marginRight: 8 }}
                         onPress={() => openWebLinkModal(exercise)}
-                        onLongPress={() => handleDeleteExercise(day.day_id, exercise.exercise_name, workout_id)}
+                        onLongPress={
+                          warmupCooldownLocked
+                            ? () =>
+                                Alert.alert(
+                                  t('warmupCooldownExerciseProtectedTitle'),
+                                  t('warmupCooldownExerciseProtected'),
+                                  [{ text: t('OK') }],
+                                )
+                            : () =>
+                                handleDeleteExercise(
+                                  day.day_id,
+                                  exercise.exercise_name,
+                                  workout_id,
+                                )
+                        }
                         activeOpacity={0.6}
                         delayLongPress={500}
                       >
@@ -935,7 +1152,28 @@ export default function WorkoutDetails() {
                         </View>
                       </View>
                     </View>
-                  )
+                  );
+
+                  if (warmupCooldownLocked) {
+                    return (
+                      <View key={exercise.exercise_id}>{exerciseRow}</View>
+                    );
+                  }
+
+                  return (
+                    <Swipeable
+                      key={exercise.exercise_id}
+                      ref={(r) => {
+                        exerciseSwipeRef = r;
+                      }}
+                      friction={2}
+                      overshootLeft={false}
+                      overshootRight={false}
+                      renderRightActions={renderExerciseDeleteActions}
+                    >
+                      {exerciseRow}
+                    </Swipeable>
+                  );
                 })
               ) : (
                 <Text style={[styles.noExercisesText, { color: theme.text }]}>{t('noExercises')} </Text>
@@ -943,6 +1181,7 @@ export default function WorkoutDetails() {
               </View>
               )}
             </View>
+            </Swipeable>
           </Animated.View>
         );
         }}
@@ -996,6 +1235,35 @@ export default function WorkoutDetails() {
         </TouchableWithoutFeedback>
       </Modal>
 
+      <Modal visible={showEditDayModal} animationType="fade" transparent onRequestClose={closeEditDayModal}>
+        {showEditDayModal && (
+          <StatusBar
+            backgroundColor={theme.type === 'light' ? 'rgba(0, 0, 0, 0.5)' : 'black'}
+            barStyle="light-content"
+          />
+        )}
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <View style={[styles.modalContainer, { backgroundColor: 'rgba(0, 0, 0, 0.5)' }]}>
+            <View style={[styles.dayModalContent, { backgroundColor: theme.card }]}>
+              <Text style={[styles.dayModalTitle, { color: theme.text }]}>{t('editDayTitle') || 'Edit day'}</Text>
+              <TextInput
+                style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
+                placeholder={t('dayNamePlaceholder')}
+                placeholderTextColor={theme.text}
+                value={editDayNameInput}
+                onChangeText={setEditDayNameInput}
+              />
+              <TouchableOpacity style={[styles.saveButton, { backgroundColor: theme.buttonBackground }]} onPress={saveRenamedDay}>
+                <Text style={[styles.saveButtonText, { color: theme.buttonText }]}>{t('Save')}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.cancelButton, { backgroundColor: theme.card }]} onPress={closeEditDayModal}>
+                <Text style={[styles.cancelButtonText, { color: theme.text }]}>{t('Cancel')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
       <Modal visible={showExerciseModal} animationType="fade" transparent onRequestClose={closeAddExerciseModal}>
         {showExerciseModal && (
           <StatusBar
@@ -1015,76 +1283,153 @@ export default function WorkoutDetails() {
                   autoCapitalize="words"
                   onChangeText={setExerciseName}
                 />
-                <TextInput
-                  style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
-                  placeholder={t('setsPlaceholder') + ' (> 0)'}
-                  placeholderTextColor={theme.text}
-                  keyboardType="numeric"
-                  value={exerciseSets}
-                  onChangeText={setExerciseSets}
-                />
-                <TextInput
-                  style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
-                  placeholder={t('repsPlaceholder') + ' (> 0)'}
-                  placeholderTextColor={theme.text}
-                  keyboardType="numeric"
-                  value={exerciseReps}
-                  onChangeText={setExerciseReps}
-                />
-                <TextInput
-                  style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
-                  placeholder={t('restSecondsPlaceholder') || 'Rest (s)'}
-                  placeholderTextColor={theme.text}
-                  keyboardType="numeric"
-                  value={exerciseRestSeconds}
-                  onChangeText={setExerciseRestSeconds}
-                />
-                <Text style={[styles.inputLabel, { color: theme.text, marginTop: 10 }]}>{t('webLink')}</Text>
-                <TextInput
-                  style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
-                  placeholder={t('webLinkPlaceholder')}
-                  placeholderTextColor={theme.text}
-                  value={exerciseWebLink}
-                  onChangeText={setExerciseWebLink}
-                  autoCapitalize="none"
-                  keyboardType="url"
-                />
-                <Text style={[styles.inputLabel, { color: theme.text, marginTop: 10 }]}>{t('muscleGroup')}</Text>
-                <FlatList
-                  data={muscleGroupData}
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  keyExtractor={(item) => item.label}
-                  renderItem={({ item }) => {
-                    const isSelected = newExerciseMuscleGroup === item.value;
-                    
-                    return (
+                {workoutPlanType === 'cardio' ? (
+                  <>
+                    <Text style={[styles.inputLabel, { color: theme.text, alignSelf: 'flex-start', width: '100%' }]}>
+                      {t('durationMinutes') || 'Duration (minutes)'}
+                    </Text>
+                    <TextInput
+                      style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
+                      placeholder={t('durationMinutes') || 'Duration (minutes)'}
+                      placeholderTextColor={theme.text}
+                      keyboardType="decimal-pad"
+                      value={exerciseCardioDuration}
+                      onChangeText={(text) => setExerciseCardioDuration(text.replace(/[^0-9.,]/g, ''))}
+                    />
+                    <Text style={[styles.inputLabel, { color: theme.text, alignSelf: 'flex-start', width: '100%', marginTop: 10 }]}>
+                      {t('distanceOptional') || 'Distance (optional)'}
+                    </Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap', width: '100%', marginBottom: 8 }}>
+                      <TextInput
+                        style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border, flex: 1, minWidth: 100, marginBottom: 0 }]}
+                        placeholder="e.g. 5"
+                        placeholderTextColor={theme.text}
+                        keyboardType="decimal-pad"
+                        value={exerciseCardioDistance}
+                        onChangeText={(text) => setExerciseCardioDistance(text.replace(/[^0-9.,]/g, ''))}
+                      />
                       <TouchableOpacity
-                        style={[
-                          styles.muscleGroupButton,
-                          { 
-                            backgroundColor: isSelected ? theme.buttonBackground : theme.card,
-                            borderColor: theme.border,
-                          }
-                        ]}
-                        onPress={() => setNewExerciseMuscleGroup(item.value)}
+                        onPress={() => setExerciseCardioDistUnit('km')}
+                        style={{
+                          paddingVertical: 10,
+                          paddingHorizontal: 14,
+                          borderRadius: 10,
+                          borderWidth: 1,
+                          borderColor: theme.border,
+                          backgroundColor: exerciseCardioDistUnit === 'km' ? (theme.buttonBackground || '#7C9A7E') : theme.card,
+                        }}
                       >
-                        <Text style={{ color: isSelected ? theme.buttonText : theme.text }}>{t(item.label)}</Text>
+                        <Text style={{ fontWeight: '600', color: exerciseCardioDistUnit === 'km' ? (theme.buttonText ?? '#fff') : theme.text }}>km</Text>
                       </TouchableOpacity>
-                    );
-                  }}
-                  style={{ marginBottom: 15 }}
-                />
-                <Text style={[styles.inputLabel, { color: theme.text, marginTop: 10 }]}>{t('exerciseNotes')}</Text>
-                <TextInput
-                    style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border, height: 100, textAlignVertical: 'top' }]}
-                    placeholder={t('exerciseNotesPlaceholder')}
-                    placeholderTextColor={theme.text}
-                    value={exerciseNotesInput}
-                    onChangeText={setExerciseNotesInput}
-                    multiline={true}
-                    numberOfLines={4}
-                />
+                      <TouchableOpacity
+                        onPress={() => setExerciseCardioDistUnit('mi')}
+                        style={{
+                          paddingVertical: 10,
+                          paddingHorizontal: 14,
+                          borderRadius: 10,
+                          borderWidth: 1,
+                          borderColor: theme.border,
+                          backgroundColor: exerciseCardioDistUnit === 'mi' ? (theme.buttonBackground || '#7C9A7E') : theme.card,
+                        }}
+                      >
+                        <Text style={{ fontWeight: '600', color: exerciseCardioDistUnit === 'mi' ? (theme.buttonText ?? '#fff') : theme.text }}>mi</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <Text style={[styles.inputLabel, { color: theme.text, marginTop: 10 }]}>{t('webLink')}</Text>
+                    <TextInput
+                      style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
+                      placeholder={t('webLinkPlaceholder')}
+                      placeholderTextColor={theme.text}
+                      value={exerciseWebLink}
+                      onChangeText={setExerciseWebLink}
+                      autoCapitalize="none"
+                      keyboardType="url"
+                    />
+                    <Text style={[styles.inputLabel, { color: theme.text, marginTop: 10 }]}>{t('exerciseNotes')}</Text>
+                    <TextInput
+                      style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border, height: 100, textAlignVertical: 'top' }]}
+                      placeholder={t('exerciseNotesPlaceholder')}
+                      placeholderTextColor={theme.text}
+                      value={exerciseNotesInput}
+                      onChangeText={setExerciseNotesInput}
+                      multiline
+                      numberOfLines={4}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <TextInput
+                      style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
+                      placeholder={t('setsPlaceholder') + ' (> 0)'}
+                      placeholderTextColor={theme.text}
+                      keyboardType="numeric"
+                      value={exerciseSets}
+                      onChangeText={setExerciseSets}
+                    />
+                    <TextInput
+                      style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
+                      placeholder={t('repsPlaceholder') + ' (> 0)'}
+                      placeholderTextColor={theme.text}
+                      keyboardType="numeric"
+                      value={exerciseReps}
+                      onChangeText={setExerciseReps}
+                    />
+                    <TextInput
+                      style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
+                      placeholder={t('restSecondsPlaceholder') || 'Rest (s)'}
+                      placeholderTextColor={theme.text}
+                      keyboardType="numeric"
+                      value={exerciseRestSeconds}
+                      onChangeText={setExerciseRestSeconds}
+                    />
+                    <Text style={[styles.inputLabel, { color: theme.text, marginTop: 10 }]}>{t('webLink')}</Text>
+                    <TextInput
+                      style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border }]}
+                      placeholder={t('webLinkPlaceholder')}
+                      placeholderTextColor={theme.text}
+                      value={exerciseWebLink}
+                      onChangeText={setExerciseWebLink}
+                      autoCapitalize="none"
+                      keyboardType="url"
+                    />
+                    <Text style={[styles.inputLabel, { color: theme.text, marginTop: 10 }]}>{t('muscleGroup')}</Text>
+                    <FlatList
+                      data={muscleGroupData}
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      keyExtractor={(item) => item.label}
+                      renderItem={({ item }) => {
+                        const isSelected = newExerciseMuscleGroup === item.value;
+
+                        return (
+                          <TouchableOpacity
+                            style={[
+                              styles.muscleGroupButton,
+                              {
+                                backgroundColor: isSelected ? theme.buttonBackground : theme.card,
+                                borderColor: theme.border,
+                              },
+                            ]}
+                            onPress={() => setNewExerciseMuscleGroup(item.value)}
+                          >
+                            <Text style={{ color: isSelected ? theme.buttonText : theme.text }}>{t(item.label)}</Text>
+                          </TouchableOpacity>
+                        );
+                      }}
+                      style={{ marginBottom: 15 }}
+                    />
+                    <Text style={[styles.inputLabel, { color: theme.text, marginTop: 10 }]}>{t('exerciseNotes')}</Text>
+                    <TextInput
+                      style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: theme.border, height: 100, textAlignVertical: 'top' }]}
+                      placeholder={t('exerciseNotesPlaceholder')}
+                      placeholderTextColor={theme.text}
+                      value={exerciseNotesInput}
+                      onChangeText={setExerciseNotesInput}
+                      multiline
+                      numberOfLines={4}
+                    />
+                  </>
+                )}
                 <TouchableOpacity style={[styles.saveButton, { backgroundColor: theme.buttonBackground }]} onPress={addExercise}>
                   <Text style={[styles.saveButtonText, { color: theme.buttonText }]}>{t('Save')}</Text>
                 </TouchableOpacity>
@@ -1206,9 +1551,9 @@ export default function WorkoutDetails() {
       </Modal>
 
       {/* Add to Calendar modal */}
-      <Modal visible={showAddToCalendarModal} animationType="fade" transparent>
+      <Modal visible={showAddToCalendarModal} animationType="fade" transparent onRequestClose={closeAddToCalendarModal}>
         <View style={[styles.modalContainer, { backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' }]}>
-          <TouchableOpacity activeOpacity={1} style={StyleSheet.absoluteFill} onPress={() => setShowAddToCalendarModal(false)} />
+          <TouchableOpacity activeOpacity={1} style={StyleSheet.absoluteFill} onPress={closeAddToCalendarModal} />
           <View style={[styles.modalContent, { backgroundColor: theme.card, padding: 24, minWidth: 280 }]}>
                 <Text style={[styles.modalTitle, { color: theme.text }]}>{t('addToCalendar') || 'Add to Calendar'}</Text>
                 <Text style={[styles.inputLabel, { color: theme.text, marginBottom: 8 }]}>{t('startDate') || 'Start date'}</Text>
@@ -1253,10 +1598,10 @@ export default function WorkoutDetails() {
                   {t('addToCalendarTip') || 'Selected days will be scheduled starting from this date (Day 1, Day 2, …).'}
                 </Text>
                 <View style={[styles.addToCalendarButtonRow, { marginTop: 20 }]}>
-                  <TouchableOpacity style={[styles.cancelButton, styles.addToCalendarButton]} onPress={() => setShowAddToCalendarModal(false)}>
+                  <TouchableOpacity style={[styles.cancelButton, styles.addToCalendarButton]} onPress={closeAddToCalendarModal}>
                     <Text style={[styles.cancelButtonText, { color: theme.text }]}>{t('Cancel')}</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={[styles.saveButton, styles.addToCalendarButton, { backgroundColor: theme.buttonBackground }]} onPress={scheduleSelectedDaysToCalendar}>
+                  <TouchableOpacity style={[styles.saveButton, styles.addToCalendarButton, { backgroundColor: theme.buttonBackground }]} onPress={scheduleDaysToCalendar}>
                     <Text style={[styles.saveButtonText, { color: theme.buttonText }]}>{t('Schedule') || 'Schedule'}</Text>
                   </TouchableOpacity>
                 </View>
@@ -1288,23 +1633,28 @@ const styles = StyleSheet.create({
       padding: 8,
     },
     titleContainer: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginBottom: 15,
+      paddingHorizontal: 44,
+    },
+    titleRow: {
       flexDirection: 'row',
       alignItems: 'center',
+      justifyContent: 'center',
+      maxWidth: '100%',
     },
-    
-    editIcon: {
-      position: 'absolute',
-      top: 20,
-      right: 10,
-      zIndex: 10,
-      padding: 8,
-      marginTop:3,
+    titleShareButton: {
+      padding: 6,
+      marginLeft: 6,
+      justifyContent: 'center',
+      alignItems: 'center',
     },
     title: {
       fontSize: 26,
       fontWeight: '900',
       textAlign: 'center',
-      marginBottom: 10,
+      flexShrink: 1,
     },
     dayContainer: {
       padding: 20,
@@ -1315,29 +1665,27 @@ const styles = StyleSheet.create({
       justifyContent: 'space-between',
       flex: 1,
     },
-    dayCheckbox: {
-      width: 24,
-      height: 24,
-      borderRadius: 6,
-      borderWidth: 2,
-      marginRight: 12,
+    swipeAction: {
       justifyContent: 'center',
       alignItems: 'center',
+      width: 88,
+      flexDirection: 'column',
+      gap: 4,
     },
-    addToCalendarBar: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      paddingVertical: 12,
-      paddingHorizontal: 16,
-      marginHorizontal: 20,
-      marginBottom: 12,
-      borderRadius: 12,
-      gap: 8,
+    swipeActionEdit: {
+      backgroundColor: '#7C9A7E',
+      borderTopRightRadius: 10,
+      borderBottomRightRadius: 10,
     },
-    addToCalendarBarText: {
+    swipeActionDelete: {
+      backgroundColor: '#c62828',
+      borderTopLeftRadius: 10,
+      borderBottomLeftRadius: 10,
+    },
+    swipeActionText: {
+      color: '#fff',
+      fontWeight: '700',
       fontSize: 13,
-      fontWeight: '600',
     },
     dayHeader: {
       flexDirection: 'row',
@@ -1524,10 +1872,6 @@ const styles = StyleSheet.create({
       marginTop: 20,
       marginBottom: 20,
       paddingHorizontal: 10,
-    },
-    exportButton: {
-      alignItems: 'center',
-      marginBottom: 15,
     },
     muscleGroupButton: {
       paddingVertical: 8,

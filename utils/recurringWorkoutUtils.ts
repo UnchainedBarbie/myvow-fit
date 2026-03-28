@@ -313,17 +313,34 @@ const scheduleWorkout = async (
 ) => {
   try {
     let notificationId = null;
-    
-    // First, insert the workout into the log
+
+    await db
+      .runAsync("ALTER TABLE Workout_Log ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';")
+      .catch(() => {});
+    await db
+      .runAsync("ALTER TABLE Workouts ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';")
+      .catch(() => {});
+
+    const wtRows = await db.getAllAsync<{ workout_type: string | null }>(
+      'SELECT workout_type FROM Workouts WHERE workout_id = ?;',
+      [workout.workout_id],
+    );
+    const workoutType =
+      (wtRows[0]?.workout_type || 'strength').toLowerCase() === 'cardio'
+        ? 'cardio'
+        : 'strength';
+
+    // First, insert the workout into the log (workout_type from Workouts so cardio sessions match LogWorkout / WorkoutDetails)
     const { lastInsertRowId: workoutLogId } = await db.runAsync(
-      'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id, recurring_workout_id) VALUES (?, ?, ?, ?, ?);',
+      'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id, recurring_workout_id, workout_type) VALUES (?, ?, ?, ?, ?, ?);',
       [
         scheduledDate,
         workout.day_name,
         workout.workout_name,
         null,
         workout.recurring_workout_id,
-      ]
+        workoutType,
+      ],
     );
     
     console.log(`Successfully inserted workout into log with ID: ${workoutLogId}`);
@@ -375,18 +392,32 @@ const scheduleWorkout = async (
       [dayId]
     ) as Exercise[];
     
-    console.log(`Adding ${exercises.length} exercises to the logged workout`);
-    
-    // Insert exercises into the Logged_Exercises table
-    const insertExercisePromises = exercises.map((exercise: Exercise) =>
-      db.runAsync(
-        'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
-        [workoutLogId, exercise.exercise_name, exercise.sets, exercise.reps, exercise.web_link, exercise.muscle_group, exercise.exercise_notes, exercise.rest_seconds ?? null]
-      )
-    );
-    
-    await Promise.all(insertExercisePromises);
-    console.log(`Workout successfully scheduled with ${exercises.length} exercises`);
+    if (workoutType === 'cardio') {
+      console.log(
+        `Cardio workout scheduled (workout_type=cardio); Logged_Exercises filled when workout opens.`,
+      );
+    } else {
+      console.log(`Adding ${exercises.length} exercises to the logged workout`);
+
+      const insertExercisePromises = exercises.map((exercise: Exercise) =>
+        db.runAsync(
+          'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+          [
+            workoutLogId,
+            exercise.exercise_name,
+            exercise.sets,
+            exercise.reps,
+            exercise.web_link,
+            exercise.muscle_group,
+            exercise.exercise_notes,
+            exercise.rest_seconds ?? null,
+          ],
+        ),
+      );
+
+      await Promise.all(insertExercisePromises);
+      console.log(`Workout successfully scheduled with ${exercises.length} exercises`);
+    }
     return true;
   } catch (error) {
     console.error('Error scheduling workout:', error);

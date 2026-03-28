@@ -23,7 +23,10 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import NutritionToday from './NutritionToday';
 import MealPlanList from './MealPlanList';
+import { useDrawerMenu } from '../context/DrawerMenuContext';
 import { initMealPlansDb } from '../utils/initMealPlansDb';
+import { foodItemServingToTrackerFields } from '../utils/foodItemServingToTrackerRow';
+import { getRelevantUnits, pickDefaultUnitForFood, isPieceServingUnit } from '../utils/getRelevantUnits';
 
 type MacroTotals = {
   calories: number;
@@ -75,6 +78,22 @@ type LoggedFoodEntry = {
   carbs: number;
   fat: number;
 };
+
+function sumMealNutritionEntries(foodsInMeal: LoggedFoodEntry[]): MacroTotals {
+  return foodsInMeal.reduce(
+    (acc, f) => ({
+      calories: acc.calories + (Number(f.calories) || 0),
+      protein: acc.protein + (Number(f.protein) || 0),
+      carbs: acc.carbs + (Number(f.carbs) || 0),
+      fat: acc.fat + (Number(f.fat) || 0),
+    }),
+    { calories: 0, protein: 0, carbs: 0, fat: 0 },
+  );
+}
+
+function formatMealNutritionLine(t: MacroTotals): string {
+  return `${Math.round(t.calories)} cal · ${Math.round(t.protein)}g P · ${Math.round(t.carbs)}g C · ${Math.round(t.fat)}g F`;
+}
 
 const buildFavoriteSignature = (
   name: string,
@@ -134,6 +153,7 @@ export default function Nutrition() {
   const db = useSQLiteContext();
   const { t } = useTranslation();
   const route = useRoute();
+  const drawerMenu = useDrawerMenu();
 
   const [activeTab, setActiveTab] = useState<'today' | 'plans'>('today');
   const routeParams = (route.params || {}) as { activeTab?: 'today' | 'plans'; reload?: number };
@@ -292,9 +312,10 @@ export default function Nutrition() {
     nutriments: any;
   } | null>(null);
   const [quantity, setQuantity] = useState(1);
-  const [quantityUnit, setQuantityUnit] = useState<
-    'g' | 'oz' | 'serving' | 'cup' | 'tbsp' | 'tsp' | 'ml' | 'lb'
-  >('serving');
+  const [quantityUnit, setQuantityUnit] = useState<string>('serving');
+  const [quantityRelevantUnits, setQuantityRelevantUnits] = useState<string[]>(() =>
+    getRelevantUnits('', null),
+  );
   const [quantityMealType, setQuantityMealType] =
     useState<string>('breakfast');
 
@@ -323,6 +344,9 @@ export default function Nutrition() {
   const [prepChecklistChecked, setPrepChecklistChecked] = useState<
     Set<number>
   >(new Set());
+  /** DayActivePlan rows for this plan with date strictly after today (tomorrow+). */
+  const [selectedPlanHasFutureActive, setSelectedPlanHasFutureActive] =
+    useState(false);
 
   const [loggedFoodsForDate, setLoggedFoodsForDate] = useState<
     LoggedFoodEntry[]
@@ -334,6 +358,39 @@ export default function Nutrition() {
       carbs: 0,
       fat: 0,
     });
+
+  const refreshPlanFutureActiveForId = useCallback(
+    async (mealPlanId: number | null) => {
+      if (mealPlanId == null) {
+        setSelectedPlanHasFutureActive(false);
+        return;
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      try {
+        await initMealPlansDb(db);
+        const row = await db.getFirstAsync<{ x: number }>(
+          'SELECT 1 AS x FROM DayActivePlan WHERE meal_plan_id = ? AND date > ? LIMIT 1',
+          [mealPlanId, today],
+        );
+        setSelectedPlanHasFutureActive(!!row);
+      } catch {
+        setSelectedPlanHasFutureActive(false);
+      }
+    },
+    [db],
+  );
+
+  useEffect(() => {
+    void refreshPlanFutureActiveForId(selectedPlan?.meal_plan_id ?? null);
+  }, [selectedPlan?.meal_plan_id, refreshPlanFutureActiveForId]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (selectedPlan?.meal_plan_id != null) {
+        void refreshPlanFutureActiveForId(selectedPlan.meal_plan_id);
+      }
+    }, [selectedPlan?.meal_plan_id, refreshPlanFutureActiveForId]),
+  );
 
   const loadLoggedFoodsForDate = async (date: Date) => {
     const dateStr = date.toISOString().slice(0, 10);
@@ -706,6 +763,8 @@ export default function Nutrition() {
         setGroceryPlanId(planToUse.meal_plan_id);
         setGroceryItems([]);
       }
+
+      await refreshPlanFutureActiveForId(planToUse.meal_plan_id);
     } catch (e) {
       console.error('Error loading meal plan details:', e);
     }
@@ -737,6 +796,7 @@ export default function Nutrition() {
               for (const meal of selectedPlanMeals) {
                 const mealType = meal.meal_type || 'breakfast';
                 for (const food of meal.foods) {
+                  const { quantity, unitToken } = foodItemServingToTrackerFields(food.serving_size);
                   await db.runAsync(
                     `INSERT INTO LoggedFoods
                     (log_id, food_name, brand, meal_type, serving_size, quantity, calories, protein, carbs, fat)
@@ -746,8 +806,8 @@ export default function Nutrition() {
                       food.food_name,
                       food.brand ?? null,
                       mealType,
-                      food.serving_size ?? null,
-                      1,
+                      unitToken,
+                      quantity,
                       food.calories ?? 0,
                       food.protein ?? 0,
                       food.carbs ?? 0,
@@ -764,12 +824,43 @@ export default function Nutrition() {
               );
 
               await loadLoggedFoodsForDate(new Date());
+              await refreshPlanFutureActiveForId(selectedPlan.meal_plan_id);
+              await loadWeeklyAggregates();
               setActiveTab('today');
               setSelectedDate(new Date());
               Alert.alert('', 'Meal plan loaded for today');
             } catch (e) {
               console.error('Error setting plan active:', e);
               Alert.alert('Error', 'Failed to load meal plan for today.');
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const handleSetAsInactive = () => {
+    if (!selectedPlan) return;
+    Alert.alert(
+      'Set as Inactive',
+      'This will remove the meal plan from tomorrow onwards. Foods you have already logged will not be affected. Continue?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          onPress: async () => {
+            try {
+              const today = new Date().toISOString().slice(0, 10);
+              await initMealPlansDb(db);
+              await db.runAsync('DELETE FROM DayActivePlan WHERE meal_plan_id = ? AND date > ?', [
+                selectedPlan.meal_plan_id,
+                today,
+              ]);
+              setSelectedPlanHasFutureActive(false);
+              await loadWeeklyAggregates();
+            } catch (e) {
+              console.error('Error setting plan inactive:', e);
+              Alert.alert('Error', 'Failed to update active plan.');
             }
           },
         },
@@ -885,7 +976,7 @@ export default function Nutrition() {
     const fatPer100g = nutriments.fatPer100g ?? 0;
 
     const perServingOr100g = (perServing: number, per100g: number) => {
-      if (unit === 'serving') {
+      if (unit === 'serving' || isPieceServingUnit(unit)) {
         return (perServing || per100g) * quantity;
       }
       const perGram = per100g / 100;
@@ -895,6 +986,9 @@ export default function Nutrition() {
       }
       if (unit === 'oz') {
         return perGram * quantity * 28.35;
+      }
+      if (unit === 'fl oz') {
+        return perGram * quantity * 29.5735;
       }
       if (unit === 'lb') {
         return perGram * quantity * 453.592;
@@ -907,6 +1001,9 @@ export default function Nutrition() {
       }
       if (unit === 'tsp') {
         return perGram * quantity * 5;
+      }
+      if (unit === 'slice') {
+        return perGram * 28 * quantity;
       }
       return (perServing || per100g) * quantity;
     };
@@ -955,13 +1052,21 @@ export default function Nutrition() {
     const nutriments = extractNutrients(prod.nutriments || {});
     setSelectedFood({ name, brand, servingSize, nutriments });
     setQuantity(1);
-    if (servingSize && /g\b/i.test(servingSize)) {
-      setQuantityUnit('g');
-    } else if (servingSize && /oz\b/i.test(servingSize)) {
-      setQuantityUnit('oz');
-    } else {
-      setQuantityUnit('serving');
+    const units = getRelevantUnits(name, servingSize);
+    setQuantityRelevantUnits(units);
+    const hasPerSrv =
+      (nutriments.caloriesPerServing ?? 0) > 0 ||
+      (nutriments.proteinPerServing ?? 0) > 0;
+    const hasPer100 = (nutriments.caloriesPer100g ?? 0) > 0;
+    let fallback = 'serving';
+    if (!hasPerSrv && hasPer100) {
+      fallback = /ml|\bcl\b|fl\.?\s*oz|liter|litre|beverage|drink|juice|water|milk/i.test(
+        String(servingSize || ''),
+      )
+        ? 'ml'
+        : 'g';
     }
+    setQuantityUnit(pickDefaultUnitForFood(name, servingSize, fallback));
     setQuantityMealType(addFoodMealType);
     setQuantityModalVisible(true);
   };
@@ -1195,6 +1300,7 @@ export default function Nutrition() {
           const foodsInMeal = loggedFoodsForDate.filter(
             (f) => (f.meal_type || '').toLowerCase() === mt.key,
           );
+          const mealSubtotals = sumMealNutritionEntries(foodsInMeal);
           return (
             <View key={mt.key} style={styles.mealSection}>
               <View style={styles.mealHeaderRow}>
@@ -1226,6 +1332,14 @@ export default function Nutrition() {
                   </Text>
                 </TouchableOpacity>
               </View>
+              <Text
+                style={[
+                  styles.mealTotalsSubline,
+                  { color: theme.textSecondary },
+                ]}
+              >
+                {formatMealNutritionLine(mealSubtotals)}
+              </Text>
 
               {foodsInMeal.length === 0 ? (
                 <Text
@@ -1316,20 +1430,40 @@ export default function Nutrition() {
         contentContainerStyle={{ paddingBottom: 32, paddingHorizontal: 4 }}
         showsVerticalScrollIndicator={false}
       >
-        <View style={styles.mealPlansHeaderRow}>
-          <TouchableOpacity
-            onPress={() => {
-              setSelectedPlan(null);
-              setSelectedPlanMeals([]);
-              setGroceryItems([]);
-              setPrepChecklistChecked(new Set());
-            }}
+        <View
+          style={[
+            styles.mealPlansHeaderRow,
+            { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 8 },
+          ]}
+        >
+          <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 0 }}>
+            <TouchableOpacity
+              onPress={() => {
+                setSelectedPlan(null);
+                setSelectedPlanMeals([]);
+                setGroceryItems([]);
+                setPrepChecklistChecked(new Set());
+              }}
+            >
+              <Text style={[styles.backText, { color: theme.primary }]}>
+                {'< Back'}
+              </Text>
+            </TouchableOpacity>
+            {drawerMenu ? (
+              <TouchableOpacity
+                onPress={drawerMenu.openDrawer}
+                style={{ marginLeft: 12, paddingVertical: 4 }}
+                accessibilityLabel="Open menu"
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Ionicons name="menu-outline" size={28} color="#7C9A7E" />
+              </TouchableOpacity>
+            ) : null}
+          </View>
+          <Text
+            style={[styles.mealPlansTitle, { color: theme.text, flex: 1, minWidth: 120 }]}
+            numberOfLines={2}
           >
-            <Text style={[styles.backText, { color: theme.primary }]}>
-              {'< Back'}
-            </Text>
-          </TouchableOpacity>
-          <Text style={[styles.mealPlansTitle, { color: theme.text }]}>
             {selectedPlan.plan_name}
           </Text>
         </View>
@@ -1357,7 +1491,7 @@ export default function Nutrition() {
               paddingHorizontal: 20,
             },
           ]}
-          onPress={handleSetPlanActive}
+          onPress={selectedPlanHasFutureActive ? handleSetAsInactive : handleSetPlanActive}
         >
           <Text
             style={{
@@ -1366,7 +1500,7 @@ export default function Nutrition() {
               color: theme.buttonText ?? '#FFFFFF',
             }}
           >
-            Set as Active
+            {selectedPlanHasFutureActive ? 'Set as Inactive' : 'Set as Active'}
           </Text>
         </TouchableOpacity>
 
@@ -2042,16 +2176,16 @@ export default function Nutrition() {
                         nutriments,
                       });
                       setQuantity(1);
-                      if (fav.serving_size && /g\b/i.test(fav.serving_size)) {
-                        setQuantityUnit('g');
-                      } else if (
-                        fav.serving_size &&
-                        /oz\b/i.test(fav.serving_size)
-                      ) {
-                        setQuantityUnit('oz');
-                      } else {
-                        setQuantityUnit('serving');
-                      }
+                      setQuantityRelevantUnits(
+                        getRelevantUnits(fav.food_name, fav.serving_size),
+                      );
+                      setQuantityUnit(
+                        pickDefaultUnitForFood(
+                          fav.food_name,
+                          fav.serving_size,
+                          'serving',
+                        ),
+                      );
                       setQuantityMealType(addFoodMealType);
                       setQuantityModalVisible(true);
                     }}
@@ -2302,19 +2436,15 @@ export default function Nutrition() {
                 </View>
                 <TouchableOpacity
                   onPress={() => {
-                    const units: typeof quantityUnit[] = [
-                      'g',
-                      'oz',
-                      'serving',
-                      'cup',
-                      'tbsp',
-                      'tsp',
-                      'ml',
-                      'lb',
-                    ];
-                    const currentIndex = units.indexOf(quantityUnit);
-                    const nextUnit = units[(currentIndex + 1) % units.length];
-                    setQuantityUnit(nextUnit);
+                    const units =
+                      quantityRelevantUnits.length > 0
+                        ? quantityRelevantUnits
+                        : getRelevantUnits(
+                            selectedFood?.name ?? '',
+                            selectedFood?.servingSize,
+                          );
+                    const idx = Math.max(0, units.indexOf(quantityUnit));
+                    setQuantityUnit(units[(idx + 1) % units.length]);
                   }}
                   style={{
                     paddingHorizontal: 10,
@@ -2370,7 +2500,7 @@ export default function Nutrition() {
                       perS: number,
                       per100: number,
                     ) => {
-                      if (quantityUnit === 'serving') {
+                      if (quantityUnit === 'serving' || isPieceServingUnit(quantityUnit)) {
                         return (perS || per100) * quantity;
                       }
                       const perGram = per100 / 100;
@@ -2380,6 +2510,9 @@ export default function Nutrition() {
                       }
                       if (quantityUnit === 'oz') {
                         return perGram * quantity * 28.35;
+                      }
+                      if (quantityUnit === 'fl oz') {
+                        return perGram * quantity * 29.5735;
                       }
                       if (quantityUnit === 'lb') {
                         return perGram * quantity * 453.592;
@@ -2392,6 +2525,9 @@ export default function Nutrition() {
                       }
                       if (quantityUnit === 'tsp') {
                         return perGram * quantity * 5;
+                      }
+                      if (quantityUnit === 'slice') {
+                        return perGram * 28 * quantity;
                       }
                       return (perS || per100) * quantity;
                     };
@@ -2704,6 +2840,11 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontFamily: 'Jost_600SemiBold',
     letterSpacing: 1.5,
+  },
+  mealTotalsSubline: {
+    fontSize: 13,
+    fontFamily: 'Jost_400Regular',
+    marginBottom: 8,
   },
   addFoodButton: {
     flexDirection: 'row',

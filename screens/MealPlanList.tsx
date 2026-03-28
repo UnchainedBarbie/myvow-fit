@@ -16,6 +16,7 @@ import {
   TouchableWithoutFeedback,
   Share,
   Modal,
+  Linking,
 } from 'react-native';
 import { useTheme } from '../context/ThemeContext';
 import { useSQLiteContext } from 'expo-sqlite';
@@ -28,10 +29,11 @@ import { initNutritionDb } from '../utils/nutritionDb';
 import {
   buildPrepGuideTextFromUniqueFoodNames,
   buildGroceryListJsonFromPlanFoodRows,
-  buildGroceryListJsonFromUniqueFoodNames,
+  countWeeklyPlanDaysForGrocery,
   fetchMealPlanFoodRowsForGrocery,
   generateGroceryListFromPlan,
   generatePrepGuideFromPlan,
+  multiplyPlanFoodRowsForWeek,
 } from '../utils/generateMealPlanGroceryAndPrep';
 
 const SAGE = '#7C9A7E';
@@ -96,19 +98,28 @@ function buildWeeklyPrepShareText(guideText: string): string {
   return `Weekly meal prep\n\n${t}`;
 }
 
-/** Parse grocery_list JSON into merged rows for the weekly list UI. */
-function groceryJsonToMergedRows(parsed: unknown): MergedGroceryRow[] {
+/**
+ * Parse grocery_list JSON into merged rows for the weekly list UI.
+ * @param dedupeByItemText When true (default), collapse duplicate category+item lines (e.g. merging multiple meal plans).
+ *   When false, keep one UI row per JSON entry.
+ */
+function groceryJsonToMergedRows(parsed: unknown, dedupeByItemText = true): MergedGroceryRow[] {
   if (!Array.isArray(parsed)) return [];
-  const seenGrocery = new Set<string>();
+  const seenGrocery = dedupeByItemText ? new Set<string>() : null;
   const items: MergedGroceryRow[] = [];
-  for (const entry of parsed) {
+  for (let i = 0; i < parsed.length; i++) {
+    const entry = parsed[i];
     const text = String((entry as { item?: string; text?: string })?.item ?? (entry as { text?: string })?.text ?? '').trim();
     if (!text) continue;
     const category = normalizeGroceryCategory((entry as { category?: string })?.category);
-    const key = `${category}|${text.toLowerCase()}`;
-    if (seenGrocery.has(key)) continue;
-    seenGrocery.add(key);
-    items.push({ key, text, category });
+    const dedupeKey = `${category}|${text.toLowerCase()}`;
+    if (seenGrocery) {
+      if (seenGrocery.has(dedupeKey)) continue;
+      seenGrocery.add(dedupeKey);
+      items.push({ key: dedupeKey, text, category });
+    } else {
+      items.push({ key: `${category}|${i}|${text.toLowerCase()}`, text, category });
+    }
   }
   items.sort((a, b) => {
     const ca = GROCERY_CATS.indexOf(a.category);
@@ -136,10 +147,10 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
   const [groceryChecked, setGroceryChecked] = useState<Set<string>>(new Set());
   const [prepStepChecked, setPrepStepChecked] = useState<Record<string, boolean>>({});
   const [regeneratingWeekly, setRegeneratingWeekly] = useState(false);
-  /** When not `database`, merged grocery UI comes from tracker/family generation (not DB merge). */
-  const [groceryUiSource, setGroceryUiSource] = useState<'database' | 'tracker' | 'family'>('database');
+  /** When not `database`, merged grocery UI comes from family generation (not DB merge). */
+  const [groceryUiSource, setGroceryUiSource] = useState<'database' | 'family'>('database');
   const [groceryModalVisible, setGroceryModalVisible] = useState(false);
-  const [groceryModalMode, setGroceryModalMode] = useState<'mealPlan' | 'tracker' | 'family'>('mealPlan');
+  const [groceryModalMode, setGroceryModalMode] = useState<'mealPlan' | 'family'>('mealPlan');
   const [familySize, setFamilySize] = useState(1);
   const [grocerySectionExpanded, setGrocerySectionExpanded] = useState(false);
   const [prepSectionExpanded, setPrepSectionExpanded] = useState(false);
@@ -214,6 +225,28 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       console.warn('shareWeeklyGrocery', e);
     }
   }, [weekStart, groceryByCategory, mergedGrocery.length]);
+
+  const openInstacartForGrocery = useCallback(async () => {
+    if (mergedGrocery.length === 0) {
+      Alert.alert('No items', 'Generate a grocery list first using the button above.');
+      return;
+    }
+    const withText = mergedGrocery.map((r) => ({ ...r, text: r.text.trim() })).filter((r) => r.text.length > 0);
+    if (withText.length === 0) {
+      Alert.alert('No items', 'Nothing to search on Instacart.');
+      return;
+    }
+    const meat = withText.find((r) => r.category === 'Meat & Fish');
+    const produce = withText.find((r) => r.category === 'Produce');
+    const query = (meat ?? produce ?? withText[0]).text;
+    const url = `https://www.instacart.com/store/search?query=${encodeURIComponent(query)}`;
+    try {
+      await Linking.openURL(url);
+    } catch (e) {
+      console.warn('openInstacartForGrocery', e);
+      Alert.alert('Unable to open', 'Could not open Instacart. Try again in a moment.');
+    }
+  }, [mergedGrocery]);
 
   const shareWeeklyPrep = useCallback(async () => {
     if (!combinedPrepGuideText.trim()) {
@@ -322,9 +355,12 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
     }
   }, [db, weekStart, currentWeekStart, groceryUiSource]);
 
-  const applyGroceryJsonToUi = useCallback((list: { category: string; item: string; checked?: boolean }[]) => {
-    setMergedGrocery(groceryJsonToMergedRows(list));
-  }, []);
+  const applyGroceryJsonToUi = useCallback(
+    (list: { category: string; item: string; checked?: boolean }[], dedupeByItemText = true) => {
+      setMergedGrocery(groceryJsonToMergedRows(list, dedupeByItemText));
+    },
+    [],
+  );
 
   /** Build grocery_list + prep_guide from each active plan's meals (PlannedMeals / MealPlanItems). */
   const regenerateWeeklyForActivePlans = useCallback(async () => {
@@ -361,44 +397,6 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       return;
     }
 
-    if (groceryModalMode === 'tracker') {
-      setRegeneratingWeekly(true);
-      try {
-        await initNutritionDb(db as any).catch(() => {});
-        const monday = currentWeekStart;
-        const sunday = sundayOfWeekIso(monday);
-        const rows = (await db
-          .getAllAsync<{ food_name: string }>(
-            `SELECT DISTINCT lf.food_name AS food_name
-             FROM LoggedFoods lf
-             INNER JOIN DailyLog dl ON lf.log_id = dl.log_id
-             WHERE dl.log_date >= ? AND dl.log_date <= ?
-               AND lf.food_name IS NOT NULL AND TRIM(lf.food_name) != ''`,
-            [monday, sunday],
-          )
-          .catch(() => [])) as { food_name: string }[];
-        const names = rows.map((r) => r.food_name).filter(Boolean);
-        if (names.length === 0) {
-          Alert.alert(
-            'No logged foods',
-            'Nothing logged for the current calendar week yet. Add foods in Nutrition (Today) for Mon–Sun, then try again.',
-          );
-          return;
-        }
-        const json = buildGroceryListJsonFromUniqueFoodNames(names);
-        setGroceryUiSource('tracker');
-        applyGroceryJsonToUi(json);
-        setGroceryModalVisible(false);
-        setGrocerySectionExpanded(true);
-      } catch (e) {
-        console.error('confirmGroceryModal tracker', e);
-        Alert.alert('Could not build list', 'Try again in a moment.');
-      } finally {
-        setRegeneratingWeekly(false);
-      }
-      return;
-    }
-
     const ids = [...activePlanIdsInWeek];
     if (ids.length === 0) {
       Alert.alert('No active plans', 'Set an active meal plan for this week to scale a family grocery list.');
@@ -410,7 +408,8 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       const allRows: { food_name: string; serving_size?: string | null }[] = [];
       for (const id of ids) {
         const rows = await fetchMealPlanFoodRowsForGrocery(db, id);
-        allRows.push(...rows);
+        const weekDays = await countWeeklyPlanDaysForGrocery(db, id);
+        allRows.push(...multiplyPlanFoodRowsForWeek(rows, weekDays));
       }
       if (allRows.length === 0) {
         Alert.alert('No foods in plans', 'Add foods to your active meal plans first.');
@@ -429,7 +428,6 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
     }
   }, [
     applyGroceryJsonToUi,
-    currentWeekStart,
     db,
     familySize,
     groceryModalMode,
@@ -603,8 +601,8 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       {activePlanIdsInWeek.size > 0 ? (
         <View style={[styles.weeklyActionCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
           <Text style={[styles.weeklyActionHint, { color: theme.textSecondary }]}>
-            Grocery and prep come from your <Text style={{ fontWeight: '700' }}>active</Text> plans, or choose tracker /
-            family options in the generator. Tap after you add or change meals.
+            Grocery and prep come from your <Text style={{ fontWeight: '700' }}>active</Text> plans, or use the family
+            option in the generator. Tap after you add or change meals.
           </Text>
           <TouchableOpacity
             style={[styles.refreshWeeklyBtn, { backgroundColor: SAGE }]}
@@ -658,11 +656,9 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
         {grocerySectionExpanded ? (
           <>
             <Text style={[styles.sectionSub, { color: theme.textSecondary }]}>
-              {groceryUiSource === 'tracker'
-                ? `From foods logged this calendar week (${currentWeekStart} – ${sundayOfWeekIso(currentWeekStart)}).`
-                : groceryUiSource === 'family'
-                  ? `Scaled for ${familySize} people from active plans' template foods (not saved to each plan).`
-                  : `Merged from stored lists for plans active this week (${weekStart} – ${sundayOfWeekIso(weekStart)}).`}{' '}
+              {groceryUiSource === 'family'
+                ? `Scaled for ${familySize} people from active plans' template foods (not saved to each plan).`
+                : `Merged from stored lists for plans active this week (${weekStart} – ${sundayOfWeekIso(weekStart)}).`}{' '}
               Tap share to send to Notes, Messages, etc.
             </Text>
             {activePlanIdsInWeek.size === 0 ? (
@@ -676,41 +672,50 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
                 }
               </Text>
             ) : (
-              GROCERY_CATS.map((cat) => {
-                const rows = groceryByCategory[cat];
-                if (rows.length === 0) return null;
-                return (
-                  <View key={cat} style={styles.categoryBlock}>
-                    <Text style={[styles.categoryTitle, { color: theme.text }]}>{cat}</Text>
-                    {rows.map((row) => {
-                      const checked = groceryChecked.has(row.key);
-                      return (
-                        <TouchableOpacity
-                          key={row.key}
-                          style={[styles.checkRow, { borderColor: theme.border }]}
-                          onPress={() => toggleGroceryItem(row.key)}
-                          activeOpacity={0.7}
-                        >
-                          <Ionicons
-                            name={checked ? 'checkbox' : 'square-outline'}
-                            size={22}
-                            color={checked ? SAGE : theme.text}
-                          />
-                          <Text
-                            style={[
-                              styles.checkRowText,
-                              { color: theme.text },
-                              checked && styles.checkRowTextDone,
-                            ]}
+              <>
+                {GROCERY_CATS.map((cat) => {
+                  const rows = groceryByCategory[cat];
+                  if (rows.length === 0) return null;
+                  return (
+                    <View key={cat} style={styles.categoryBlock}>
+                      <Text style={[styles.categoryTitle, { color: theme.text }]}>{cat}</Text>
+                      {rows.map((row) => {
+                        const checked = groceryChecked.has(row.key);
+                        return (
+                          <TouchableOpacity
+                            key={row.key}
+                            style={[styles.checkRow, { borderColor: theme.border }]}
+                            onPress={() => toggleGroceryItem(row.key)}
+                            activeOpacity={0.7}
                           >
-                            {row.text}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-                );
-              })
+                            <Ionicons
+                              name={checked ? 'checkbox' : 'square-outline'}
+                              size={22}
+                              color={checked ? SAGE : theme.text}
+                            />
+                            <Text
+                              style={[
+                                styles.checkRowText,
+                                { color: theme.text },
+                                checked && styles.checkRowTextDone,
+                              ]}
+                            >
+                              {row.text}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+                  );
+                })}
+                <TouchableOpacity
+                  style={[styles.refreshWeeklyBtn, styles.instacartBtn, { backgroundColor: SAGE }]}
+                  onPress={openInstacartForGrocery}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.refreshWeeklyBtnText}>Shop on Instacart</Text>
+                </TouchableOpacity>
+              </>
             )}
           </>
         ) : null}
@@ -868,13 +873,12 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
               </TouchableOpacity>
             </View>
             <Text style={styles.groceryModalHint}>
-              Choose a source. Meal plan updates your saved lists and meal prep; tracker and family views are for shopping only.
+              Choose a source. Meal plan updates your saved lists and meal prep; family view is for shopping only.
             </Text>
 
             {(
               [
                 { mode: 'mealPlan' as const, title: 'My Meal Plan', sub: 'From active meal plan templates (saved to each plan + prep guide).' },
-                { mode: 'tracker' as const, title: "This Week's Tracker", sub: `Logged foods Mon–Sun for ${currentWeekStart} week.` },
                 { mode: 'family' as const, title: 'Family Size', sub: 'Scale template servings for multiple people (shopping list only).' },
               ] as const
             ).map((opt) => {
@@ -1105,6 +1109,7 @@ const styles = StyleSheet.create({
   },
   refreshWeeklyBtnInner: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   refreshWeeklyBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  instacartBtn: { marginTop: 16, alignSelf: 'stretch' },
   sectionCard: {
     borderRadius: 12,
     borderWidth: 1,

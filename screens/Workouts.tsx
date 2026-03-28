@@ -94,9 +94,21 @@ export default function Workouts() {
               });
             } catch (error) {
               console.error('Error deleting workout with future logs:', error);
+              const rawMessage =
+                error instanceof Error ? error.message.toLowerCase() : '';
+              const likelyBlockedByCalendarOrLogs =
+                rawMessage.includes('foreign key') ||
+                rawMessage.includes('constraint') ||
+                rawMessage.includes('workout_log') ||
+                rawMessage.includes('weight_log') ||
+                rawMessage.includes('recurring_workouts');
+
               Alert.alert(
                 t('errorTitle'),
-                t('errorDeletingWorkout') || 'Failed to delete workout and scheduled sessions.'
+                likelyBlockedByCalendarOrLogs
+                  ? t('workoutDeleteBlockedMessage') ||
+                    "This workout can't be deleted because it is scheduled on your calendar or has logged sessions. Remove it from your calendar first, then try again."
+                  : t('errorDeletingWorkout') || 'Failed to delete workout and scheduled sessions.'
               );
             }
           },

@@ -6,6 +6,70 @@
  * before dairy/meat & fish/produce so oils, condiments, and plant milks map to Pantry.
  */
 
+import { ALTERNATING_A_DAYS, ALTERNATING_B_DAYS } from './initMealPlansDb';
+
+/** Same expansion as MealPlanDetail / DayActivePlan: schedule rows → mon–sun keys. */
+function expandMealPlanScheduleToWeekdayKeys(rows: { day_of_week: string }[]): Set<string> {
+  const out = new Set<string>();
+  for (const r of rows) {
+    const v = r.day_of_week.toLowerCase().trim();
+    if (v === 'alternating_a') {
+      ALTERNATING_A_DAYS.forEach((d) => out.add(d));
+    } else if (v === 'alternating_b') {
+      ALTERNATING_B_DAYS.forEach((d) => out.add(d));
+    } else {
+      out.add(v);
+    }
+  }
+  return out;
+}
+
+/**
+ * Days per week this plan’s template applies (each meal slot repeats once per such day).
+ * Empty MealPlanSchedule → 7 (same as DayActivePlan: all week).
+ */
+export async function countWeeklyPlanDaysForGrocery(db: any, planId: number): Promise<number> {
+  const scheduleRows = (await db
+    .getAllAsync<{ day_of_week: string }>(
+      'SELECT day_of_week FROM MealPlanSchedule WHERE meal_plan_id = ?',
+      [planId],
+    )
+    .catch(() => [])) as { day_of_week: string }[];
+  const expanded = expandMealPlanScheduleToWeekdayKeys(scheduleRows);
+  if (expanded.size === 0) return 7;
+  return expanded.size;
+}
+
+/**
+ * Meal plan rows: `food_name`, optional `serving_size` (unit text only; leading numbers are stripped for display).
+ * Tracker / LoggedFoods rows: include `quantity` — summed as-is per row (not parsed from `serving_size`).
+ */
+export type GroceryPlanFoodRow = {
+  food_name: string;
+  serving_size?: string | null;
+  quantity?: number | null;
+};
+
+/** Repeat each row `factor` times so buildGroceryListJsonFromPlanFoodRows sums servings across the week. */
+export function multiplyPlanFoodRowsForWeek(
+  rows: GroceryPlanFoodRow[],
+  factor: number,
+): GroceryPlanFoodRow[] {
+  const n = Math.max(1, Math.floor(factor));
+  if (n <= 1) return rows;
+  const out: GroceryPlanFoodRow[] = [];
+  for (let i = 0; i < n; i++) {
+    for (const r of rows) {
+      out.push({
+        food_name: r.food_name,
+        serving_size: r.serving_size ?? null,
+        ...(r.quantity != null ? { quantity: r.quantity } : {}),
+      });
+    }
+  }
+  return out;
+}
+
 /** Internal prep buckets; `grain` historically = pantry / grains / dry goods. */
 type FoodKind = 'grain' | 'dairy' | 'meatFish' | 'produce' | 'other';
 
@@ -915,51 +979,76 @@ export function groceryCategoryFromFood(foodName: string): string {
 
 const GROCERY_JSON_CATEGORY_ORDER = ['Produce', 'Meat & Fish', 'Dairy', 'Pantry', 'Other'] as const;
 
-/**
- * Scale a leading decimal number in a serving string (e.g. "2 cups" → "6 cups" for factor 3).
- * If no leading number, prefixes "factor× ".
- */
-export function scaleNumericPrefixInString(s: string, factor: number): string {
-  if (factor <= 1) return s;
-  const t = s.trim();
-  const m = t.match(/^(\d+(?:\.\d+)?)(\s*)(.*)$/);
-  if (!m) return `${factor}× ${t}`;
-  const num = parseFloat(m[1]) * factor;
-  const rounded = Math.round(num * 1000) / 1000;
-  const numStr = Number.isInteger(rounded) ? String(Math.round(rounded)) : String(rounded);
-  return `${numStr}${m[2]}${m[3]}`;
-}
-
-export function formatGroceryItemLine(
-  foodName: string,
-  servingSize: string | null | undefined,
-  familySize: number,
-): string {
-  const name = String(foodName ?? '').trim();
-  const ss = servingSize?.trim();
-  const n = Math.max(1, Math.min(8, familySize));
-  if (!ss) {
-    if (n > 1) return `${name} (×${n})`;
-    return name;
-  }
-  const scaled = n > 1 ? scaleNumericPrefixInString(ss, n) : ss;
-  return `${name} — ${scaled}`;
-}
-
 export type GroceryListJsonEntry = { category: string; item: string; checked: boolean };
 
-/** Load food rows used to build a grocery list for one meal plan (PlannedMeals + FoodItems, or MealPlanItems). */
+/** Case-insensitive merge key; trims and collapses internal whitespace. */
+function normalizeIngredientKey(raw: string): string {
+  return String(raw ?? '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+/**
+ * Remove a leading fraction or decimal from serving_size text; remainder is the unit phrase.
+ * E.g. "1 medium" → "medium", "1/2 cup dry" → "cup dry".
+ */
+function stripLeadingNumericPrefixFromServingSize(s: string): string {
+  const t = s.trim();
+  if (!t) return '';
+  const frac = t.match(/^(\d+\/\d+)\s+(.+)$/);
+  if (frac) return frac[2].trim();
+  const dec = t.match(/^(\d+(?:\.\d+)?)\s+(.+)$/);
+  if (dec) return dec[2].trim();
+  return t;
+}
+
+const PURE_NUMBER_TOKEN = /^\d+(?:\.\d+)?$|^\d+\/\d+$/;
+
+/**
+ * Unit for grocery display: strip leading number from serving_size, then drop a trailing parenthetical
+ * (e.g. "6 oz (170g)" → "oz"). Returns "" if nothing usable remains.
+ */
+function extractGroceryUnitFromServingSize(servingSize: string | null | undefined): string {
+  const raw = String(servingSize ?? '').trim();
+  if (!raw) return '';
+  const rest = stripLeadingNumericPrefixFromServingSize(raw);
+  if (!rest || PURE_NUMBER_TOKEN.test(rest)) return '';
+  let u = rest.replace(/\s*\([^)]*\)\s*$/g, '').trim();
+  if (!u || PURE_NUMBER_TOKEN.test(u)) return '';
+  return u;
+}
+
+function normalizeUnitKey(unit: string): string {
+  return unit.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/** Per-row quantity: explicit `quantity` when present, else 1 (meal-plan template rows). */
+function rowGroceryQuantity(r: GroceryPlanFoodRow): number {
+  if (r.quantity == null) return 1;
+  const q = Number(r.quantity);
+  if (!Number.isFinite(q) || q < 0) return 1;
+  return q;
+}
+
+/**
+ * Load every food line for a meal plan: all PlannedMeals rows for that plan (one template day:
+ * breakfast/lunch/dinner/etc.) joined to FoodItems — one row per ingredient per meal slot.
+ * `generateGroceryListFromPlan` repeats these rows by scheduled days per week (see
+ * `countWeeklyPlanDaysForGrocery`) before aggregating servings.
+ * Legacy plans use MealPlanItems (flat list); same weekly multiplier applies.
+ */
 export async function fetchMealPlanFoodRowsForGrocery(
   db: any,
   planId: number,
-): Promise<{ food_name: string; serving_size?: string | null }[]> {
+): Promise<GroceryPlanFoodRow[]> {
   let rows: { meal_type: string; food_name: string; serving_size?: string | null }[] = await db
     .getAllAsync(
       `SELECT pm.meal_type, fi.food_name, fi.serving_size
      FROM PlannedMeals pm
      JOIN FoodItems fi ON fi.meal_id = pm.meal_id
      WHERE pm.meal_plan_id = ?
-     ORDER BY pm.meal_order, fi.food_id`,
+     ORDER BY pm.meal_order, pm.meal_id, fi.food_id`,
       [planId],
     )
     .catch(() => []);
@@ -975,13 +1064,62 @@ export async function fetchMealPlanFoodRowsForGrocery(
   return rows.map((r) => ({ food_name: r.food_name, serving_size: r.serving_size ?? null }));
 }
 
-/** Build grocery JSON using the same categorization as per-plan generation; optional family size scales servings. */
+/**
+ * Build grocery JSON: merge rows by normalized `food_name`, sum `(quantity ?? 1) × familySize` per row,
+ * derive a single unit from `serving_size` (leading number stripped; trailing "(…)" removed). Lines are
+ * `[food name] — [total] [unit]`, or the food name only when no unit; if units disagree for the same food,
+ * show `[food name] — [total]` without a unit.
+ */
 export function buildGroceryListJsonFromPlanFoodRows(
-  rows: { food_name: string; serving_size?: string | null }[],
+  rows: GroceryPlanFoodRow[],
   options?: { familySize?: number },
 ): GroceryListJsonEntry[] {
   const familySize = Math.max(1, Math.min(8, options?.familySize ?? 1));
-  const seen = new Set<string>();
+  const aggregate = new Map<
+    string,
+    {
+      displayName: string;
+      category: string;
+      totalQty: number;
+      unit: string;
+      mixedUnits: boolean;
+    }
+  >();
+
+  for (const r of rows) {
+    const displayName = String(r.food_name ?? '').trim().replace(/\s+/g, ' ');
+    if (!displayName) continue;
+    const key = normalizeIngredientKey(displayName);
+    const category = groceryCategoryFromFood(displayName);
+    const rowQty = rowGroceryQuantity(r) * familySize;
+    if (rowQty <= 0) continue;
+
+    const unitThis = extractGroceryUnitFromServingSize(r.serving_size);
+    const unitKeyThis = unitThis ? normalizeUnitKey(unitThis) : '';
+
+    const existing = aggregate.get(key);
+    if (!existing) {
+      aggregate.set(key, {
+        displayName,
+        category,
+        totalQty: rowQty,
+        unit: unitThis,
+        mixedUnits: false,
+      });
+      continue;
+    }
+
+    existing.totalQty += rowQty;
+
+    if (!unitKeyThis) {
+      // keep existing.unit
+    } else if (!existing.unit) {
+      existing.unit = unitThis;
+    } else if (normalizeUnitKey(existing.unit) !== unitKeyThis) {
+      existing.mixedUnits = true;
+    }
+  }
+
   const byCategory: Record<string, string[]> = {
     Produce: [],
     'Meat & Fish': [],
@@ -989,12 +1127,25 @@ export function buildGroceryListJsonFromPlanFoodRows(
     Pantry: [],
     Other: [],
   };
-  for (const r of rows) {
-    const item = formatGroceryItemLine(r.food_name, r.serving_size, familySize);
-    if (seen.has(item)) continue;
-    seen.add(item);
-    const cat = groceryCategoryFromFood(r.food_name);
-    if (byCategory[cat]) byCategory[cat].push(item);
+
+  for (const row of aggregate.values()) {
+    const rounded = Math.round(row.totalQty * 1000) / 1000;
+    if (rounded <= 0) continue;
+    const amountStr = Number.isInteger(rounded)
+      ? String(Math.round(rounded))
+      : String(rounded);
+
+    let item: string;
+    const unit = row.mixedUnits ? '' : row.unit.trim();
+    if (unit) {
+      item = `${row.displayName} — ${amountStr} ${unit}`;
+    } else if (row.mixedUnits) {
+      item = `${row.displayName} — ${amountStr}`;
+    } else {
+      item = row.displayName;
+    }
+
+    if (byCategory[row.category]) byCategory[row.category].push(item);
     else byCategory['Other'].push(item);
   }
   const list: GroceryListJsonEntry[] = [];
@@ -1004,30 +1155,21 @@ export function buildGroceryListJsonFromPlanFoodRows(
   return list;
 }
 
-/** Categorized grocery JSON from unique food names only (e.g. Nutrition tracker foods). */
-export function buildGroceryListJsonFromUniqueFoodNames(names: string[]): GroceryListJsonEntry[] {
-  const unique = dedupeFoodNamesCaseInsensitive(names);
-  const byCategory: Record<string, string[]> = {
-    Produce: [],
-    'Meat & Fish': [],
-    Dairy: [],
-    Pantry: [],
-    Other: [],
-  };
-  for (const name of unique) {
-    const cat = groceryCategoryFromFood(name);
-    if (byCategory[cat]) byCategory[cat].push(name);
-    else byCategory['Other'].push(name);
-  }
-  const list: GroceryListJsonEntry[] = [];
-  for (const cat of GROCERY_JSON_CATEGORY_ORDER) {
-    for (const item of byCategory[cat]) list.push({ category: cat, item, checked: false });
-  }
-  return list;
+/**
+ * Grocery JSON from nutrition-tracker rows (e.g. LoggedFoods for a date range).
+ * Same rules as `buildGroceryListJsonFromPlanFoodRows`: sum `quantity` per food, unit from `serving_size` after stripping a leading number.
+ */
+export function buildGroceryListJsonFromUniqueFoodNames(
+  rows: GroceryPlanFoodRow[],
+  options?: { familySize?: number },
+): GroceryListJsonEntry[] {
+  return buildGroceryListJsonFromPlanFoodRows(rows, options);
 }
 
 export async function generateGroceryListFromPlan(db: any, planId: number): Promise<void> {
-  const rows = await fetchMealPlanFoodRowsForGrocery(db, planId);
+  const rawRows = await fetchMealPlanFoodRowsForGrocery(db, planId);
+  const weekDays = await countWeeklyPlanDaysForGrocery(db, planId);
+  const rows = multiplyPlanFoodRowsForWeek(rawRows, weekDays);
   const list = buildGroceryListJsonFromPlanFoodRows(rows, { familySize: 1 });
   await db.runAsync('UPDATE MealPlans SET grocery_list = ? WHERE meal_plan_id = ?', [
     JSON.stringify(list),

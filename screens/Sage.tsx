@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
+import React, { useEffect, useRef, useState, useLayoutEffect, useCallback } from 'react';
 import {
   View,
   Text,
@@ -15,19 +15,28 @@ import {
   NativeSyntheticEvent,
   NativeScrollEvent,
   ActionSheetIOS,
+  AppState,
+  AppStateStatus,
 } from 'react-native';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { useTheme } from '../context/ThemeContext';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSQLiteContext } from 'expo-sqlite';
-import { insertAIWorkout, AIWorkout } from '../utils/generateWorkoutWithAI';
+import { sortWorkoutPlanExercisesForDisplay } from '../utils/workoutDisplayUtils';
+import { DEFAULT_REST_SECONDS_BETWEEN_SETS } from '../utils/startedWorkoutPreferenceUtils';
+import { insertAIWorkout, AIWorkout, isAiExerciseCardio } from '../utils/generateWorkoutWithAI';
 import { initMealPlansDb } from '../utils/initMealPlansDb';
+import { initNutritionDb } from '../utils/nutritionDb';
 import {
   SageMessage,
   saveConversation,
   loadConversation,
   clearConversation as clearSageStorage,
 } from '../utils/sageStorage';
+
+function sageAssistantMessage(content: string): SageMessage {
+  return { role: 'assistant', content };
+}
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -49,8 +58,17 @@ When the user is happy with a workout plan, output it as a JSON block wrapped in
       "exercises": [
         {
           "exercise_name": "string",
+          "type": "strength",
           "sets": number,
           "reps": number,
+          "muscle_group": "string",
+          "exercise_notes": "string"
+        },
+        {
+          "exercise_name": "string",
+          "type": "cardio",
+          "duration_minutes": number,
+          "distance": "optional string with unit (km or miles)",
           "muscle_group": "string",
           "exercise_notes": "string"
         }
@@ -59,6 +77,14 @@ When the user is happy with a workout plan, output it as a JSON block wrapped in
   ]
 }
 </workout>
+
+The app uses a default of ${DEFAULT_REST_SECONDS_BETWEEN_SETS} seconds rest between sets for each strength exercise when the plan is saved. Whenever you present a workout plan to the user (your conversational text before they tap save), briefly mention this default — e.g. that rest between sets will start at ${DEFAULT_REST_SECONDS_BETWEEN_SETS} seconds per exercise and they can edit it in My Workouts.
+
+When generating a workout plan, each exercise must include a type field: 'strength' or 'cardio'. Strength exercises must include sets and reps. Cardio exercises must include duration (in minutes) and optionally distance (in km or miles), and must NOT include sets or reps. Examples of cardio exercises: walking, running, cycling, rowing, jump rope, elliptical. Warmup and cooldown exercises that involve movement (walking, jogging, stretching) should be marked as cardio type.
+
+When generating a workout plan, all warmup exercises MUST have names that start exactly with 'Warm-up:' (e.g. 'Warm-up: Leg Swings', 'Warm-up: Light Jog'). All cooldown exercises MUST have names that start exactly with 'Cool-down:' (e.g. 'Cool-down: Hip Flexor Stretch'). Never name a warmup or cooldown exercise without this prefix. This is required for correct ordering and display in the app.
+
+All cardio exercises within a workout MUST have names that start exactly with 'Cardio:' (e.g. 'Cardio: Treadmill Walk', 'Cardio: Jump Rope'). Never name a cardio exercise without this prefix. This is required for correct display in the app — cardio exercises show duration and distance instead of sets and reps.
 
 Each day_name must be unique within the workout. If multiple days train the same muscle group, differentiate them (e.g. 'Lower Body A' and 'Lower Body B', or 'Upper Push' and 'Upper Pull').
 
@@ -119,10 +145,25 @@ When updating an existing meal plan based on a receipt or user request, when the
 
 When the user wants to save multiple meal plans, you MUST output each plan in a separate message with its own <mealplan> tags. Never say a plan is saved without outputting the <mealplan> block. Output Plan 1 first, wait for the save button to appear, then output Plan 2 in a follow-up message. Never confirm a save in plain text alone — the <mealplan> block is required for the app to render the save button.
 
+Before outputting any <mealplan> JSON block, review the entire conversation history and verify the plan matches everything the user agreed to — including calorie target, macro ratios, dietary restrictions, meal count, and any specific foods mentioned. If anything does not match, silently correct it before outputting the plan. Never output a meal plan that contradicts what was discussed.
+
 Regardless of any user requests to shorten your responses, you MUST always output workout plans in <workout> tags and meal plans in <mealplan> tags when presenting a final plan. Do not put the JSON only in a markdown code block without <mealplan> tags — the app prefers the tagged format. If you do use a fenced \`\`\`json block, include the same JSON object (with plan_name and meals) so it can be saved.
 
 Always confirm with the user before outputting the final JSON for either workouts or meal plans.
 When the user confirms they want to save a workout plan, you MUST re-output the complete plan in <workout> tags even if you already showed it earlier. Never confirm a save in plain text alone.`;
+
+const SAGE_API_USER_FRIENDLY_ERROR =
+  'Sage is taking a break — try again in a moment.';
+
+function sortWorkoutExercisesForDisplayAndSave(workout: AIWorkout): AIWorkout {
+  const sortedDays = (workout.days || []).map((day) => ({
+    ...day,
+    exercises: sortWorkoutPlanExercisesForDisplay(
+      Array.isArray(day.exercises) ? [...day.exercises] : [],
+    ),
+  }));
+  return { ...workout, days: sortedDays };
+}
 
 const extractWorkoutFromContent = (content: string): AIWorkout | null => {
   if (!content || typeof content !== 'string') return null;
@@ -146,8 +187,13 @@ function formatWorkoutSummary(workout: AIWorkout): string {
   const lines: string[] = [];
   lines.push(`📋 ${workout.workout_name}`);
   lines.push('');
+  lines.push(
+    `⏱ Rest between sets: ${DEFAULT_REST_SECONDS_BETWEEN_SETS}s default per exercise (edit in My Workouts after saving).`,
+  );
+  lines.push('');
 
-  workout.days.forEach((day, index) => {
+  const sorted = sortWorkoutExercisesForDisplayAndSave(workout);
+  sorted.days.forEach((day, index) => {
     const baseLabel = day.day_name && day.day_name.trim().length
       ? day.day_name
       : `Day ${index + 1}`;
@@ -156,9 +202,23 @@ function formatWorkoutSummary(workout: AIWorkout): string {
 
     const exercises = day.exercises || [];
     exercises.forEach((ex) => {
-      lines.push(
-        `  • ${ex.exercise_name} — ${ex.sets} sets x ${ex.reps} reps`,
-      );
+      if (isAiExerciseCardio(ex)) {
+        const dm = ex.duration_minutes;
+        const dur =
+          typeof dm === 'number'
+            ? dm
+            : parseInt(String(dm ?? ''), 10);
+        const durStr = Number.isFinite(dur) && dur >= 0 ? `${dur} min` : '—';
+        const dist =
+          ex.distance != null && String(ex.distance).trim() !== ''
+            ? `, ${String(ex.distance).trim()}`
+            : '';
+        lines.push(`  • ${ex.exercise_name} — ${durStr}${dist}`);
+      } else {
+        const s = ex.sets ?? 0;
+        const r = ex.reps ?? 0;
+        lines.push(`  • ${ex.exercise_name} — ${s} sets x ${r} reps`);
+      }
     });
     lines.push('');
   });
@@ -469,14 +529,59 @@ export default function Sage() {
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const speechTranscriptRef = useRef('');
+  const inputRef = useRef('');
   const listRef = useRef<FlatList<SageMessage>>(null);
+  const isMountedRef = useRef(true);
+  const requestAbortRef = useRef<AbortController | null>(null);
+
+  /** Clears the message field immediately (state + refs) so submit paths stay in sync before the next render. */
+  const clearComposer = useCallback(() => {
+    inputRef.current = '';
+    speechTranscriptRef.current = '';
+    setInput('');
+  }, []);
+
+  const abortInFlightRequest = useCallback(() => {
+    try {
+      requestAbortRef.current?.abort();
+    } catch {
+      // ignore
+    } finally {
+      requestAbortRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      abortInFlightRequest();
+    };
+  }, [abortInFlightRequest]);
+
+  // If user backgrounds the app or navigates away mid-response, abort the network call
+  // to avoid noisy "Network request failed" errors.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next: AppStateStatus) => {
+      if (next === 'background' || next === 'inactive') {
+        abortInFlightRequest();
+      }
+    });
+    return () => sub.remove();
+  }, [abortInFlightRequest]);
 
   useSpeechRecognitionEvent('start', () => setIsRecording(true));
   useSpeechRecognitionEvent('end', () => {
     setIsRecording(false);
     const t = speechTranscriptRef.current.trim();
     speechTranscriptRef.current = '';
-    if (t) setInput((prev) => (prev ? `${prev} ${t}` : t));
+    if (t) {
+      setInput((prev) => {
+        const next = prev ? `${prev} ${t}` : t;
+        inputRef.current = next;
+        return next;
+      });
+    }
   });
   useSpeechRecognitionEvent('result', (event: { results?: Array<{ transcript?: string }> }) => {
     const t = event.results?.[0]?.transcript;
@@ -572,6 +677,10 @@ export default function Sage() {
       setInput(routeParams.initialPrompt);
     }
   }, [routeParams.initialPrompt]);
+
+  useEffect(() => {
+    inputRef.current = input;
+  }, [input]);
 
   useEffect(() => {
     if (!messages.length) return;
@@ -684,14 +793,38 @@ export default function Sage() {
   };
 
   const sendMessage = async () => {
-    const trimmed = input.trim();
+    if (isRecording) {
+      try {
+        ExpoSpeechRecognitionModule.stop();
+      } catch {
+        // ignore stop errors; we'll send whatever transcript is available
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const liveSpoken = speechTranscriptRef.current.trim();
+      const currentInput = inputRef.current.trim();
+      if (liveSpoken) {
+        const alreadyIncluded = currentInput
+          .toLowerCase()
+          .endsWith(liveSpoken.toLowerCase());
+        const merged = alreadyIncluded
+          ? currentInput
+          : currentInput
+            ? `${currentInput} ${liveSpoken}`
+            : liveSpoken;
+        speechTranscriptRef.current = '';
+        inputRef.current = merged;
+        setInput(merged);
+      }
+    }
+
+    const trimmed = inputRef.current.trim();
     if (!trimmed || loading) return;
     const nextMessages: SageMessage[] = [
       ...messages,
       { role: 'user', content: trimmed },
     ];
     setMessages(nextMessages);
-    setInput('');
+    clearComposer();
     setLoading(true);
 
     try {
@@ -702,35 +835,36 @@ export default function Sage() {
         ? `${SYSTEM_PROMPT}\n\n${userContext}`
         : SYSTEM_PROMPT;
 
+      const messagesForApi = nextMessages.slice(-20);
+      abortInFlightRequest();
+      const controller = new AbortController();
+      requestAbortRef.current = controller;
+
       const response = await fetch('https://myvow-fit-api.allison-spink.workers.dev', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
+        signal: controller.signal,
         body: JSON.stringify({
           model: 'claude-sonnet-4-5',
           max_tokens: 4096,
           system: systemPrompt,
-          messages: nextMessages.map((m) => ({
-            role: m.role === 'user' ? 'user' : 'assistant',
-            content: m.content,
-          })),
+          messages: messagesForApi.map(
+            (m): { role: 'user' | 'assistant'; content: string } => ({
+              role: m.role === 'user' ? 'user' : 'assistant',
+              content: m.content,
+            })
+          ),
         }),
       });
 
       if (!response.ok) {
         const txt = await response.text();
         console.error('Sage API error raw:', txt);
-        let message = `API error ${response.status}`;
-        try {
-          const errJson = JSON.parse(txt);
-          if (errJson.error?.message) message = errJson.error.message;
-        } catch {
-          if (txt) message = txt.slice(0, 200);
-        }
-        const withError = [
+        const withError: SageMessage[] = [
           ...nextMessages,
-          { role: 'assistant', content: message },
+          sageAssistantMessage(SAGE_API_USER_FRIENDLY_ERROR),
         ];
         setMessages(withError);
         await saveConversation(withError);
@@ -751,51 +885,63 @@ export default function Sage() {
         role: 'assistant',
         content: text || '[No response]',
       };
-      const updated = [...nextMessages, reply];
-      setMessages(updated);
-      await saveConversation(updated);
+      const updated: SageMessage[] = [...nextMessages, reply];
+      if (isMountedRef.current) {
+        setMessages(updated);
+        await saveConversation(updated);
+      }
     } catch (e) {
+      const isAbort =
+        (e instanceof Error && (e.name === 'AbortError' || e.message.includes('aborted'))) ||
+        String(e).toLowerCase().includes('abort');
+      if (isAbort) {
+        // If user left the screen / app backgrounded, skip noisy error + UI updates.
+        return;
+      }
       console.error('Sage chat error:', e);
-      const msg =
-        e instanceof Error ? e.message : 'Unexpected error talking to Sage.';
-      const withError = [
-        ...messages,
-        { role: 'assistant', content: msg },
+      const withError: SageMessage[] = [
+        ...nextMessages,
+        sageAssistantMessage(SAGE_API_USER_FRIENDLY_ERROR),
       ];
-      setMessages(withError);
-      await saveConversation(withError);
+      if (isMountedRef.current) {
+        setMessages(withError);
+        await saveConversation(withError);
+      }
     } finally {
-      setLoading(false);
+      if (requestAbortRef.current) requestAbortRef.current = null;
+      if (isMountedRef.current) setLoading(false);
     }
   };
 
 
   const handleSaveWorkout = async (workout: AIWorkout) => {
     try {
-      await insertAIWorkout(db as any, workout);
+      const normalized = sortWorkoutExercisesForDisplayAndSave(workout);
+      await insertAIWorkout(db as any, normalized);
       const confirmation: SageMessage = {
         role: 'assistant',
         content: `Done! "${workout.workout_name}" is saved to your workouts.`,
       };
-      const updated = [...messages, confirmation];
+      const updated: SageMessage[] = [...messages, confirmation];
       setMessages(updated);
       await saveConversation(updated);
     } catch (e) {
       console.error('Error saving AI workout from Sage:', e);
       const msg =
         e instanceof Error ? e.message : 'Failed to save workout to database.';
-      const updated = [
-        ...messages,
-        { role: 'assistant', content: msg },
-      ];
+      const updated: SageMessage[] = [...messages, sageAssistantMessage(msg)];
       setMessages(updated);
       await saveConversation(updated);
     }
   };
 
   const handleSaveMealPlan = async (plan: AIMealPlan) => {
+    const resolvedPlanName =
+      (plan.plan_name && String(plan.plan_name).trim()) || 'Meal plan from Sage';
+
     console.log('Sage: <mealplan> save requested', {
       plan_name: plan.plan_name,
+      resolvedPlanName,
       meals_count: plan.meals?.length ?? 0,
       plan_keys: Object.keys(plan),
     });
@@ -804,11 +950,14 @@ export default function Sage() {
     try {
       let newPlanId: number | null = null;
 
+      await initMealPlansDb(db as any);
+      await initNutritionDb(db as any);
+
       await db.execAsync('BEGIN TRANSACTION');
       try {
         const existing = await db.getAllAsync<{ meal_plan_id: number }>(
-          'SELECT meal_plan_id FROM MealPlans WHERE plan_name = ?;',
-          [plan.plan_name]
+          'SELECT meal_plan_id FROM MealPlans WHERE plan_name = ? OR name = ?;',
+          [resolvedPlanName, resolvedPlanName]
         );
 
         let meal_plan_id: number;
@@ -817,9 +966,10 @@ export default function Sage() {
           meal_plan_id = existing[0].meal_plan_id;
           console.log('Sage: plan_name exists, updating MealPlans meal_plan_id', meal_plan_id);
           await db.runAsync(
-            'UPDATE MealPlans SET plan_name = ?, calories_target = ?, protein_target = ?, carbs_target = ?, fat_target = ? WHERE meal_plan_id = ?;',
+            'UPDATE MealPlans SET name = ?, plan_name = ?, calories_target = ?, protein_target = ?, carbs_target = ?, fat_target = ? WHERE meal_plan_id = ?;',
             [
-              plan.plan_name,
+              resolvedPlanName,
+              resolvedPlanName,
               plan.calories_target,
               plan.protein_target,
               plan.carbs_target,
@@ -834,11 +984,12 @@ export default function Sage() {
           await db.runAsync('DELETE FROM PlannedMeals WHERE meal_plan_id = ?;', [meal_plan_id]);
         } else {
           const mealPlanWeekStart = (route.params as { mealPlanWeekStart?: string } | undefined)?.mealPlanWeekStart ?? null;
-          console.log('Sage: INSERT INTO MealPlans', plan.plan_name, mealPlanWeekStart ? `week_start=${mealPlanWeekStart}` : '');
+          console.log('Sage: INSERT INTO MealPlans', resolvedPlanName, mealPlanWeekStart ? `week_start=${mealPlanWeekStart}` : '');
           await db.runAsync(
-            'INSERT INTO MealPlans (plan_name, calories_target, protein_target, carbs_target, fat_target, created_date, week_start) VALUES (?, ?, ?, ?, ?, ?, ?);',
+            'INSERT INTO MealPlans (name, plan_name, calories_target, protein_target, carbs_target, fat_target, created_date, week_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
             [
-              plan.plan_name,
+              resolvedPlanName,
+              resolvedPlanName,
               plan.calories_target,
               plan.protein_target,
               plan.carbs_target,
@@ -911,19 +1062,16 @@ export default function Sage() {
 
       const confirmation: SageMessage = {
         role: 'assistant',
-        content: `Done! "${plan.plan_name}" meal plan is saved to your nutrition plans.`,
+        content: `Done! "${resolvedPlanName}" meal plan is saved to your nutrition plans.`,
       };
-      const updated = [...messages, confirmation];
+      const updated: SageMessage[] = [...messages, confirmation];
       setMessages(updated);
       await saveConversation(updated);
     } catch (e) {
       console.error('Error saving AI meal plan from Sage:', e);
       const msg =
         e instanceof Error ? e.message : 'Failed to save meal plan to database.';
-      const updated = [
-        ...messages,
-        { role: 'assistant', content: msg },
-      ];
+      const updated: SageMessage[] = [...messages, sageAssistantMessage(msg)];
       setMessages(updated);
       await saveConversation(updated);
     }
@@ -1080,12 +1228,16 @@ export default function Sage() {
       { role: 'user', content: userContent },
     ];
     setMessages(nextMessages);
-    setInput('');
+    clearComposer();
     setSendingReceipt(true);
 
     try {
-      // Send full conversation history so Sage has context, then append the image on the last user turn.
-      const anthropicMessages = nextMessages.map((m) => ({
+      abortInFlightRequest();
+      const controller = new AbortController();
+      requestAbortRef.current = controller;
+
+      const tailForApi = nextMessages.slice(-20);
+      const anthropicMessages = tailForApi.map((m) => ({
         role: m.role,
         content: [{ type: 'text', text: m.content }] as any[],
       }));
@@ -1107,6 +1259,7 @@ export default function Sage() {
         headers: {
           'Content-Type': 'application/json',
         },
+        signal: controller.signal,
         body: JSON.stringify({
           model: 'claude-sonnet-4-5',
           max_tokens: 1024,
@@ -1118,19 +1271,14 @@ export default function Sage() {
       if (!response.ok) {
         const txt = await response.text();
         console.error('Sage receipt API error raw:', txt);
-        let message = `API error ${response.status}`;
-        try {
-          const errJson = JSON.parse(txt);
-          if (errJson.error?.message) message = errJson.error.message;
-        } catch {
-          if (txt) message = txt.slice(0, 200);
-        }
-        const withError = [
+        const withError: SageMessage[] = [
           ...nextMessages,
-          { role: 'assistant', content: message },
+          sageAssistantMessage(SAGE_API_USER_FRIENDLY_ERROR),
         ];
-        setMessages(withError);
-        await saveConversation(withError);
+        if (isMountedRef.current) {
+          setMessages(withError);
+          await saveConversation(withError);
+        }
         return;
       }
 
@@ -1147,23 +1295,30 @@ export default function Sage() {
         role: 'assistant',
         content: text || '[No response]',
       };
-      const updated = [...nextMessages, reply];
-      setMessages(updated);
-      await saveConversation(updated);
+      const updated: SageMessage[] = [...nextMessages, reply];
+      if (isMountedRef.current) {
+        setMessages(updated);
+        await saveConversation(updated);
+      }
     } catch (e) {
+      const isAbort =
+        (e instanceof Error && (e.name === 'AbortError' || e.message.includes('aborted'))) ||
+        String(e).toLowerCase().includes('abort');
+      if (isAbort) {
+        return;
+      }
       console.error('Sage receipt import error:', e);
-      const msg =
-        e instanceof Error
-          ? e.message
-          : 'Unexpected error while processing your receipt.';
-      const withError = [
-        ...messages,
-        { role: 'assistant', content: msg },
+      const withError: SageMessage[] = [
+        ...nextMessages,
+        sageAssistantMessage(SAGE_API_USER_FRIENDLY_ERROR),
       ];
-      setMessages(withError);
-      await saveConversation(withError);
+      if (isMountedRef.current) {
+        setMessages(withError);
+        await saveConversation(withError);
+      }
     } finally {
-      setSendingReceipt(false);
+      if (requestAbortRef.current) requestAbortRef.current = null;
+      if (isMountedRef.current) setSendingReceipt(false);
     }
   };
 
@@ -1171,13 +1326,11 @@ export default function Sage() {
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
       if (status !== 'granted') {
-        const withError = [
+        const withError: SageMessage[] = [
           ...messages,
-          {
-            role: 'assistant',
-            content:
-              'I need camera permission to take a photo of your receipt. Please enable it in system settings.',
-          },
+          sageAssistantMessage(
+            'I need camera permission to take a photo of your receipt. Please enable it in system settings.',
+          ),
         ];
         setMessages(withError);
         await saveConversation(withError);
@@ -1193,13 +1346,11 @@ export default function Sage() {
       await processReceiptImage(compressedBase64);
     } catch (e) {
       console.error('Sage camera error:', e);
-      const withError = [
+      const withError: SageMessage[] = [
         ...messages,
-        {
-          role: 'assistant',
-          content:
-            e instanceof Error ? e.message : 'Could not open camera or read photo.',
-        },
+        sageAssistantMessage(
+          e instanceof Error ? e.message : 'Could not open camera or read photo.',
+        ),
       ];
       setMessages(withError);
       await saveConversation(withError);
@@ -1211,13 +1362,11 @@ export default function Sage() {
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== 'granted') {
-        const withError = [
+        const withError: SageMessage[] = [
           ...messages,
-          {
-            role: 'assistant',
-            content:
-              'I need photo library permission to read your receipt. Please enable it in system settings.',
-          },
+          sageAssistantMessage(
+            'I need photo library permission to read your receipt. Please enable it in system settings.',
+          ),
         ];
         setMessages(withError);
         await saveConversation(withError);
@@ -1233,13 +1382,11 @@ export default function Sage() {
       await processReceiptImage(compressedBase64);
     } catch (e) {
       console.error('Sage library picker error:', e);
-      const withError = [
+      const withError: SageMessage[] = [
         ...messages,
-        {
-          role: 'assistant',
-          content:
-            e instanceof Error ? e.message : 'Could not read image from library.',
-        },
+        sageAssistantMessage(
+          e instanceof Error ? e.message : 'Could not read image from library.',
+        ),
       ];
       setMessages(withError);
       await saveConversation(withError);
@@ -1662,8 +1809,16 @@ export default function Sage() {
               placeholder="Message..."
               placeholderTextColor={theme.textSecondary || theme.text}
               value={input}
-              onChangeText={setInput}
+              onChangeText={(text) => {
+                inputRef.current = text;
+                setInput(text);
+              }}
               multiline
+              returnKeyType="send"
+              submitBehavior="submit"
+              onSubmitEditing={() => {
+                void sendMessage();
+              }}
             />
             <TouchableOpacity
               style={[styles.micButton, isRecording && styles.micButtonRecording]}
@@ -1696,7 +1851,7 @@ export default function Sage() {
                 { backgroundColor: theme.buttonBackground },
               ]}
               onPress={sendMessage}
-              disabled={loading || !input.trim()}
+              disabled={loading || (!input.trim() && !isRecording)}
             >
               {loading ? (
                 <ActivityIndicator color={theme.buttonText} size="small" />

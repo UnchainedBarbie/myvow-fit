@@ -10,20 +10,26 @@ import { useProfile } from '../context/ProfileContext';
 
 const SAGE = '#7C9A7E';
 
+export function openProfileAccountAlert(opts: {
+  openProfileModal: () => void;
+  navigateToSettings: () => void;
+}) {
+  Alert.alert('Profile', undefined, [
+    { text: 'Edit Profile', onPress: opts.openProfileModal },
+    { text: 'Settings', onPress: opts.navigateToSettings },
+    { text: 'Cancel', style: 'cancel' },
+  ]);
+}
+
 export default function HeaderAvatar() {
   const navigation = useNavigation<any>();
   const { profilePhotoUri, openProfileModal } = useProfile();
 
   const onPress = () => {
-    Alert.alert(
-      'Profile',
-      undefined,
-      [
-        { text: 'Edit Profile', onPress: openProfileModal },
-        { text: 'Settings', onPress: () => navigation.navigate('Settings') },
-        { text: 'Cancel', style: 'cancel' },
-      ]
-    );
+    openProfileAccountAlert({
+      openProfileModal,
+      navigateToSettings: () => navigation.navigate('Settings'),
+    });
   };
 
   return (

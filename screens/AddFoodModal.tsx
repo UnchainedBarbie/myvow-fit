@@ -1,6 +1,6 @@
 /**
- * Add Food modal: Search (Open Food Facts) + Favorites.
- * Barcode icon is inside the search bar. Title and content respect safe area.
+ * Add Food modal: Search (USDA FoodData Central) + Favorites.
+ * Barcode uses Open Food Facts. Title and content respect safe area.
  */
 import React, { useState, useEffect, useCallback } from 'react';
 import {
@@ -13,6 +13,7 @@ import {
   ScrollView,
   ActivityIndicator,
   Alert,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../context/ThemeContext';
@@ -20,11 +21,17 @@ import { useSQLiteContext } from 'expo-sqlite';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { initNutritionDb } from '../utils/nutritionDb';
+import { getRelevantUnits, pickDefaultUnitForFood, isPieceServingUnit } from '../utils/getRelevantUnits';
 
 const SAGE = '#7C9A7E';
 
-/** Units suitable for general food (e.g. fruit, packaged) when adding from search. */
-const UNITS = ['g', 'oz', 'serving', 'cup'] as const;
+const NO_RESULTS_MESSAGE =
+  'No results found. Try a different search or scan the barcode.';
+
+const FOOD_SEARCH_TIMEOUT_MS = 15000;
+const SEARCH_SLOW_OR_UNAVAILABLE_MESSAGE =
+  'Search is taking too long — try a more specific search term or scan the barcode.';
+
 const MEAL_OPTIONS = ['Breakfast', 'Snack', 'Lunch', 'Dinner'] as const;
 
 /** Grams per unit (for volume we approximate as weight). */
@@ -32,12 +39,14 @@ function gramsPerUnit(unit: string): number {
   switch (unit) {
     case 'g': return 1;
     case 'oz': return 28.35;
+    case 'fl oz': return 29.5735;
     case 'serving': return 100;
     case 'cup': return 240;
     case 'tbsp': return 15;
     case 'tsp': return 5;
     case 'ml': return 1;
     case 'lb': return 453.59;
+    case 'slice': return 28;
     default: return 100;
   }
 }
@@ -68,6 +77,12 @@ export type FoodResult = {
   fat: number;
   serving_size?: string | null;
   source?: 'off' | 'usda';
+  /** Barcode + OFF: calories/macros are for one API serving (not per 100g). */
+  macrosArePerServing?: boolean;
+  /** Per-100g nutriments when present (barcode: used if user switches unit off “serving”). */
+  per100g?: { calories: number; protein: number; carbs: number; fat: number };
+  /** Barcode, per-100g-only path: default unit when quantity defaults to 100. */
+  defaultBarcodeMassUnit?: 'g' | 'ml';
 };
 
 /** Favorite from DB (same table as Profile uses). */
@@ -94,41 +109,353 @@ export type AddFoodModalProps = {
   onFoodAdded?: () => void;
 };
 
-function normalizeOffProduct(p: any): FoodResult {
-  const nut = p.nutriments || {};
-  const energyKcal = nut['energy-kcal_100g'] ?? nut.energy_100g ?? 0;
+function numNut(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function extractPer100gFromNutriments(nut: Record<string, unknown>): {
+  calories: number;
+  protein: number;
+  carbs: number;
+  fat: number;
+} {
+  const kcal = numNut(nut['energy-kcal_100g'] ?? nut.energy_100g);
   return {
-    code: p.code || '',
+    calories: Math.round(kcal),
+    protein: Math.round(numNut(nut.proteins_100g) * 10) / 10,
+    carbs: Math.round(numNut(nut.carbohydrates_100g) * 10) / 10,
+    fat: Math.round(numNut(nut.fat_100g) * 10) / 10,
+  };
+}
+
+function extractPerServingFromNutriments(nut: Record<string, unknown>): {
+  kcal: number;
+  protein: number;
+  carbs: number;
+  fat: number;
+} {
+  const kj = numNut(nut['energy-kj_serving']);
+  const kcal =
+    numNut(nut['energy-kcal_serving']) ||
+    (kj > 0 ? kj / 4.184 : 0) ||
+    numNut(nut.energy_serving);
+  return {
+    kcal,
+    protein: numNut(nut.proteins_serving),
+    carbs: numNut(nut.carbohydrates_serving),
+    fat: numNut(nut.fat_serving),
+  };
+}
+
+function servingNutrientsMeaningful(s: ReturnType<typeof extractPerServingFromNutriments>): boolean {
+  return s.kcal > 0 || s.protein > 0 || s.carbs > 0 || s.fat > 0;
+}
+
+function productHasServingSizeDefined(p: { serving_size?: unknown; serving_quantity?: unknown }): boolean {
+  if (String(p.serving_size ?? '').trim()) return true;
+  const sq = p.serving_quantity;
+  if (sq == null || sq === '') return false;
+  const n = Number(sq);
+  return Number.isFinite(n) && n > 0;
+}
+
+/** Default mass unit for barcode products that only have per-100g data. */
+function inferDefaultMassUnitForBarcode(p: {
+  serving_size?: unknown;
+  nutrition_data_per?: unknown;
+  categories_tags?: unknown;
+}): 'g' | 'ml' {
+  const ss = String(p.serving_size ?? '').toLowerCase();
+  if (/\bml\b|\bcl\b/.test(ss)) return 'ml';
+  const ndp = String(p.nutrition_data_per ?? '').toLowerCase();
+  if (ndp.includes('ml')) return 'ml';
+  const tags = Array.isArray(p.categories_tags)
+    ? p.categories_tags.join(' ').toLowerCase()
+    : '';
+  if (
+    /en:beverages|en:waters|en:soft-drinks|en:alcoholic-beverages|en:beers|en:wines|en:plant-milks|en:dairy-drinks|en:juices/.test(
+      tags,
+    )
+  ) {
+    return 'ml';
+  }
+  return 'g';
+}
+
+/** USDA FoodData Central nutrient ids (search response). */
+const USDA_NUTRIENT_ENERGY_KCAL = 1008;
+const USDA_NUTRIENT_PROTEIN = 1003;
+const USDA_NUTRIENT_CARBS = 1005;
+const USDA_NUTRIENT_FAT = 1004;
+
+function usdaNutrientValue(
+  foodNutrients: unknown,
+  nutrientId: number,
+): number {
+  if (!Array.isArray(foodNutrients)) return 0;
+  for (const n of foodNutrients) {
+    if (!n || typeof n !== 'object') continue;
+    const row = n as Record<string, unknown>;
+    const id = Number(row.nutrientId ?? (row.nutrient as Record<string, unknown> | undefined)?.id);
+    if (id === nutrientId) {
+      return numNut(row.value ?? row.amount);
+    }
+  }
+  return 0;
+}
+
+function usdaEnergyKcalFromNutrients(foodNutrients: unknown): number {
+  let kcal = usdaNutrientValue(foodNutrients, USDA_NUTRIENT_ENERGY_KCAL);
+  if (kcal > 0) return kcal;
+  if (!Array.isArray(foodNutrients)) return 0;
+  for (const n of foodNutrients) {
+    if (!n || typeof n !== 'object') continue;
+    const row = n as Record<string, unknown>;
+    const name = String(
+      row.nutrientName ?? (row.nutrient as Record<string, unknown> | undefined)?.name ?? '',
+    ).toLowerCase();
+    const unit = String(
+      row.unitName ?? (row.nutrient as Record<string, unknown> | undefined)?.unitName ?? '',
+    ).toUpperCase();
+    if (name === 'energy' && unit === 'KJ') {
+      return Math.round(numNut(row.value ?? row.amount) / 4.184);
+    }
+  }
+  return 0;
+}
+
+function formatUsdaServingSize(food: Record<string, unknown>): string | null {
+  const size = food.servingSize;
+  const unitRaw = food.servingSizeUnit;
+  if (size == null || size === '') return null;
+  const unit = String(unitRaw ?? '').trim();
+  if (!unit) return String(size).trim();
+  return `${String(size).trim()} ${unit}`.trim();
+}
+
+/** SR Legacy search hits often lack servingSize; use 100g equivalent with g or ml default. */
+function inferUsdaSrDefaultMassUnit(food: Record<string, unknown>): 'g' | 'ml' {
+  const cat = String(food.foodCategory || '').toLowerCase();
+  if (
+    /beverage|beverages|juice|drinks|soda|water|coffee|tea|wine|beer|alcoholic/.test(
+      cat,
+    )
+  ) {
+    return 'ml';
+  }
+  return 'g';
+}
+
+/**
+ * Map USDA `/foods/search` item to FoodResult.
+ * Branded items with servingSize use per-serving nutrient values; SR Legacy (no serving) uses per 100g.
+ */
+function normalizeUsdaSearchFood(food: Record<string, unknown>): FoodResult | null {
+  const fdcId = food.fdcId;
+  if (fdcId == null) return null;
+
+  const nutrients = food.foodNutrients;
+  const calories = usdaEnergyKcalFromNutrients(nutrients);
+  const protein = usdaNutrientValue(nutrients, USDA_NUTRIENT_PROTEIN);
+  const carbs = usdaNutrientValue(nutrients, USDA_NUTRIENT_CARBS);
+  const fat = usdaNutrientValue(nutrients, USDA_NUTRIENT_FAT);
+
+  const description = String(food.description || '').trim() || 'Unknown';
+  const owner = String(food.brandOwner || '').trim();
+  const bname = String(food.brandName || '').trim();
+  const brand = owner || bname || null;
+
+  const servingSizeNum = numNut(food.servingSize);
+  const unitStr = String(food.servingSizeUnit || '').trim();
+  const hasServing = servingSizeNum > 0 && unitStr.length > 0;
+  const serving_size = formatUsdaServingSize(food);
+
+  const base: FoodResult = {
+    code: String(fdcId),
+    food_name: description,
+    brand,
+    calories: Math.round(calories),
+    protein: Math.round(protein * 10) / 10,
+    carbs: Math.round(carbs * 10) / 10,
+    fat: Math.round(fat * 10) / 10,
+    serving_size,
+    source: 'usda',
+  };
+
+  if (hasServing) {
+    return {
+      ...base,
+      macrosArePerServing: true,
+    };
+  }
+
+  const per100g = {
+    calories: Math.round(calories),
+    protein: Math.round(protein * 10) / 10,
+    carbs: Math.round(carbs * 10) / 10,
+    fat: Math.round(fat * 10) / 10,
+  };
+
+  return {
+    ...base,
+    macrosArePerServing: false,
+    per100g,
+    defaultBarcodeMassUnit: inferUsdaSrDefaultMassUnit(food),
+  };
+}
+
+/**
+ * Barcode / full product JSON: prefer per-serving nutriments as returned by OFF.
+ * If there are no serving-level nutrients, use per-100g only and default UI to 100 g or 100 ml.
+ */
+function normalizeOffProductFromBarcode(p: any): FoodResult {
+  const nut = (p.nutriments || {}) as Record<string, unknown>;
+  const per100 = extractPer100gFromNutriments(nut);
+  const perSrv = extractPerServingFromNutriments(nut);
+  const hasServingSize = productHasServingSizeDefined(p);
+  const hasServingN = servingNutrientsMeaningful(perSrv);
+
+  const base: FoodResult = {
+    code: String(p.code || ''),
     food_name: p.product_name || p.food_name || 'Unknown',
     brand: p.brands || p.brand || null,
-    calories: Math.round(Number(energyKcal) || 0),
-    protein: Math.round(Number(nut.proteins_100g) || 0),
-    carbs: Math.round(Number(nut.carbohydrates_100g) || 0),
-    fat: Math.round(Number(nut.fat_100g) || 0),
     serving_size: p.serving_size || null,
     source: 'off',
+    calories: 0,
+    protein: 0,
+    carbs: 0,
+    fat: 0,
   };
+
+  if (hasServingN) {
+    return {
+      ...base,
+      calories: Math.round(perSrv.kcal),
+      protein: Math.round(perSrv.protein * 10) / 10,
+      carbs: Math.round(perSrv.carbs * 10) / 10,
+      fat: Math.round(perSrv.fat * 10) / 10,
+      macrosArePerServing: true,
+      per100g:
+        per100.calories > 0 || per100.protein > 0 || per100.carbs > 0 || per100.fat > 0
+          ? per100
+          : undefined,
+    };
+  }
+
+  return {
+    ...base,
+    calories: per100.calories,
+    protein: per100.protein,
+    carbs: per100.carbs,
+    fat: per100.fat,
+    macrosArePerServing: false,
+    per100g: per100,
+    defaultBarcodeMassUnit: !hasServingSize
+      ? inferDefaultMassUnitForBarcode(p)
+      : undefined,
+  };
+}
+
+/** Non-empty package serving description (e.g. "6 oz", "1 cup"). */
+function trimmedServingSize(food: { serving_size?: string | null }): string {
+  return String(food.serving_size ?? '').trim();
+}
+
+/**
+ * Use quantity=1, unit=serving, and store base `serving_size` on save.
+ * Search/barcode: per-serving macros from API. Favorites: macros are per saved serving when `serving_size` is set.
+ */
+function useServingPortionDefaults(food: FoodResult | FavoriteFoodItem): boolean {
+  if (!trimmedServingSize(food)) return false;
+  if ('macrosArePerServing' in food && food.macrosArePerServing === true) return true;
+  if ('favorite_id' in food) return true;
+  return false;
+}
+
+function applyQuantityDefaultsForSelectedFood(food: FoodResult | FavoriteFoodItem) {
+  if (useServingPortionDefaults(food)) {
+    return { qty: '1', unit: 'serving' as const };
+  }
+  if ('macrosArePerServing' in food && food.macrosArePerServing) {
+    return { qty: '1', unit: 'serving' as const };
+  }
+  if ('defaultBarcodeMassUnit' in food && food.defaultBarcodeMassUnit) {
+    return { qty: '100', unit: food.defaultBarcodeMassUnit };
+  }
+  return { qty: '1', unit: 'serving' as const };
+}
+
+/** Live + log totals from selected food, quantity, and unit. */
+function macrosForQuantity(
+  food: FoodResult | FavoriteFoodItem,
+  quantity: number,
+  unit: string,
+): { calories: number; protein: number; carbs: number; fat: number } {
+  const q = quantity > 0 ? quantity : 1;
+
+  if (
+    'favorite_id' in food &&
+    trimmedServingSize(food) &&
+    (unit === 'serving' || isPieceServingUnit(unit))
+  ) {
+    return {
+      calories: Math.round(food.calories * q),
+      protein: Math.round(food.protein * q * 10) / 10,
+      carbs: Math.round(food.carbs * q * 10) / 10,
+      fat: Math.round(food.fat * q * 10) / 10,
+    };
+  }
+
+  if ('macrosArePerServing' in food && food.macrosArePerServing === true) {
+    if (unit === 'serving' || isPieceServingUnit(unit)) {
+      return {
+        calories: Math.round(food.calories * q),
+        protein: Math.round(food.protein * q * 10) / 10,
+        carbs: Math.round(food.carbs * q * 10) / 10,
+        fat: Math.round(food.fat * q * 10) / 10,
+      };
+    }
+    const fr = food as FoodResult;
+    const p100 = fr.per100g;
+    if (
+      p100 &&
+      (p100.calories > 0 || p100.protein > 0 || p100.carbs > 0 || p100.fat > 0)
+    ) {
+      return computedMacros(p100, q, unit);
+    }
+    return {
+      calories: Math.round(food.calories * q),
+      protein: Math.round(food.protein * q * 10) / 10,
+      carbs: Math.round(food.carbs * q * 10) / 10,
+      fat: Math.round(food.fat * q * 10) / 10,
+    };
+  }
+
+  if (isPieceServingUnit(unit)) {
+    return {
+      calories: Math.round(food.calories * q),
+      protein: Math.round(food.protein * q * 10) / 10,
+      carbs: Math.round(food.carbs * q * 10) / 10,
+      fat: Math.round(food.fat * q * 10) / 10,
+    };
+  }
+
+  return computedMacros(
+    {
+      calories: food.calories,
+      protein: food.protein,
+      carbs: food.carbs,
+      fat: food.fat,
+    },
+    q,
+    unit,
+  );
 }
 
 function nutrientValueByNumber(nutrients: any[], nutrientNumber: string): number {
   const match = (nutrients || []).find((n: any) => String(n?.nutrientNumber ?? '') === nutrientNumber);
   return Number(match?.value) || 0;
-}
-
-function normalizeUsdaFood(f: any): FoodResult {
-  const nutrients = f?.foodNutrients || [];
-  const servingSize = f?.servingSize ? `${f.servingSize}${f?.servingSizeUnit ? ` ${f.servingSizeUnit}` : ''}` : null;
-  return {
-    code: String(f?.fdcId ?? ''),
-    food_name: f?.description || 'Unknown',
-    brand: f?.brandOwner || f?.brandName || null,
-    calories: Math.round(nutrientValueByNumber(nutrients, '208')),
-    protein: Math.round(nutrientValueByNumber(nutrients, '203') * 10) / 10,
-    carbs: Math.round(nutrientValueByNumber(nutrients, '205') * 10) / 10,
-    fat: Math.round(nutrientValueByNumber(nutrients, '204') * 10) / 10,
-    serving_size: servingSize,
-    source: 'usda',
-  };
 }
 
 export default function AddFoodModal({
@@ -144,14 +471,24 @@ export default function AddFoodModal({
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<FoodResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [favoriteFoods, setFavoriteFoods] = useState<FavoriteFoodItem[]>([]);
   const [showQuantityModal, setShowQuantityModal] = useState(false);
   const [selectedFood, setSelectedFood] = useState<FoodResult | FavoriteFoodItem | null>(null);
   const [favoritedSignatures, setFavoritedSignatures] = useState<Set<string>>(new Set());
   const [qtyValue, setQtyValue] = useState('1');
   const [qtyUnit, setQtyUnit] = useState<string>('serving');
+  const [qtyRelevantUnits, setQtyRelevantUnits] = useState<string[]>(() => getRelevantUnits('', null));
   const [qtyMealType, setQtyMealType] = useState<string>('Breakfast');
   const [unitDropdownOpen, setUnitDropdownOpen] = useState(false);
+
+  const syncQuantityModalFromFood = useCallback((food: FoodResult | FavoriteFoodItem) => {
+    const ss = trimmedServingSize(food) || null;
+    setQtyRelevantUnits(getRelevantUnits(food.food_name, ss));
+    const def = applyQuantityDefaultsForSelectedFood(food);
+    setQtyValue(def.qty);
+    setQtyUnit(pickDefaultUnitForFood(food.food_name, ss, def.unit));
+  }, []);
   const [barcodeScannerVisible, setBarcodeScannerVisible] = useState(false);
   const [barcodeLoading, setBarcodeLoading] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -210,8 +547,8 @@ export default function AddFoodModal({
         setFavoriteFoods((prev) => prev.filter((f) => favoriteSignature(f.food_name, f.brand) !== sig));
       } else {
         await db.runAsync(
-          'INSERT INTO FavoriteFoods (food_name, brand, calories, protein, carbs, fat) VALUES (?, ?, ?, ?, ?, ?)',
-          [item.food_name, item.brand, item.calories, item.protein, item.carbs, item.fat]
+          'INSERT INTO FavoriteFoods (food_name, brand, serving_size, calories, protein, carbs, fat) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [item.food_name, item.brand, trimmedServingSize(item) || null, item.calories, item.protein, item.carbs, item.fat]
         );
         setFavoritedSignatures((prev) => new Set([...prev, sig]));
         const rows = await db.getAllAsync<{ favorite_id: number; food_name: string; brand: string | null; serving_size: string | null; calories: number; protein: number; carbs: number; fat: number }>(
@@ -263,10 +600,9 @@ export default function AddFoodModal({
         setBarcodeLoading(false);
         return;
       }
-      const food = normalizeOffProduct(product);
+      const food = normalizeOffProductFromBarcode(product);
       setSelectedFood(food);
-      setQtyValue('1');
-      setQtyUnit('serving');
+      syncQuantityModalFromFood(food);
       setQtyMealType(mealType.charAt(0).toUpperCase() + mealType.slice(1));
       setShowQuantityModal(true);
     } catch (e) {
@@ -276,28 +612,117 @@ export default function AddFoodModal({
   };
 
   const runSearch = async () => {
-    if (!searchQuery.trim()) return;
+    const trimmedQuery = searchQuery.trim();
+    if (!trimmedQuery) return;
     setSearching(true);
     setSearchResults([]);
+    setSearchError(null);
+    const q = encodeURIComponent(trimmedQuery);
+    const usdaUrl = `https://api.nal.usda.gov/fdc/v1/foods/search?query=${q}&api_key=${process.env.EXPO_PUBLIC_USDA_API_KEY}&pageSize=20&dataType=Branded,SR%20Legacy`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FOOD_SEARCH_TIMEOUT_MS);
+    const signal = controller.signal;
+
+    const parseAndHandleResponse = (
+      res: Response,
+      responseText: string,
+      url: string,
+    ): { ok: true; data: any } | { ok: false } => {
+      if (res.status === 503) {
+        setSearchError(SEARCH_SLOW_OR_UNAVAILABLE_MESSAGE);
+        setSearchResults([]);
+        return { ok: false };
+      }
+
+      let data: any;
+      try {
+        data = responseText ? JSON.parse(responseText) : null;
+      } catch (parseErr) {
+        console.error('[AddFoodModal] USDA search: invalid JSON', {
+          url,
+          status: res.status,
+          statusText: res.statusText,
+          responseText,
+          parseErr,
+        });
+        setSearchError(
+          `Search returned an invalid response (HTTP ${res.status}).`,
+        );
+        setSearchResults([]);
+        return { ok: false };
+      }
+
+      if (!res.ok) {
+        console.error('[AddFoodModal] USDA search: HTTP error', {
+          url,
+          status: res.status,
+          statusText: res.statusText,
+          response: data,
+          responseText,
+        });
+        setSearchError(`Search failed (HTTP ${res.status}).`);
+        setSearchResults([]);
+        return { ok: false };
+      }
+
+      return { ok: true, data };
+    };
+
     try {
-      const q = encodeURIComponent(searchQuery.trim());
-      const res = await fetch(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${q}&search_simple=1&action=process&json=1&page_size=20`);
-      const data = await res.json();
-      const products = (data.products || []).filter((p: any) => p.code);
-      const normalizedOff = products.map(normalizeOffProduct);
-      if (normalizedOff.length > 0) {
-        setSearchResults(normalizedOff);
+      const res = await fetch(usdaUrl, { signal });
+      const responseText = await res.text();
+      const parsed = parseAndHandleResponse(res, responseText, usdaUrl);
+      if (!parsed.ok) {
+        return;
+      }
+
+      const rawFoods = Array.isArray(parsed.data?.foods) ? parsed.data.foods : [];
+      const normalized = rawFoods
+        .map((row: Record<string, unknown>) => normalizeUsdaSearchFood(row))
+        .filter((f): f is FoodResult => f != null);
+
+      if (normalized.length > 0) {
+        setSearchResults(normalized);
       } else {
-        const usdaRes = await fetch(`https://api.nal.usda.gov/fdc/v1/foods/search?query=${q}&api_key=DEMO_KEY&pageSize=10`);
-        const usdaData = await usdaRes.json();
-        const usdaFoods = (usdaData?.foods || []).map(normalizeUsdaFood);
-        setSearchResults(usdaFoods);
+        console.error('[AddFoodModal] USDA search: no foods in response', {
+          url: usdaUrl,
+          response: parsed.data,
+        });
+        setSearchResults([]);
       }
     } catch (e) {
+      const isAbort =
+        (e instanceof Error && e.name === 'AbortError') ||
+        (typeof DOMException !== 'undefined' &&
+          e instanceof DOMException &&
+          e.name === 'AbortError');
+      console.error('[AddFoodModal] USDA search: fetch failed', {
+        url: usdaUrl,
+        error: e,
+        aborted: isAbort,
+      });
+      if (isAbort) {
+        setSearchError(SEARCH_SLOW_OR_UNAVAILABLE_MESSAGE);
+      } else {
+        setSearchError(
+          'Search request failed. Check your connection and try again.',
+        );
+      }
       setSearchResults([]);
+    } finally {
+      clearTimeout(timeoutId);
+      setSearching(false);
     }
-    setSearching(false);
   };
+
+  const clearSearch = useCallback(() => {
+    setSearchQuery('');
+    setSearchResults([]);
+    setSearchError(null);
+    setSearching(false);
+    setShowManualForm(false);
+  }, []);
 
   const resetManualForm = () => {
     setShowManualForm(false);
@@ -313,19 +738,26 @@ export default function AddFoodModal({
   const handleAddToLog = async () => {
     if (!selectedFood) return;
     const quantity = parseFloat(qtyValue) || 1;
-    const { calories: computedCals, protein: computedProtein, carbs: computedCarbs, fat: computedFat } = computedMacros(
-      { calories: selectedFood.calories, protein: selectedFood.protein, carbs: selectedFood.carbs, fat: selectedFood.fat },
-      quantity,
-      qtyUnit
-    );
+    const {
+      calories: computedCals,
+      protein: computedProtein,
+      carbs: computedCarbs,
+      fat: computedFat,
+    } = macrosForQuantity(selectedFood, quantity, qtyUnit);
     const today = selectedDate || new Date().toISOString().split('T')[0];
+    const baseServing = trimmedServingSize(selectedFood);
+    const servingSizeForDb =
+      qtyUnit === 'serving'
+        ? baseServing || 'serving'
+        : qtyUnit;
     try {
+      await initNutritionDb(db);
       await db.runAsync('INSERT OR IGNORE INTO DailyLog (log_date) VALUES (?)', [today]);
       const logRow = await db.getFirstAsync<{ log_id: number }>('SELECT log_id FROM DailyLog WHERE log_date = ?', [today]);
       if (!logRow) throw new Error('DailyLog row not found');
       await db.runAsync(
         `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type, serving_size, quantity, calories, protein, carbs, fat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [logRow.log_id, selectedFood.food_name, selectedFood.brand, qtyMealType.toLowerCase(), qtyUnit, quantity, computedCals, computedProtein, computedCarbs, computedFat]
+        [logRow.log_id, selectedFood.food_name, selectedFood.brand, qtyMealType.toLowerCase(), servingSizeForDb, quantity, computedCals, computedProtein, computedCarbs, computedFat]
       );
       setShowQuantityModal(false);
       setSelectedFood(null);
@@ -352,6 +784,7 @@ export default function AddFoodModal({
     const servingSize = manualServingSize.trim() || 'serving';
     const today = selectedDate || new Date().toISOString().split('T')[0];
     try {
+      await initNutritionDb(db);
       await db.runAsync('INSERT OR IGNORE INTO DailyLog (log_date) VALUES (?)', [today]);
       const logRow = await db.getFirstAsync<{ log_id: number }>('SELECT log_id FROM DailyLog WHERE log_date = ?', [today]);
       if (!logRow) throw new Error('DailyLog row not found');
@@ -415,14 +848,31 @@ export default function AddFoodModal({
               {/* Search bar with barcode icon inside (right side) */}
               <View style={[styles.searchRow, { backgroundColor: theme.card, borderColor: theme.border }]}>
                 <TextInput
-                  style={[styles.searchInput, { color: theme.text }]}
-                  placeholder="Search Open Food Facts"
+                  style={[
+                    styles.searchInput,
+                    searchQuery.trim().length > 0 && styles.searchInputWithClear,
+                    { color: theme.text },
+                  ]}
+                  placeholder="Search foods"
                   placeholderTextColor="#888"
                   value={searchQuery}
-                  onChangeText={setSearchQuery}
+                  onChangeText={(t) => {
+                    setSearchQuery(t);
+                    setSearchError(null);
+                  }}
                   onSubmitEditing={runSearch}
                   returnKeyType="search"
                 />
+                {searchQuery.trim().length > 0 ? (
+                  <TouchableOpacity
+                    onPress={clearSearch}
+                    style={styles.clearSearchBtn}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    accessibilityLabel="Clear search"
+                  >
+                    <Ionicons name="close-circle" size={18} color="#9AA0A6" />
+                  </TouchableOpacity>
+                ) : null}
                 <TouchableOpacity onPress={openScanner} style={styles.barcodeBtn}>
                   <Ionicons name="barcode-outline" size={24} color={SAGE} />
                 </TouchableOpacity>
@@ -431,6 +881,16 @@ export default function AddFoodModal({
                 <Text style={styles.searchSubmitText}>Search</Text>
               </TouchableOpacity>
               {searching && <ActivityIndicator size="small" color={SAGE} style={styles.searchSpinner} />}
+              {searchError != null && searchError !== '' && (
+                <View
+                  style={[
+                    styles.searchErrorBanner,
+                    { backgroundColor: theme.card, borderColor: '#C62828' },
+                  ]}
+                >
+                  <Text style={styles.searchErrorText}>{searchError}</Text>
+                </View>
+              )}
               <ScrollView style={styles.searchResultsScroll} showsVerticalScrollIndicator={false}>
                 {searchResults.map((item) => (
                   <View key={item.code} style={[styles.foodRow, { backgroundColor: theme.card, borderColor: theme.border }]}>
@@ -439,19 +899,13 @@ export default function AddFoodModal({
                       activeOpacity={0.6}
                       onPress={() => {
                         setSelectedFood(item);
-                        setQtyValue('1');
-                        setQtyUnit('serving');
+                        syncQuantityModalFromFood(item);
                         setQtyMealType(mealType.charAt(0).toUpperCase() + mealType.slice(1));
                         setShowQuantityModal(true);
                       }}
                     >
                       <View style={styles.foodNameRow}>
                         <Text style={[styles.foodName, { color: theme.text }]}>{item.food_name}</Text>
-                        {item.source === 'usda' && (
-                          <View style={styles.usdaPill}>
-                            <Text style={styles.usdaPillText}>USDA</Text>
-                          </View>
-                        )}
                       </View>
                       <Text style={[styles.foodBrand, { color: theme.textSecondary }]}>{item.brand}</Text>
                       <Text style={[styles.foodMacros, { color: theme.textSecondary }]}>
@@ -474,9 +928,12 @@ export default function AddFoodModal({
                     </TouchableOpacity>
                   </View>
                 ))}
-                {!searching && searchQuery.trim() && searchResults.length === 0 && (
+                {!searching &&
+                  !searchError &&
+                  searchQuery.trim() &&
+                  searchResults.length === 0 && (
                   <View>
-                    <Text style={[styles.emptyText, { color: theme.textSecondary }]}>No results. Try another search or scan barcode.</Text>
+                    <Text style={[styles.emptyText, { color: theme.textSecondary }]}>{NO_RESULTS_MESSAGE}</Text>
                     <TouchableOpacity
                       style={[styles.searchSubmitBtn, { backgroundColor: theme.card, borderColor: theme.border, borderWidth: 1 }]}
                       onPress={() => setShowManualForm((v) => !v)}
@@ -487,6 +944,20 @@ export default function AddFoodModal({
                 )}
                 {showManualForm && (
                   <View style={[styles.manualFormCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                    <View style={[styles.quantityModalActions, styles.quantityModalActionsTop]}>
+                      <TouchableOpacity
+                        style={[styles.quantityBtn, { backgroundColor: theme.background }]}
+                        onPress={resetManualForm}
+                      >
+                        <Text style={[styles.quantityBtnText, { color: theme.text }]}>Cancel</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.quantityBtn, { backgroundColor: SAGE }]}
+                        onPress={handleAddManualToLog}
+                      >
+                        <Text style={styles.quantityBtnText}>Add to Log</Text>
+                      </TouchableOpacity>
+                    </View>
                     <Text style={[styles.quantityModalLabel, { color: theme.text, marginTop: 0 }]}>Food name</Text>
                     <TextInput
                       style={[styles.quantityInput, { backgroundColor: theme.background, color: theme.text, borderColor: theme.border }]}
@@ -547,20 +1018,6 @@ export default function AddFoodModal({
                       placeholder="0"
                       placeholderTextColor="#888"
                     />
-                    <View style={styles.quantityModalActions}>
-                      <TouchableOpacity
-                        style={[styles.quantityBtn, { backgroundColor: theme.background }]}
-                        onPress={resetManualForm}
-                      >
-                        <Text style={[styles.quantityBtnText, { color: theme.text }]}>Cancel</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={[styles.quantityBtn, { backgroundColor: SAGE }]}
-                        onPress={handleAddManualToLog}
-                      >
-                        <Text style={styles.quantityBtnText}>Add to Log</Text>
-                      </TouchableOpacity>
-                    </View>
                   </View>
                 )}
               </ScrollView>
@@ -580,8 +1037,7 @@ export default function AddFoodModal({
                         activeOpacity={0.6}
                         onPress={() => {
                           setSelectedFood(item);
-                          setQtyValue('1');
-                          setQtyUnit('serving');
+                          syncQuantityModalFromFood(item);
                           setQtyMealType(mealType.charAt(0).toUpperCase() + mealType.slice(1));
                           setShowQuantityModal(true);
                         }}
@@ -609,17 +1065,36 @@ export default function AddFoodModal({
           {/* QuantityModal — quantity, unit, live macros, meal selector, Add to Log */}
           {showQuantityModal && selectedFood && (() => {
             const quantity = parseFloat(qtyValue) || 0;
-            const live = computedMacros(
-              { calories: selectedFood.calories, protein: selectedFood.protein, carbs: selectedFood.carbs, fat: selectedFood.fat },
+            const live = macrosForQuantity(
+              selectedFood,
               quantity || 1,
-              qtyUnit
+              qtyUnit,
             );
             return (
               <View style={styles.quantityModalOverlay}>
+                <KeyboardAvoidingView behavior="padding">
                 <View style={[styles.quantityModalBox, { backgroundColor: theme.background }]}>
+                  <View style={[styles.quantityModalActions, styles.quantityModalActionsTop]}>
+                    <TouchableOpacity
+                      style={[styles.quantityBtn, { backgroundColor: theme.card }]}
+                      onPress={() => {
+                        setShowQuantityModal(false);
+                        setSelectedFood(null);
+                        setUnitDropdownOpen(false);
+                      }}
+                    >
+                      <Text style={[styles.quantityBtnText, { color: theme.text }]}>Cancel</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.quantityBtn, { backgroundColor: SAGE }]} onPress={handleAddToLog}>
+                      <Text style={styles.quantityBtnText}>Add to Log</Text>
+                    </TouchableOpacity>
+                  </View>
                   <Text style={[styles.quantityModalTitle, { color: theme.text }]}>{selectedFood.food_name}</Text>
-                  <Text style={[styles.quantityModalHint, { color: theme.textSecondary }]}>
-                    Per 100g: {selectedFood.calories} cal · P {selectedFood.protein}g · C {selectedFood.carbs}g · F {selectedFood.fat}g
+                  {!!selectedFood.brand && (
+                    <Text style={[styles.quantityModalBrand, { color: theme.textSecondary }]}>{selectedFood.brand}</Text>
+                  )}
+                  <Text style={[styles.quantityModalLive, { color: theme.text }]}>
+                    {live.calories} cal · P {live.protein}g · C {live.carbs}g · F {live.fat}g
                   </Text>
 
                   <Text style={[styles.quantityModalLabel, { color: theme.text }]}>Quantity</Text>
@@ -643,7 +1118,7 @@ export default function AddFoodModal({
                   {unitDropdownOpen && (
                     <View style={[styles.unitDropdownList, { backgroundColor: theme.card, borderColor: theme.border }]}>
                       <ScrollView style={styles.unitDropdownScroll} nestedScrollEnabled showsVerticalScrollIndicator={false}>
-                        {UNITS.map((u) => (
+                        {qtyRelevantUnits.map((u) => (
                           <TouchableOpacity
                             key={u}
                             style={[styles.unitDropdownOption, { backgroundColor: qtyUnit === u ? SAGE : 'transparent' }]}
@@ -668,24 +1143,11 @@ export default function AddFoodModal({
                       </TouchableOpacity>
                     ))}
                   </View>
-
-                  <Text style={[styles.quantityModalLabel, { color: theme.text }]}>Total</Text>
-                  <Text style={[styles.quantityModalLive, { color: theme.text }]}>
-                    {live.calories} cal · P {live.protein}g · C {live.carbs}g · F {live.fat}g
-                  </Text>
-
-                  <View style={styles.quantityModalActions}>
-                    <TouchableOpacity style={[styles.quantityBtn, { backgroundColor: theme.card }]} onPress={() => { setShowQuantityModal(false); setSelectedFood(null); setUnitDropdownOpen(false); }}>
-                      <Text style={[styles.quantityBtnText, { color: theme.text }]}>Cancel</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={[styles.quantityBtn, { backgroundColor: SAGE }]} onPress={handleAddToLog}>
-                      <Text style={styles.quantityBtnText}>Add to Log</Text>
-                    </TouchableOpacity>
-                  </View>
                 </View>
+                </KeyboardAvoidingView>
               </View>
             );
-          })(          )}
+          })()}
         </View>
       </View>
 
@@ -743,10 +1205,28 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   searchInput: { flex: 1, paddingVertical: 12, fontSize: 16 },
+  searchInputWithClear: { paddingRight: 8 },
+  clearSearchBtn: {
+    paddingHorizontal: 4,
+    paddingVertical: 4,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
   barcodeBtn: { padding: 8 },
   searchSubmitBtn: { paddingVertical: 12, borderRadius: 12, alignItems: 'center', marginBottom: 8 },
   searchSubmitText: { color: '#fff', fontWeight: '600' },
   searchSpinner: { marginVertical: 8 },
+  searchErrorBanner: {
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 10,
+  },
+  searchErrorText: {
+    color: '#C62828',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   searchResultsScroll: { flex: 1 },
   manualFormCard: {
     borderWidth: 1,
@@ -765,15 +1245,6 @@ const styles = StyleSheet.create({
   },
   foodName: { fontSize: 16, fontWeight: '600' },
   foodNameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
-  usdaPill: {
-    backgroundColor: '#EAF3EB',
-    borderColor: '#C8DFCC',
-    borderWidth: 1,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 8,
-  },
-  usdaPillText: { color: '#3E6B44', fontSize: 11, fontWeight: '700' },
   foodBrand: { fontSize: 13, marginTop: 4 },
   foodMacros: { fontSize: 12, marginTop: 2 },
   emptyText: { textAlign: 'center', paddingVertical: 24, fontSize: 14 },
@@ -786,7 +1257,8 @@ const styles = StyleSheet.create({
   },
   quantityModalBox: { borderRadius: 16, padding: 20, overflow: 'hidden', maxWidth: '100%' },
   quantityModalTitle: { fontSize: 18, fontWeight: '700', marginBottom: 8 },
-  quantityModalHint: { fontSize: 14, marginBottom: 12 },
+  quantityModalBrand: { fontSize: 14, marginBottom: 6 },
+  quantityModalServingLabel: { fontSize: 14, marginTop: 2, marginBottom: 8, fontWeight: '500' },
   quantityModalLabel: { fontSize: 14, fontWeight: '600', marginBottom: 6, marginTop: 8 },
   quantityInput: { borderWidth: 1, borderRadius: 10, paddingVertical: 10, paddingHorizontal: 12, fontSize: 16 },
   unitRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 4 },
@@ -799,8 +1271,9 @@ const styles = StyleSheet.create({
   unitDropdownScroll: { maxHeight: 156 },
   unitDropdownOption: { paddingVertical: 8, paddingHorizontal: 12 },
   unitDropdownOptionText: { fontSize: 15 },
-  quantityModalLive: { fontSize: 15, fontWeight: '600', marginTop: 4, marginBottom: 16 },
+  quantityModalLive: { fontSize: 15, fontWeight: '600', marginTop: 2, marginBottom: 14 },
   quantityModalActions: { flexDirection: 'row', gap: 12, justifyContent: 'flex-end' },
+  quantityModalActionsTop: { marginBottom: 12, marginTop: 0 },
   quantityBtn: { paddingVertical: 10, paddingHorizontal: 20, borderRadius: 10 },
   quantityBtnText: { color: '#fff', fontWeight: '600' },
   scannerFullScreen: { flex: 1, backgroundColor: '#000' },

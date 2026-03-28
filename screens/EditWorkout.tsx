@@ -16,8 +16,31 @@ import { useSQLiteContext } from 'expo-sqlite';
 import { useTheme } from '../context/ThemeContext';
 import { useTranslation } from 'react-i18next';
 import DraggableFlatList, { RenderItemParams } from 'react-native-draggable-flatlist';
+import { sortWorkoutPlanExercisesForDisplay } from '../utils/workoutDisplayUtils';
+import { initWorkoutDb } from '../utils/initWorkoutDb';
+import {
+  ensureCardioExerciseName,
+  formatCardioDistanceForDb,
+  isCardioExerciseInEditor,
+  parseStoredDistance,
+} from '../utils/cardioExerciseUtils';
+import { DEFAULT_REST_SECONDS_BETWEEN_SETS } from '../utils/startedWorkoutPreferenceUtils';
 
-type Exercise = { exercise_id: number; exercise_name: string; sets: number; reps: number; web_link: string | null; muscle_group: string | null; exercise_notes: string | null; rest_seconds: number | null };
+type Exercise = {
+  exercise_id: number;
+  exercise_name: string;
+  sets: number;
+  reps: number;
+  web_link: string | null;
+  muscle_group: string | null;
+  exercise_notes: string | null;
+  rest_seconds: number | null;
+  duration_minutes?: number | null;
+  cardio_distance?: string | null;
+  exercise_type?: string | null;
+  _cardioDistValue?: string;
+  _cardioDistUnit?: 'km' | 'mi';
+};
 type Day = { day_id: number; day_name: string; exercises: Exercise[] };
 
 export default function EditWorkout() {
@@ -30,9 +53,11 @@ export default function EditWorkout() {
   const { workout_id } = route.params as { workout_id: number };
 
   const [workoutName, setWorkoutName] = useState('');
+  const [workoutType, setWorkoutType] = useState<'strength' | 'cardio'>('strength');
   const [days, setDays] = useState<Day[]>([]);
   const [isSaving, setIsSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const SAGE = '#7C9A7E';
 
   useEffect(() => {
     fetchWorkoutDetails();
@@ -40,24 +65,57 @@ export default function EditWorkout() {
 
   const fetchWorkoutDetails = async () => {
     try {
-      const workoutResult = await db.getAllAsync<{ workout_name: string }>(
-        'SELECT workout_name FROM Workouts WHERE workout_id = ?',
+      await initWorkoutDb(db);
+      await db.runAsync("ALTER TABLE Workouts ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';").catch(() => {});
+      const workoutResult = await db.getAllAsync<{ workout_name: string; workout_type?: string }>(
+        'SELECT workout_name, workout_type FROM Workouts WHERE workout_id = ?',
         [workout_id]
       );
       setWorkoutName(workoutResult[0]?.workout_name || '');
+      const wt =
+        (workoutResult[0]?.workout_type as string | undefined) === 'cardio' ? 'cardio' : 'strength';
+      setWorkoutType(wt);
 
       const daysResult = await db.getAllAsync<{ day_id: number; day_name: string }>(
         'SELECT day_id, day_name FROM Days WHERE workout_id = ?',
         [workout_id]
       );
-      
+
+      await db.runAsync('ALTER TABLE Exercises ADD COLUMN sort_order INTEGER;').catch(() => {});
       const daysWithExercises = await Promise.all(
         daysResult.map(async (day) => {
-          const exercises = await db.getAllAsync<Exercise>(
-            'SELECT exercise_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds FROM Exercises WHERE day_id = ? ORDER BY exercise_id',
+          const exercises = await db.getAllAsync<
+            Exercise & { sort_order?: number | null }
+          >(
+            'SELECT exercise_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, duration_minutes, cardio_distance, exercise_type FROM Exercises WHERE day_id = ? ORDER BY COALESCE(sort_order, 999999), exercise_id;',
             [day.day_id]
+          ).catch(async () =>
+            db.getAllAsync<Exercise & { sort_order?: number | null }>(
+              'SELECT exercise_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order FROM Exercises WHERE day_id = ? ORDER BY COALESCE(sort_order, 999999), exercise_id;',
+              [day.day_id]
+            )
           );
-          return { ...day, exercises };
+          const sorted = sortWorkoutPlanExercisesForDisplay(exercises);
+          for (let i = 0; i < sorted.length; i++) {
+            await db.runAsync('UPDATE Exercises SET sort_order = ? WHERE exercise_id = ?;', [
+              i,
+              sorted[i].exercise_id,
+            ]);
+          }
+          const enriched: Exercise[] = sorted.map((ex) => {
+            const parsed = parseStoredDistance(ex.cardio_distance ?? null);
+            const isCardio = isCardioExerciseInEditor(wt, ex);
+            const repsForUi = isCardio
+              ? Math.round(Number(ex.duration_minutes ?? ex.reps) || 0)
+              : ex.reps;
+            return {
+              ...ex,
+              reps: repsForUi,
+              _cardioDistValue: parsed.value,
+              _cardioDistUnit: parsed.unit,
+            };
+          });
+          return { ...day, exercises: enriched };
         })
       );
 
@@ -199,23 +257,43 @@ export default function EditWorkout() {
           return;
         }
         for (const exercise of day.exercises) {
-          if (
-            !exercise.exercise_name.trim() ||
-            !exercise.sets ||
-            !exercise.reps ||
-            parseInt(exercise.sets.toString(), 10) === 0 ||
-            parseInt(exercise.reps.toString(), 10) === 0
-          ) {
+          const isCardio = isCardioExerciseInEditor(workoutType, exercise);
+          if (!exercise.exercise_name.trim()) {
             setErrorMessage(t('fillExercisesErrorMessage'));
             return;
+          }
+          if (isCardio) {
+            const dur = Number(exercise.reps);
+            if (!Number.isFinite(dur) || dur <= 0) {
+              setErrorMessage(
+                t('fillExercisesErrorMessage') ||
+                  'Enter a duration in minutes for each cardio exercise.',
+              );
+              return;
+            }
+          } else {
+            if (
+              !exercise.sets ||
+              !exercise.reps ||
+              parseInt(exercise.sets.toString(), 10) === 0 ||
+              parseInt(exercise.reps.toString(), 10) === 0
+            ) {
+              setErrorMessage(t('fillExercisesErrorMessage'));
+              return;
+            }
           }
         }
       }
 
       setIsSaving(true);
       console.log('Updating workout name...');
-      await db.runAsync('UPDATE Workouts SET workout_name = ? WHERE workout_id = ?;', [
+
+      // Update days and exercises
+      // Ensure workout_type exists for older DBs and persist it.
+      await db.runAsync("ALTER TABLE Workouts ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';").catch(() => {});
+      await db.runAsync('UPDATE Workouts SET workout_name = ?, workout_type = ? WHERE workout_id = ?;', [
         workoutName.trim(),
+        workoutType,
         workout_id,
       ]);
 
@@ -234,15 +312,87 @@ export default function EditWorkout() {
           [day.day_name.trim(), day.day_id]
         );
         
-        // Delete all exercises for this day to maintain order
         await db.runAsync('DELETE FROM Exercises WHERE day_id = ?;', [day.day_id]);
-        
-        // Re-insert exercises in the new order
+
+        let sortIdx = 0;
         for (const exercise of day.exercises) {
-          await db.runAsync(
-            'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
-            [day.day_id, exercise.exercise_name.trim(), exercise.sets, exercise.reps, exercise.web_link, exercise.muscle_group, exercise.exercise_notes, exercise.rest_seconds ?? null]
-          );
+          const isCardio = isCardioExerciseInEditor(workoutType, exercise);
+          const nameTrim = exercise.exercise_name.trim();
+          if (isCardio) {
+            const dur = Math.max(1, Math.round(Number(exercise.reps) || 0));
+            const displayName = ensureCardioExerciseName(nameTrim);
+            const dist = formatCardioDistanceForDb(
+              exercise._cardioDistValue ?? '',
+              exercise._cardioDistUnit ?? 'km',
+            );
+            try {
+              await db.runAsync(
+                'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, exercise_type, duration_minutes, cardio_distance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+                [
+                  day.day_id,
+                  displayName,
+                  1,
+                  dur,
+                  exercise.web_link,
+                  exercise.muscle_group,
+                  exercise.exercise_notes,
+                  exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
+                  sortIdx,
+                  'cardio',
+                  dur,
+                  dist,
+                ],
+              );
+            } catch {
+              await db.runAsync(
+                'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);',
+                [
+                  day.day_id,
+                  displayName,
+                  1,
+                  dur,
+                  exercise.web_link,
+                  exercise.muscle_group,
+                  exercise.exercise_notes,
+                  exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
+                  sortIdx,
+                ],
+              );
+            }
+          } else {
+            try {
+              await db.runAsync(
+                'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, exercise_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+                [
+                  day.day_id,
+                  nameTrim,
+                  exercise.sets,
+                  exercise.reps,
+                  exercise.web_link,
+                  exercise.muscle_group,
+                  exercise.exercise_notes,
+                  exercise.rest_seconds ?? null,
+                  sortIdx,
+                  'strength',
+                ],
+              );
+            } catch {
+              await db.runAsync(
+                'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+                [
+                  day.day_id,
+                  nameTrim,
+                  exercise.sets,
+                  exercise.reps,
+                  exercise.web_link,
+                  exercise.muscle_group,
+                  exercise.exercise_notes,
+                  exercise.rest_seconds ?? null,
+                ],
+              );
+            }
+          }
+          sortIdx += 1;
         }
       }
 
@@ -270,22 +420,65 @@ export default function EditWorkout() {
   const handleExerciseChange = (
     dayId: number,
     exerciseIndex: number,
-    field: 'exercise_name' | 'sets' | 'reps' | 'rest_seconds',
-    value: string | number
+    field:
+      | 'exercise_name'
+      | 'sets'
+      | 'reps'
+      | 'rest_seconds'
+      | '_cardioDistValue'
+      | '_cardioDistUnit',
+    value: string | number,
   ) => {
     setDays((prevDays) =>
-      prevDays.map((day) =>
-        day.day_id === dayId
-          ? {
-              ...day,
-              exercises: day.exercises.map((exercise, index) =>
-                index === exerciseIndex
-                  ? { ...exercise, [field]: field === 'exercise_name' ? value : field === 'rest_seconds' ? (value === '' ? null : (typeof value === 'number' ? value : parseInt(String(value), 10) || null)) : value }
-                  : exercise
-              ),
+      prevDays.map((day) => {
+        if (day.day_id !== dayId) return day;
+        return {
+          ...day,
+          exercises: day.exercises.map((exercise, index) => {
+            if (index !== exerciseIndex) return exercise;
+            if (field === 'exercise_name') {
+              return { ...exercise, exercise_name: String(value) };
             }
-          : day
-      )
+            if (field === 'rest_seconds') {
+              return {
+                ...exercise,
+                rest_seconds:
+                  value === ''
+                    ? null
+                    : typeof value === 'number'
+                      ? value
+                      : parseInt(String(value), 10) || null,
+              };
+            }
+            if (field === '_cardioDistValue') {
+              return { ...exercise, _cardioDistValue: String(value) };
+            }
+            if (field === '_cardioDistUnit') {
+              return {
+                ...exercise,
+                _cardioDistUnit: value === 'mi' ? 'mi' : 'km',
+              };
+            }
+            const isCardio = isCardioExerciseInEditor(workoutType, exercise);
+            if (field === 'reps' && isCardio) {
+              const raw = String(value).replace(/[^0-9.,]/g, '').replace(',', '.');
+              const n = parseFloat(raw);
+              return {
+                ...exercise,
+                reps: Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0,
+              };
+            }
+            if (field === 'sets' || field === 'reps') {
+              const n = parseInt(String(value).replace(/\D/g, ''), 10);
+              return {
+                ...exercise,
+                [field]: Number.isFinite(n) ? n : 0,
+              };
+            }
+            return exercise;
+          }),
+        };
+      }),
     );
   };
 
@@ -298,74 +491,153 @@ export default function EditWorkout() {
     );
   };
 
-  // Render exercise item with drag handle
   const renderExerciseItem = ({ item, drag, isActive }: RenderItemParams<Exercise>, day: Day) => {
-    const index = day.exercises.findIndex(e => e.exercise_id === item.exercise_id);
-    
+    const index = day.exercises.findIndex((e) => e.exercise_id === item.exercise_id);
+    const showCardio = isCardioExerciseInEditor(workoutType, item);
+
     return (
       <TouchableOpacity
         onLongPress={drag}
         disabled={isActive}
         style={[
-          styles.exerciseContainer
+          styles.exerciseContainer,
+          showCardio && { flexDirection: 'column', alignItems: 'stretch' },
         ]}
       >
-        {/* Drag handle */}
-        <TouchableOpacity onPressIn={drag} style={styles.dragHandle}>
+        <TouchableOpacity onPressIn={drag} style={[styles.dragHandle, showCardio && { alignSelf: 'flex-start' }]}>
           <Ionicons name="reorder-three" size={30} color={theme.text} />
         </TouchableOpacity>
-        
-        {/* Exercise Name */}
-        <TextInput
-          style={[styles.exerciseInput, { color: theme.text }]}
-          value={item.exercise_name}
-          onChangeText={(text) =>
-            handleExerciseChange(day.day_id, index, 'exercise_name', text)
-          }
-          placeholder={t('exerciseNamePlaceholder')}
-          placeholderTextColor={theme.text}
-        />
-        
-        {/* Sets */}
-        <TextInput
-          style={[styles.numberInput, { color: theme.text }]}
-          value={item.sets.toString()}
-          onChangeText={(text) =>
-            handleExerciseChange(day.day_id, index, 'sets', text)
-          }
-          keyboardType="numeric"
-          placeholder={t('setsPlaceholder')}
-          placeholderTextColor={theme.text}
-        />
-        
-        {/* Reps */}
-        <TextInput
-          style={[styles.numberInput, { color: theme.text }]}
-          value={item.reps.toString()}
-          onChangeText={(text) =>
-            handleExerciseChange(day.day_id, index, 'reps', text)
-          }
-          keyboardType="numeric"
-          placeholder={t('repsPlaceholder')}
-          placeholderTextColor={theme.text}
-        />
-        {/* Rest (s) */}
-        <TextInput
-          style={[styles.restInput, { color: theme.text }]}
-          value={item.rest_seconds != null ? String(item.rest_seconds) : ''}
-          onChangeText={(text) => {
-            const sanitized = text.replace(/[^0-9]/g, '');
-            handleExerciseChange(day.day_id, index, 'rest_seconds', sanitized === '' ? '' : parseInt(sanitized, 10));
-          }}
-          keyboardType="numeric"
-          placeholder={t('restSecondsPlaceholder') || 'Rest (s)'}
-          placeholderTextColor={theme.text}
-        />
+
+        <View style={{ flex: showCardio ? undefined : 1, flexGrow: 1, minWidth: 0 }}>
+          <TextInput
+            style={[styles.exerciseInput, { color: theme.text }, showCardio && { flex: undefined, width: '100%' }]}
+            value={item.exercise_name}
+            onChangeText={(text) =>
+              handleExerciseChange(day.day_id, index, 'exercise_name', text)
+            }
+            placeholder={t('exerciseNamePlaceholder')}
+            placeholderTextColor={theme.text}
+          />
+
+          {showCardio ? (
+            <>
+              <Text style={[styles.cardioFieldLabel, { color: theme.textSecondary }]}>
+                Duration (minutes)
+              </Text>
+              <TextInput
+                style={[styles.exerciseInput, { color: theme.text, marginBottom: 8 }]}
+                value={item.reps ? String(item.reps) : ''}
+                onChangeText={(text) =>
+                  handleExerciseChange(day.day_id, index, 'reps', text)
+                }
+                keyboardType="decimal-pad"
+                placeholder="e.g. 30"
+                placeholderTextColor={theme.text}
+              />
+              <Text style={[styles.cardioFieldLabel, { color: theme.textSecondary }]}>
+                Distance (optional)
+              </Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <TextInput
+                  style={[styles.numberInput, { color: theme.text, flex: 1, minWidth: 80 }]}
+                  value={item._cardioDistValue ?? ''}
+                  onChangeText={(text) =>
+                    handleExerciseChange(day.day_id, index, '_cardioDistValue', text.replace(/[^0-9.,]/g, ''))
+                  }
+                  keyboardType="decimal-pad"
+                  placeholder="e.g. 5"
+                  placeholderTextColor={theme.text}
+                />
+                <TouchableOpacity
+                  onPress={() =>
+                    handleExerciseChange(day.day_id, index, '_cardioDistUnit', 'km')
+                  }
+                  style={[
+                    styles.unitChip,
+                    {
+                      borderColor: theme.border,
+                      backgroundColor:
+                        (item._cardioDistUnit ?? 'km') === 'km' ? SAGE : theme.card,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={{
+                      fontWeight: '600',
+                      color: (item._cardioDistUnit ?? 'km') === 'km' ? '#fff' : theme.text,
+                    }}
+                  >
+                    km
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() =>
+                    handleExerciseChange(day.day_id, index, '_cardioDistUnit', 'mi')
+                  }
+                  style={[
+                    styles.unitChip,
+                    {
+                      borderColor: theme.border,
+                      backgroundColor: item._cardioDistUnit === 'mi' ? SAGE : theme.card,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={{
+                      fontWeight: '600',
+                      color: item._cardioDistUnit === 'mi' ? '#fff' : theme.text,
+                    }}
+                  >
+                    mi
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          ) : (
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center' }}>
+              <TextInput
+                style={[styles.numberInput, { color: theme.text }]}
+                value={item.sets.toString()}
+                onChangeText={(text) =>
+                  handleExerciseChange(day.day_id, index, 'sets', text)
+                }
+                keyboardType="numeric"
+                placeholder={t('setsPlaceholder')}
+                placeholderTextColor={theme.text}
+              />
+              <TextInput
+                style={[styles.numberInput, { color: theme.text }]}
+                value={item.reps.toString()}
+                onChangeText={(text) =>
+                  handleExerciseChange(day.day_id, index, 'reps', text)
+                }
+                keyboardType="numeric"
+                placeholder={t('repsPlaceholder')}
+                placeholderTextColor={theme.text}
+              />
+              <TextInput
+                style={[styles.restInput, { color: theme.text }]}
+                value={item.rest_seconds != null ? String(item.rest_seconds) : ''}
+                onChangeText={(text) => {
+                  const sanitized = text.replace(/[^0-9]/g, '');
+                  handleExerciseChange(
+                    day.day_id,
+                    index,
+                    'rest_seconds',
+                    sanitized === '' ? '' : parseInt(sanitized, 10),
+                  );
+                }}
+                keyboardType="numeric"
+                placeholder={t('restSecondsPlaceholder') || 'Rest (s)'}
+                placeholderTextColor={theme.text}
+              />
+            </View>
+          )}
+        </View>
       </TouchableOpacity>
     );
   };
 
-  const SAGE = '#7C9A7E';
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
       <View style={{ flex: 1, backgroundColor: theme.background }}>
@@ -380,6 +652,43 @@ export default function EditWorkout() {
 
       <ScrollView contentContainerStyle={{ flexGrow: 1 }} showsVerticalScrollIndicator={false}>
         <View style={[styles.container, { backgroundColor: theme.background }]}>
+          <View style={{ flexDirection: 'row', gap: 10, marginBottom: 12 }}>
+            <TouchableOpacity
+              onPress={() => setWorkoutType('strength')}
+              activeOpacity={0.85}
+              style={{
+                flex: 1,
+                paddingVertical: 12,
+                borderRadius: 12,
+                alignItems: 'center',
+                borderWidth: 1,
+                borderColor: theme.border,
+                backgroundColor: workoutType === 'strength' ? SAGE : theme.card,
+              }}
+            >
+              <Text style={{ fontWeight: '700', color: workoutType === 'strength' ? '#fff' : theme.text }}>
+                Strength
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setWorkoutType('cardio')}
+              activeOpacity={0.85}
+              style={{
+                flex: 1,
+                paddingVertical: 12,
+                borderRadius: 12,
+                alignItems: 'center',
+                borderWidth: 1,
+                borderColor: theme.border,
+                backgroundColor: workoutType === 'cardio' ? SAGE : theme.card,
+              }}
+            >
+              <Text style={{ fontWeight: '700', color: workoutType === 'cardio' ? '#fff' : theme.text }}>
+                Cardio
+              </Text>
+            </TouchableOpacity>
+          </View>
+
           {/* Workout Name */}
           <TextInput
             style={[styles.inputWorkoutName, { color: theme.text, backgroundColor: theme.card, borderWidth: 1, borderColor: theme.border }]}
@@ -402,7 +711,6 @@ export default function EditWorkout() {
                 placeholderTextColor={theme.text}
               />
 
-              {/* Exercises as DraggableFlatList */}
               <View style={styles.exercisesContainer}>
                 <DraggableFlatList
                   scrollEnabled={false}
@@ -576,6 +884,18 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     fontSize: 16,
     textAlign: 'center',
+  },
+  cardioFieldLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  unitChip: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
   },
   saveButton: {
     paddingVertical: 16,

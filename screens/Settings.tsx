@@ -18,7 +18,6 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
 import { setClaudeApiKey } from '../utils/claudeApiKeyStorage';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export default function Settings() {
   const {
@@ -28,8 +27,6 @@ export default function Settings() {
     setTimeFormat,
     weightFormat,
     setWeightFormat,
-    firstWeekday,
-    setFirstWeekday,
     language,
     setLanguage,
     notificationPermissionGranted,
@@ -64,8 +61,6 @@ export default function Settings() {
 
   // Manages whether the language dropdown is visible
   const [languageDropdownVisible, setLanguageDropdownVisible] = useState(false);
-  // Manages whether the first-day-of-week dropdown is visible
-  const [firstDayDropdownVisible, setFirstDayDropdownVisible] = useState(false);
 
   // Languages array with i18n-compatible codes
   const languages = [
@@ -111,11 +106,6 @@ export default function Settings() {
 
   const handleWeightFormatChange = (format: string) => {
     setWeightFormat(format);
-  };
-
-  // New handler for first day of the week
-  const handleFirstWeekdayChange = (day: 'Sunday' | 'Monday') => {
-    setFirstWeekday(day);
   };
 
   // Handle notification main toggle change
@@ -600,33 +590,6 @@ export default function Settings() {
 
         <View style={styles.section}>
           <Text style={[styles.sectionTitle, { color: theme.text }]}>
-            {t('settingsFirstWeekday') || 'First Day of the Week'}
-          </Text>
-          <TouchableOpacity
-            style={[
-              styles.pickerField,
-              { borderColor: theme.border, backgroundColor: theme.card },
-            ]}
-            onPress={() =>
-              openSimplePicker(
-                t('settingsFirstWeekday') || 'First Day of the Week',
-                ['Monday', 'Sunday'],
-                firstWeekday,
-                (val) => handleFirstWeekdayChange(val as 'Sunday' | 'Monday'),
-              )
-            }
-          >
-            <Text style={{ color: theme.text }}>{t(firstWeekday)}</Text>
-            <Ionicons
-              name="chevron-down"
-              size={18}
-              color={theme.text}
-            />
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]}>
             {t('settingsTheme')}
           </Text>
           <View style={styles.buttonGroup}>
@@ -651,44 +614,6 @@ export default function Settings() {
               </Text>
             </TouchableOpacity>
           </View>
-        </View>
-
-        <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]}>
-            {t('settingsFirstDayOfWeek')}
-          </Text>
-          <TouchableOpacity
-            style={[
-              styles.dropdownButton,
-              { borderColor: theme.border, backgroundColor: theme.primary },
-            ]}
-            onPress={() => setFirstDayDropdownVisible(!firstDayDropdownVisible)}
-          >
-            <Text style={{ color: theme.buttonText }}>{t(firstWeekday)}</Text>
-            <Ionicons
-              name={firstDayDropdownVisible ? 'chevron-up' : 'chevron-down'}
-              size={24}
-              color={theme.buttonText}
-            />
-          </TouchableOpacity>
-          {firstDayDropdownVisible && (
-            <View style={[styles.dropdownList, { backgroundColor: theme.card, borderColor: theme.border }]}>
-              {(['Monday', 'Sunday'] as const).map((day) => (
-                <TouchableOpacity
-                  key={day}
-                  style={[styles.dropdownItem, firstWeekday === day && styles.activeDropdownItem]}
-                  onPress={() => {
-                    handleFirstWeekdayChange(day);
-                    setFirstDayDropdownVisible(false);
-                  }}
-                >
-                  <Text style={[styles.dropdownItemText, firstWeekday === day && styles.activeDropdownItemText, { color: theme.text }]}>
-                    {t(day)}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )}
         </View>
 
         <View style={styles.section}>

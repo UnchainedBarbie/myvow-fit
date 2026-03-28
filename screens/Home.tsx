@@ -5,7 +5,8 @@ import { ScaledSheet, scale } from 'react-native-size-matters'; // Import Scaled
 import { useTranslation } from 'react-i18next';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { useNavigation } from '@react-navigation/native';
-import HeaderAvatar from '../components/HeaderAvatar';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useDrawerMenu } from '../context/DrawerMenuContext';
 
 
 
@@ -17,17 +18,26 @@ export default function Home() {
   const { theme } = useTheme(); // Get the current theme
   const { t } = useTranslation(); // Initialize translations
   const navigation = useNavigation<any>();
+  const insets = useSafeAreaInsets();
+  const drawerMenu = useDrawerMenu();
 
   return (
-    <View style={[styles.container, { backgroundColor: theme.background }]}>
+    <View style={[styles.container, { backgroundColor: theme.background, paddingTop: Math.max(60, insets.top + 44) }]}>
       <View style={styles.headerContainer}>
+        {drawerMenu ? (
+          <TouchableOpacity
+            onPress={drawerMenu.openDrawer}
+            style={styles.menuBtn}
+            accessibilityLabel="Open menu"
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          >
+            <Ionicons name="menu-outline" size={28} color="#7C9A7E" />
+          </TouchableOpacity>
+        ) : null}
         <Text style={styles.title}>
           <Text style={[styles.titleRegular, { color: theme.text }]}>MyVow </Text>
           <Text style={[styles.titleAccent, { color: theme.primary }]}>Fit</Text>
         </Text>
-        <View style={styles.avatarPosition}>
-          <HeaderAvatar />
-        </View>
       </View>
 
       <View style={styles.grid}>
@@ -44,7 +54,7 @@ export default function Home() {
           <Text style={[styles.tileIcon, { color: theme.primary }]}>✦</Text>
           <View style={styles.tileTextBlock}>
             <Text style={[styles.tileTitle, { color: theme.text }]}>
-              MySage Chat
+              Sage Chat
             </Text>
             <Text
               style={[
@@ -101,7 +111,7 @@ export default function Home() {
           <Text style={[styles.tileIcon, { color: theme.primary }]}>⊕</Text>
           <View style={styles.tileTextBlock}>
             <Text style={[styles.tileTitle, { color: theme.text }]}>
-              MyWorkouts
+              Workouts
             </Text>
             <Text
               style={[
@@ -127,7 +137,7 @@ export default function Home() {
           <Text style={[styles.tileIcon, { color: theme.primary }]}>◎</Text>
           <View style={styles.tileTextBlock}>
             <Text style={[styles.tileTitle, { color: theme.text }]}>
-              MyNutrition
+              Nutrition
             </Text>
             <Text
               style={[
@@ -179,7 +189,7 @@ export default function Home() {
           <Text style={[styles.tileIcon, { color: theme.primary }]}>✚</Text>
           <View style={styles.tileTextBlock}>
             <Text style={[styles.tileTitle, { color: theme.text }]}>
-              MyCalendar
+              Calendar
             </Text>
             <Text
               style={[
@@ -201,13 +211,18 @@ export default function Home() {
 const styles = ScaledSheet.create({
   container: {
     flex: 1,
-    paddingTop: 60,
   },
   headerContainer: {
     position: 'relative',
     marginBottom: '15@vs', // Slightly reduced scaled margin
     alignItems: 'center',
     paddingTop: 16,
+  },
+  menuBtn: {
+    position: 'absolute',
+    left: '16@s',
+    top: '2@vs',
+    zIndex: 1,
   },
   title: {
     fontSize: '36@s',
@@ -222,11 +237,6 @@ const styles = ScaledSheet.create({
   titleAccent: {
     fontFamily: 'CormorantGaramond-Italic',
     fontStyle: 'italic',
-  },
-  avatarPosition: {
-    position: 'absolute',
-    right: '16@s',
-    top: '2@vs',
   },
   grid: {
     flex: 1,

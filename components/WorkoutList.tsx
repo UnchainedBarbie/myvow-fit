@@ -3,7 +3,7 @@ import { StackNavigationProp } from '@react-navigation/stack';
 import { WorkoutStackParamList } from '../App';
 import { Workout } from '../utils/types';
 import React from 'react';
-import { TouchableOpacity, Text, StyleSheet, ScrollView, View } from 'react-native';
+import { TouchableOpacity, Text, StyleSheet, View, FlatList } from 'react-native';
 import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { useTheme } from '../context/ThemeContext'; // Adjust the path to your ThemeContext
@@ -19,7 +19,7 @@ type WorkoutListNavigationProp = StackNavigationProp<
 export default function WorkoutList({
   workouts,
   deleteWorkout,
-  getWorkouts,
+  getWorkouts: _getWorkouts,
 }: {
   workouts: Workout[];
   deleteWorkout: (workout_id: number, workout_name: string) => Promise<void>;
@@ -37,41 +37,45 @@ export default function WorkoutList({
     exportWorkout(db, workoutId);
   };
 
-  return (
-    <ScrollView
-      style={[styles.container, { backgroundColor: theme.background }]}
-    >
-      {/* Action Buttons */}
-      <View style={styles.actionButtonsContainer}>
-        <TouchableOpacity
-          style={[styles.buildActionButton, { backgroundColor: theme.primary || '#7C9A7E' }]}
-          activeOpacity={0.7}
-          onPress={() => (navigation.getParent?.() ?? navigation).navigate('Sage' as never)}
-        >
-          <Text style={styles.buildActionButtonTextLight}>
-            {t('buildWithSage') || 'Build with Sage ✦'}
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.buildActionButton, { backgroundColor: theme.buttonBackground }]}
-          activeOpacity={0.7}
-          onPress={() => navigation.navigate('CreateWorkout')}
-        >
-          <Text style={[styles.buildActionButtonTextDark, { color: theme.buttonText }]}>
-            {t('buildMyself') || 'Build it myself'}
-          </Text>
-        </TouchableOpacity>
-      </View>
+  const listHeader = (
+    <View style={styles.actionButtonsContainer}>
+      <TouchableOpacity
+        style={[styles.buildActionButton, { backgroundColor: theme.primary || '#7C9A7E' }]}
+        activeOpacity={0.7}
+        onPress={() => (navigation.getParent?.() ?? navigation).navigate('Sage' as never)}
+      >
+        <Text style={styles.buildActionButtonTextLight}>
+          {t('buildWithSage') || 'Build with Sage ✦'}
+        </Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.buildActionButton, { backgroundColor: theme.buttonBackground }]}
+        activeOpacity={0.7}
+        onPress={() => navigation.navigate('CreateWorkout')}
+      >
+        <Text style={[styles.buildActionButtonTextDark, { color: theme.buttonText }]}>
+          {t('buildMyself') || 'Build it myself'}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
 
-      {/* Workout List */}
-      {sortedWorkouts.map((workout) => {
+  return (
+    <FlatList
+      data={sortedWorkouts}
+      keyExtractor={(item) => item.workout_id.toString()}
+      style={[styles.list, { backgroundColor: theme.background }]}
+      contentContainerStyle={styles.contentContainer}
+      ListHeaderComponent={listHeader}
+      keyboardShouldPersistTaps="handled"
+      renderItem={({ item: workout }) => {
         let swipeRef: Swipeable | null = null;
         const renderRightActions = () => (
           <RectButton
             style={[styles.deleteButton, { backgroundColor: '#c62828' }]}
             onPress={() => {
               swipeRef?.close();
-              deleteWorkout(workout.workout_id, workout.workout_name);
+              void deleteWorkout(workout.workout_id, workout.workout_name);
             }}
           >
             <Text style={styles.swipeBtnText}>{t('delete') || 'Delete'}</Text>
@@ -79,10 +83,13 @@ export default function WorkoutList({
         );
         return (
           <Swipeable
-            key={workout.workout_id}
-            ref={(r) => { swipeRef = r; }}
+            ref={(r) => {
+              swipeRef = r;
+            }}
             renderRightActions={renderRightActions}
             friction={2}
+            overshootLeft={false}
+            overshootRight={false}
           >
             <TouchableOpacity
               style={[
@@ -98,6 +105,11 @@ export default function WorkoutList({
                   workout_id: workout.workout_id,
                 })
               }
+              onLongPress={() =>
+                void deleteWorkout(workout.workout_id, workout.workout_name)
+              }
+              delayLongPress={450}
+              accessibilityHint={t('deleteWorkoutLongPressHint')}
             >
               <View style={styles.workoutNameWrapper}>
                 <Text style={[styles.workoutText, { color: theme.text }]} numberOfLines={1} ellipsizeMode="tail">
@@ -130,18 +142,21 @@ export default function WorkoutList({
             </TouchableOpacity>
           </Swipeable>
         );
-      })}
-    </ScrollView>
+      }}
+    />
   );
 }
 
 //WorkoutList.tsx
 
 const styles = StyleSheet.create({
-  container: {
+  list: {
     flex: 1,
+  },
+  contentContainer: {
     paddingHorizontal: 16,
     paddingTop: 24,
+    paddingBottom: 32,
   },
   actionButtonsContainer: {
     flexDirection: 'row',
@@ -220,4 +235,3 @@ const styles = StyleSheet.create({
     fontFamily: 'Jost_500Medium',
   },
 });
-
