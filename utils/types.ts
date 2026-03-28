@@ -12,6 +12,7 @@ export interface TemplateWorkouts {
 export interface Workout {
     workout_id: number;
     workout_name: string;
+    workout_type?: 'strength' | 'cardio' | string;
   }
   
   // Interface for the Days table
@@ -40,6 +41,7 @@ export interface WorkoutLog {
   workout_date: number; // Date of the workout (in seconds as UNIX timestamp)
   day_name: string; // Day name (copied at the time of logging)
   workout_name: string; // Workout name (copied at the time of logging)
+  workout_type?: 'strength' | 'cardio' | string;
 }
 
 // Interface for the Logged_Exercises table

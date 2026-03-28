@@ -11,7 +11,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.anarcobarbie.myvowfit",
-      "infoPlist": {
+        "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSSpeechRecognitionUsageDescription": "MyVow Fit uses speech recognition so you can talk to Sage, your AI coach, hands-free."
       }

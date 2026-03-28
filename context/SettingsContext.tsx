@@ -8,6 +8,10 @@ import { loadSettings, saveSettings } from '../utils/settingsStorage';
 import i18n from '../utils/i18n';
 import * as Localization from 'expo-localization';
 import { requestNotificationPermissions } from '../utils/notificationUtils';
+import {
+  type CalendarFirstWeekday,
+  isCalendarFirstWeekday,
+} from '../utils/calendarGridRange';
 
 // Helper to get device's preferred time format
 const getDeviceTimeFormat = (): '24h' | 'AM/PM' => {
@@ -63,8 +67,8 @@ type SettingsContextType = {
   setTimeFormat: (fmt: '24h' | 'AM/PM') => void;
   weightFormat: string;
   setWeightFormat: (fmt: string) => void;
-  firstWeekday: 'Sunday' | 'Monday';
-  setFirstWeekday: (day: 'Sunday' | 'Monday') => void;
+  firstWeekday: CalendarFirstWeekday;
+  setFirstWeekday: (day: CalendarFirstWeekday) => void;
   notificationPermissionGranted: boolean;
   setNotificationPermissionGranted: (granted: boolean) => void;
   requestNotificationPermission: () => Promise<boolean>;
@@ -82,7 +86,7 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
   const [dateFormat, setDateFormat] = useState('dd-mm-yyyy');
   const [timeFormat, setTimeFormat] = useState<'24h' | 'AM/PM'>('24h');
   const [weightFormat, setWeightFormat] = useState('kg');
-  const [firstWeekday, setFirstWeekday] = useState<'Sunday' | 'Monday'>(
+  const [firstWeekday, setFirstWeekday] = useState<CalendarFirstWeekday>(
     'Monday',
   );
   const [notificationPermissionGranted, setNotificationPermissionGranted] =
@@ -110,7 +114,12 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
         // MODIFIED: Use device format as fallback
         setDateFormat(savedSettings.dateFormat || deviceDateFormat);
         setWeightFormat(savedSettings.weightFormat || deviceWeightFormat);
-        setFirstWeekday(savedSettings.firstWeekday || deviceFirstWeekday);
+        const fw = savedSettings.firstWeekday;
+        setFirstWeekday(
+          typeof fw === 'string' && isCalendarFirstWeekday(fw)
+            ? fw
+            : deviceFirstWeekday,
+        );
 
         let timeFormatToSet = savedSettings.timeFormat;
         if (timeFormatToSet === '24-Hour') {

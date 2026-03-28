@@ -3,7 +3,7 @@
  * MyBody: 2x3 stat cards, starting weight comparison, Log Today modal, line chart (Weight|Muscle|Fat|Water, 30/90/365).
  * MyStrength: exercise list from Weight_Log + StrengthRecords, detail with chart and Log MyStrength PR.
  */
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -437,8 +437,21 @@ export default function MyProgress() {
   const [logWater, setLogWater] = useState('');
   const [logFat, setLogFat] = useState('');
   const [logNotes, setLogNotes] = useState('');
-  /** Log MyBody modal: lift footer only so Cancel/Save sit above keyboard (no KeyboardAvoidingView on the sheet). */
+  /** Log MyBody modal: keyboard height — bottom inset only (do not also subtract in card height). */
   const [bodyLogKeyboardInset, setBodyLogKeyboardInset] = useState(0);
+  const logModalOverlayTopPad = 16 + insets.top;
+  const logModalOverlayBottomPad =
+    bodyLogKeyboardInset > 0
+      ? bodyLogKeyboardInset
+      : 24 + Math.max(insets.bottom, 0);
+  const logModalCardHeight = useMemo(
+    () =>
+      Math.max(
+        300,
+        windowHeight - logModalOverlayTopPad - logModalOverlayBottomPad,
+      ),
+    [windowHeight, logModalOverlayTopPad, logModalOverlayBottomPad],
+  );
   const [userHeightInches, setUserHeightInches] = useState<string>('');
 
   // Editable card values (synced from latestBody, saved on blur)
@@ -1221,16 +1234,31 @@ export default function MyProgress() {
       )}
 
       <Modal visible={logModalVisible} animationType="slide" transparent>
-        <View style={styles.modalOverlay}>
+        <View
+          style={[
+            styles.modalOverlay,
+            styles.modalOverlayBodyLog,
+            {
+              paddingTop: logModalOverlayTopPad,
+              paddingHorizontal: 24,
+              paddingBottom: logModalOverlayBottomPad,
+            },
+          ]}
+        >
           <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
             <View style={StyleSheet.absoluteFill} />
           </TouchableWithoutFeedback>
-          <View style={styles.modalKeyboardAvoiding}>
+          <View style={[styles.modalKeyboardAvoiding, styles.modalKeyboardAvoidingBodyLog]}>
             <View
               style={[
                 styles.modalBox,
                 styles.modalBoxBodyLog,
-                { backgroundColor: theme.card, paddingBottom: 0 },
+                styles.modalBoxBodyLogFill,
+                {
+                  backgroundColor: theme.card,
+                  height: logModalCardHeight,
+                  maxHeight: logModalCardHeight,
+                },
               ]}
             >
               <View style={styles.modalHeaderRow}>
@@ -1243,8 +1271,8 @@ export default function MyProgress() {
                 keyboardShouldPersistTaps="handled"
                 keyboardDismissMode="on-drag"
                 showsVerticalScrollIndicator
-                style={{ maxHeight: bodyLogModalScrollMax }}
-                contentContainerStyle={styles.modalScrollContent}
+                style={styles.modalBodyLogScroll}
+                contentContainerStyle={styles.modalBodyLogScrollContent}
               >
                 <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
                   <View>
@@ -1306,7 +1334,7 @@ export default function MyProgress() {
                   onSubmitEditing={Keyboard.dismiss}
                 />
                 <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
-                  <View style={styles.modalTapBelowInputs} />
+                  <View style={styles.modalTapBelowInputsSmall} />
                 </TouchableWithoutFeedback>
               </ScrollView>
               <View
@@ -1314,7 +1342,6 @@ export default function MyProgress() {
                   styles.modalButtons,
                   styles.modalButtonsSticky,
                   styles.modalButtonsBodyLogFooter,
-                  { paddingBottom: bodyLogKeyboardInset },
                 ]}
               >
                 <TouchableOpacity
@@ -1957,21 +1984,44 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
+  /** Log MyBody: padding comes from inline (flush to keyboard when open) */
+  modalOverlayBodyLog: {
+    padding: 0,
+    justifyContent: 'flex-start',
+  },
   modalKeyboardAvoiding: {
     width: '100%',
     maxWidth: '100%',
     zIndex: 1,
+  },
+  modalKeyboardAvoidingBodyLog: {
+    flex: 1,
+    maxHeight: '100%',
   },
   modalBox: {
     borderRadius: 16,
     padding: 24,
     maxHeight: '80%',
   },
-  /** MyBody log / edit: column layout; Edit modal may still use KeyboardAvoidingView */
+  /** MyBody log / edit: shared width; Log modal adds modalBoxBodyLogFill + explicit height */
   modalBoxBodyLog: {
     maxHeight: '88%',
     width: '100%',
     paddingBottom: 16,
+  },
+  /** Log MyBody: column so ScrollView flex:1 fills space between header and buttons */
+  modalBoxBodyLogFill: {
+    flexDirection: 'column',
+    paddingBottom: 0,
+    alignSelf: 'stretch',
+  },
+  modalBodyLogScroll: {
+    flex: 1,
+    minHeight: 0,
+  },
+  modalBodyLogScrollContent: {
+    flexGrow: 1,
+    paddingBottom: 8,
   },
   modalHeaderRow: {
     flexDirection: 'row',
@@ -1994,6 +2044,9 @@ const styles = StyleSheet.create({
   },
   modalTapBelowInputs: {
     minHeight: 72,
+  },
+  modalTapBelowInputsSmall: {
+    minHeight: 8,
   },
   modalButtonsSticky: {
     marginTop: 8,

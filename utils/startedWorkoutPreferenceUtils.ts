@@ -10,9 +10,11 @@ const ENABLE_SET_SWITCH_SOUND_KEY = '@enable_set_switch_sound';
 const AUTO_FILL_REPS_KEY = '@auto_fill_reps';
 const USE_LOGS_FOR_REP_INPUT_KEY = '@use_logs_for_rep_input';
 
-// Default values
-const DEFAULT_SET_REST_TIME = '30';
-const DEFAULT_EXERCISE_REST_TIME = '60';
+/** Rest between sets (seconds) for new exercises, Sage saves, and timer defaults. */
+export const DEFAULT_REST_SECONDS_BETWEEN_SETS = 60;
+
+const DEFAULT_SET_REST_TIME = String(DEFAULT_REST_SECONDS_BETWEEN_SETS);
+const DEFAULT_EXERCISE_REST_TIME = String(DEFAULT_REST_SECONDS_BETWEEN_SETS);
 
 export interface RestTimerPreferences {
   restTimeBetweenSets: string;

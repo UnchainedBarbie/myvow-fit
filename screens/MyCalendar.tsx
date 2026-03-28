@@ -40,6 +40,17 @@ import {
   ScrollView as GestureScrollView,
 } from 'react-native-gesture-handler';
 import { runOnJS } from 'react-native-reanimated';
+import { formatWorkoutHeaderTitle } from '../utils/workoutDisplayUtils';
+import {
+  CALENDAR_GRID_FIRST_WEEKDAY,
+  daysToSubtractForMonthGrid,
+  getWeekdayHeaderKeys,
+} from '../utils/calendarGridRange';
+import {
+  clearActiveWorkoutSession,
+  getActiveWorkoutSession,
+} from '../utils/activeWorkoutSession';
+import { timerStateUtils } from '../utils/timerPersistenceUtils';
 
 type MyCalendarNavigationProp = StackNavigationProp<
   WorkoutLogStackParamList,
@@ -56,6 +67,7 @@ interface WorkoutEntry {
     day_name: string;
     workout_log_id: number;
     notification_id?: string | null;
+    workout_type?: string | null;
   };
   isLogged: boolean;
 }
@@ -77,7 +89,7 @@ export default function MyCalendar() {
   const route = useRoute<MyCalendarRouteProp>();
   const { theme } = useTheme();
   const { t } = useTranslation();
-  const { dateFormat, weightFormat, firstWeekday } = useSettings();
+  const { dateFormat, weightFormat } = useSettings();
   const { cancelNotification, scheduleNotification } = useNotifications();
   const { checkRecurringWorkouts } = useRecurringWorkouts();
 
@@ -105,6 +117,9 @@ export default function MyCalendar() {
     ExerciseDetails[]
   >([]);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
+  const [activeWorkoutLogId, setActiveWorkoutLogId] = useState<number | null>(
+    null,
+  );
 
   const workoutsRef = useRef(workouts);
   const selectedDateRef = useRef(selectedDate);
@@ -210,12 +225,10 @@ export default function MyCalendar() {
         const firstDayOfMonth = new Date(date.getFullYear(), date.getMonth(), 1);
         const dayOfWeek = firstDayOfMonth.getDay(); // 0=Sun, 1=Mon...
 
-        const daysToSubtract =
-          firstWeekday === 'Monday'
-            ? dayOfWeek === 0
-              ? 6
-              : dayOfWeek - 1
-            : dayOfWeek;
+        const daysToSubtract = daysToSubtractForMonthGrid(
+          dayOfWeek,
+          CALENDAR_GRID_FIRST_WEEKDAY,
+        );
 
         const gridStartDate = new Date(firstDayOfMonth);
         gridStartDate.setDate(gridStartDate.getDate() - daysToSubtract);
@@ -272,7 +285,7 @@ export default function MyCalendar() {
         console.error('Error fetching workouts for grid:', error);
       }
     },
-    [db, firstWeekday],
+    [db],
   );
 
   /** Load workouts for one local calendar day (used when swiping the day modal off-grid). */
@@ -361,16 +374,28 @@ export default function MyCalendar() {
         console.log(
           'MyCalendar: Screen focused, materializing recurring & fetching grid.',
         );
-        await checkRecurringWorkouts(currentDate, firstWeekday);
+        await checkRecurringWorkouts(currentDate, CALENDAR_GRID_FIRST_WEEKDAY);
         if (!cancelled) {
           await fetchWorkoutsForGrid(currentDate);
+        }
+        if (!cancelled) {
+          const session = await getActiveWorkoutSession();
+          if (!cancelled) {
+            setActiveWorkoutLogId(session?.workoutLogId ?? null);
+          }
         }
       })();
       return () => {
         cancelled = true;
       };
-    }, [currentDate, firstWeekday, checkRecurringWorkouts, fetchWorkoutsForGrid]),
+    }, [currentDate, checkRecurringWorkouts, fetchWorkoutsForGrid]),
   );
+
+  const dismissActiveWorkoutBanner = useCallback(async () => {
+    await clearActiveWorkoutSession().catch(() => {});
+    await timerStateUtils.clearTimerState().catch(() => {});
+    setActiveWorkoutLogId(null);
+  }, []);
 
   const fetchWorkoutDetails = async (
     workout_log_id: number,
@@ -475,7 +500,7 @@ export default function MyCalendar() {
   useEffect(() => {
     const handleRefresh = async () => {
       console.log('DEBUG: Refresh signal received, starting async process.');
-      await checkRecurringWorkouts(currentDate, firstWeekday);
+      await checkRecurringWorkouts(currentDate, CALENDAR_GRID_FIRST_WEEKDAY);
       console.log('Recurring workouts check complete.');
       await fetchWorkoutsForGrid(currentDate);
       console.log('Calendar grid data re-fetched.');
@@ -490,7 +515,6 @@ export default function MyCalendar() {
     navigation,
     fetchWorkoutsForGrid,
     currentDate,
-    firstWeekday,
     checkRecurringWorkouts,
   ]);
 
@@ -707,26 +731,10 @@ export default function MyCalendar() {
     return t(months[date.getMonth()]);
   };
 
-  const weekDays =
-    firstWeekday === 'Monday'
-      ? [
-          t('Mon'),
-          t('Tue'),
-          t('Wed'),
-          t('Thu'),
-          t('Fri'),
-          t('Sat'),
-          t('Sun'),
-        ]
-      : [
-          t('Sun'),
-          t('Mon'),
-          t('Tue'),
-          t('Wed'),
-          t('Thu'),
-          t('Fri'),
-          t('Sat'),
-        ];
+  const weekDays = useMemo(
+    () => getWeekdayHeaderKeys(CALENDAR_GRID_FIRST_WEEKDAY).map((k) => t(k)),
+    [t],
+  );
 
   const renderCalendarGrid = () => {
     const gridItems = [];
@@ -746,12 +754,7 @@ export default function MyCalendar() {
     const firstDayOfMonth = new Date(year, month, 1);
     const dayOfWeek = firstDayOfMonth.getDay();
 
-    const daysToSubtract =
-      firstWeekday === 'Monday'
-        ? dayOfWeek === 0
-          ? 6
-          : dayOfWeek - 1
-        : dayOfWeek;
+    const daysToSubtract = daysToSubtractForMonthGrid(dayOfWeek, CALENDAR_GRID_FIRST_WEEKDAY);
 
     const gridStartDate = new Date(firstDayOfMonth);
     gridStartDate.setDate(gridStartDate.getDate() - daysToSubtract);
@@ -848,6 +851,65 @@ export default function MyCalendar() {
       showsVerticalScrollIndicator={false}
       contentContainerStyle={[styles.contentContainer, { paddingTop: 24 }]}
     >
+      {activeWorkoutLogId != null && (
+        <View
+          style={[
+            styles.activeWorkoutBanner,
+            {
+              backgroundColor: theme.card,
+              borderColor: theme.border,
+            },
+          ]}
+        >
+          <Text
+            style={[styles.activeWorkoutBannerText, { color: theme.text }]}
+          >
+            {t('workoutInProgressBanner')}
+          </Text>
+          <View style={styles.activeWorkoutBannerActions}>
+            <TouchableOpacity
+              style={[
+                styles.activeWorkoutBannerButton,
+                styles.activeWorkoutBannerButtonOutline,
+                { borderColor: theme.border },
+              ]}
+              onPress={dismissActiveWorkoutBanner}
+              activeOpacity={0.85}
+            >
+              <Text
+                style={[
+                  styles.activeWorkoutBannerButtonText,
+                  { color: theme.text },
+                ]}
+              >
+                {t('Cancel')}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.activeWorkoutBannerButton,
+                { backgroundColor: theme.buttonBackground },
+              ]}
+              onPress={() =>
+                navigation.navigate('StartedWorkoutInterface', {
+                  workout_log_id: activeWorkoutLogId,
+                  resume: true,
+                })
+              }
+              activeOpacity={0.85}
+            >
+              <Text
+                style={[
+                  styles.activeWorkoutBannerButtonText,
+                  { color: theme.buttonText },
+                ]}
+              >
+                {t('resumeWorkout')}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
       <View style={styles.buttonRow}>
         <TouchableOpacity
             style={[
@@ -1049,11 +1111,24 @@ export default function MyCalendar() {
             {detailedWorkout ? (
               <>
                 <Text style={[styles.modalTitle, { color: theme.text }]}>
-                  {detailedWorkout.workout.workout_name}
+                  {detailedWorkout.workout.workout_name.trim() ===
+                  detailedWorkout.workout.day_name.trim()
+                    ? formatWorkoutHeaderTitle(
+                        detailedWorkout.workout.workout_name,
+                        detailedWorkout.workout.day_name
+                      )
+                    : detailedWorkout.workout.workout_name}
                 </Text>
+                {!!detailedWorkout.workout.workout_type && (
+                  <Text style={[styles.modalSubtitle, { color: theme.textSecondary, marginTop: 2 }]}>
+                    {detailedWorkout.workout.workout_type === 'cardio' ? 'Cardio' : 'Strength'}
+                  </Text>
+                )}
                 <Text style={[styles.modalSubtitle, { color: theme.text }]}>
-                  {detailedWorkout.workout.day_name} |{' '}
-                  {formatDate(detailedWorkout.workout.workout_date)}
+                  {detailedWorkout.workout.workout_name.trim() ===
+                  detailedWorkout.workout.day_name.trim()
+                    ? formatDate(detailedWorkout.workout.workout_date)
+                    : `${detailedWorkout.workout.day_name} | ${formatDate(detailedWorkout.workout.workout_date)}`}
                 </Text>
                 {completionTime && (
                   <View style={styles.completionTimeContainer}>
@@ -1174,16 +1249,24 @@ export default function MyCalendar() {
                                   { color: theme.text },
                                 ]}
                               >
-                                {entry.workout.workout_name}
+                                {entry.workout.workout_name.trim() === entry.workout.day_name.trim()
+                                  ? formatWorkoutHeaderTitle(
+                                      entry.workout.workout_name,
+                                      entry.workout.day_name
+                                    )
+                                  : entry.workout.workout_name}
                               </Text>
-                              <Text
-                                style={[
-                                  styles.modalWorkoutDay,
-                                  { color: theme.text },
-                                ]}
-                              >
-                                {entry.workout.day_name}
-                              </Text>
+                              {entry.workout.workout_name.trim() !==
+                                entry.workout.day_name.trim() && (
+                                <Text
+                                  style={[
+                                    styles.modalWorkoutDay,
+                                    { color: theme.text },
+                                  ]}
+                                >
+                                  {entry.workout.day_name}
+                                </Text>
+                              )}
                             </View>
                           </TouchableOpacity>
                         ))}
@@ -1356,7 +1439,10 @@ export default function MyCalendar() {
             {workoutToReschedule && (
               <>
                 <Text style={[styles.modalSubtitle, { color: theme.text }]}>
-                  {workoutToReschedule.workout.workout_name} · {workoutToReschedule.workout.day_name}
+                  {formatWorkoutHeaderTitle(
+                    workoutToReschedule.workout.workout_name,
+                    workoutToReschedule.workout.day_name
+                  )}
                 </Text>
                 <Text style={[styles.rescheduleLabel, { color: theme.text }]}>
                   {t('chooseNewDate') || 'Choose new date'}
@@ -1506,12 +1592,21 @@ export default function MyCalendar() {
               <Ionicons name='close' size={scale(24)} color={theme.text} />
             </TouchableOpacity>
             <Text style={[styles.modalTitle, { color: theme.text }]}>
-              {selectedUntrackedWorkout?.workout.workout_name}
+              {selectedUntrackedWorkout &&
+              selectedUntrackedWorkout.workout.workout_name.trim() ===
+                selectedUntrackedWorkout.workout.day_name.trim()
+                ? formatWorkoutHeaderTitle(
+                    selectedUntrackedWorkout.workout.workout_name,
+                    selectedUntrackedWorkout.workout.day_name
+                  )
+                : selectedUntrackedWorkout?.workout.workout_name}
             </Text>
             {selectedUntrackedWorkout && (
               <Text style={[styles.modalSubtitle, { color: theme.text }]}>
-                {selectedUntrackedWorkout.workout.day_name} |{' '}
-                {formatDate(selectedUntrackedWorkout.workout.workout_date)}
+                {selectedUntrackedWorkout.workout.workout_name.trim() ===
+                selectedUntrackedWorkout.workout.day_name.trim()
+                  ? formatDate(selectedUntrackedWorkout.workout.workout_date)
+                  : `${selectedUntrackedWorkout.workout.day_name} | ${formatDate(selectedUntrackedWorkout.workout.workout_date)}`}
               </Text>
             )}
             <ScrollView
@@ -1982,5 +2077,41 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: verticalScale(10),
     marginRight: scale(10),
+  },
+  activeWorkoutBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: scale(12),
+    paddingVertical: verticalScale(12),
+    paddingHorizontal: scale(14),
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: verticalScale(14),
+  },
+  activeWorkoutBannerText: {
+    flex: 1,
+    fontFamily: 'Jost_500Medium',
+    fontSize: moderateScale(15),
+    lineHeight: moderateScale(21),
+  },
+  activeWorkoutBannerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexShrink: 0,
+    gap: scale(8),
+  },
+  activeWorkoutBannerButton: {
+    paddingVertical: verticalScale(8),
+    paddingHorizontal: scale(14),
+    borderRadius: 20,
+  },
+  activeWorkoutBannerButtonOutline: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+  },
+  activeWorkoutBannerButtonText: {
+    fontFamily: 'Jost_600SemiBold',
+    fontSize: moderateScale(15),
   },
 });

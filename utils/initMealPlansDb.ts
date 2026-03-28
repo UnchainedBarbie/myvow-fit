@@ -1,13 +1,12 @@
 /**
  * Meal plans and schedule tables. Call from Nutrition screens (under SQLiteProvider).
  */
-let initialized = false;
+import { ensureLoggedFoodsSchema, ensureMealPlansNutritionColumns } from './nutritionDb';
 
 export const initMealPlansDb = async (db: {
   runAsync: (sql: string, params?: any[]) => Promise<void>;
   getAllAsync: (sql: string, params?: any[]) => Promise<any[]>;
 }) => {
-  if (initialized) return;
   try {
     await db.runAsync(`
       CREATE TABLE IF NOT EXISTS MealPlans (
@@ -16,6 +15,21 @@ export const initMealPlansDb = async (db: {
         schedule_type TEXT DEFAULT 'manual'
       );
     `);
+    // Migration: newer nutrition schema uses plan_name; older scheduling schema uses name.
+    // Ensure BOTH columns exist so queries/inserts don't crash on existing installs.
+    try {
+      await db.runAsync(`ALTER TABLE MealPlans ADD COLUMN plan_name TEXT;`);
+    } catch (_) {}
+    try {
+      await db.runAsync(`ALTER TABLE MealPlans ADD COLUMN name TEXT;`);
+    } catch (_) {}
+    // Backfill whichever column is missing values.
+    try {
+      await db.runAsync(`UPDATE MealPlans SET plan_name = COALESCE(plan_name, name);`);
+    } catch (_) {}
+    try {
+      await db.runAsync(`UPDATE MealPlans SET name = COALESCE(name, plan_name);`);
+    } catch (_) {}
     try {
       await db.runAsync(`ALTER TABLE MealPlans ADD COLUMN schedule_type TEXT DEFAULT 'manual';`);
     } catch (_) {
@@ -60,22 +74,33 @@ export const initMealPlansDb = async (db: {
       );
     `);
 
+    // Align with nutrition tracker (DailyLog + LoggedFoods.log_id). Legacy installs are migrated in ensureLoggedFoodsSchema.
+    await db.runAsync(`
+      CREATE TABLE IF NOT EXISTS DailyLog (
+        log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        log_date TEXT UNIQUE,
+        meal_plan_id INTEGER,
+        FOREIGN KEY (meal_plan_id) REFERENCES MealPlans(meal_plan_id)
+      );
+    `);
     await db.runAsync(`
       CREATE TABLE IF NOT EXISTS LoggedFoods (
         logged_food_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        log_date TEXT NOT NULL,
-        meal_type TEXT,
-        food_name TEXT NOT NULL,
+        log_id INTEGER,
+        food_name TEXT,
         brand TEXT,
+        meal_type TEXT,
+        serving_size TEXT,
         quantity REAL DEFAULT 1,
-        unit TEXT DEFAULT 'serving',
-        calories REAL DEFAULT 0,
-        protein REAL DEFAULT 0,
-        carbs REAL DEFAULT 0,
-        fat REAL DEFAULT 0
+        calories INTEGER,
+        protein REAL,
+        carbs REAL,
+        fat REAL,
+        FOREIGN KEY (log_id) REFERENCES DailyLog(log_id)
       );
     `);
-    initialized = true;
+    await ensureMealPlansNutritionColumns(db);
+    await ensureLoggedFoodsSchema(db as any);
   } catch (error) {
     console.error('initMealPlansDb error:', error);
   }

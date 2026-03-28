@@ -163,7 +163,7 @@ export default function Home() {
           <Text style={[styles.tileIcon, { color: theme.primary }]}>↗</Text>
           <View style={styles.tileTextBlock}>
             <Text style={[styles.tileTitle, { color: theme.text }]}>
-              MyProgress
+              Progress
             </Text>
             <Text
               style={[

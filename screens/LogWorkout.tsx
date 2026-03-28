@@ -246,10 +246,21 @@ export default function LogWorkout() {
         });
       }
 
+      // Defensive migration: some older DBs don't have notification_id yet.
+      await db.runAsync('ALTER TABLE Workout_Log ADD COLUMN notification_id TEXT;').catch(() => {});
+      await db.runAsync('ALTER TABLE Workout_Log ADD COLUMN completion_time INTEGER;').catch(() => {});
+      await db.runAsync("ALTER TABLE Workout_Log ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';").catch(() => {});
+      await db.runAsync("ALTER TABLE Workouts ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';").catch(() => {});
+      const wtRows = await db.getAllAsync<{ workout_type: string }>(
+        'SELECT workout_type FROM Workouts WHERE workout_id = ?;',
+        [selectedWorkout],
+      );
+      const workoutType = wtRows[0]?.workout_type === 'cardio' ? 'cardio' : 'strength';
+
       // Insert the workout log into the database with notification_id if available
       const { lastInsertRowId: workoutLogId } = await db.runAsync(
-        'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id) VALUES (?, ?, ?, ?);',
-        [workoutDate, selectedDayName, workout_name, notificationId]
+        'INSERT OR REPLACE INTO Workout_Log (workout_date, day_name, workout_name, notification_id, workout_type) VALUES (?, ?, ?, ?, ?);',
+        [workoutDate, selectedDayName, workout_name, notificationId, workoutType]
       );
 
       // Fetch all exercises associated with the selected day
@@ -258,15 +269,17 @@ export default function LogWorkout() {
         [selectedDay]
       );
 
-      // Insert exercises into the Logged_Exercises table
-      const insertExercisePromises = exercises.map((exercise) =>
-        db.runAsync(
-          'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
-          [workoutLogId, exercise.exercise_name, exercise.sets, exercise.reps, exercise.web_link, exercise.muscle_group, exercise.exercise_notes, exercise.rest_seconds ?? null]
-        )
-      );
+      if (workoutType !== 'cardio') {
+        // Insert exercises into the Logged_Exercises table
+        const insertExercisePromises = exercises.map((exercise) =>
+          db.runAsync(
+            'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+            [workoutLogId, exercise.exercise_name, exercise.sets, exercise.reps, exercise.web_link, exercise.muscle_group, exercise.exercise_notes, exercise.rest_seconds ?? null]
+          )
+        );
 
-      await Promise.all(insertExercisePromises);
+        await Promise.all(insertExercisePromises);
+      }
 
       // New navigation logic based on the selected date
       const today = new Date();

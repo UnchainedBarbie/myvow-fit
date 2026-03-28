@@ -225,7 +225,6 @@ type NutritionTodayProps = {
 };
 
 export default function NutritionToday({ selectedDate, onLoadPlan, reload }: NutritionTodayProps) {
-  console.log('[NutritionToday render] selectedDate prop:', selectedDate);
   const isLoadingRef = useRef(false);
   const { theme } = useTheme();
   const db = useSQLiteContext();

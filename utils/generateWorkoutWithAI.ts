@@ -3,10 +3,17 @@
  * Returns data ready to insert into Workouts, Days, and Exercises tables.
  */
 
+import { initWorkoutDb } from './initWorkoutDb';
+import { DEFAULT_REST_SECONDS_BETWEEN_SETS } from './startedWorkoutPreferenceUtils';
+
 export interface AIExercise {
   exercise_name: string;
-  sets: number;
-  reps: number;
+  /** Sage: 'strength' | 'cardio' */
+  type?: string | null;
+  sets?: number;
+  reps?: number;
+  duration_minutes?: number | null;
+  distance?: string | number | null;
   web_link?: string | null;
   muscle_group?: string | null;
   exercise_notes?: string | null;
@@ -158,11 +165,36 @@ export async function generateWorkoutWithAI(
   return validateAndNormalize(parsed);
 }
 
+export function isAiExerciseCardio(ex: AIExercise): boolean {
+  if (String(ex.type ?? '').toLowerCase() === 'cardio') return true;
+  return /^cardio:/i.test((ex.exercise_name ?? '').trim());
+}
+
+/** DB keeps NOT NULL on sets/reps; cardio uses placeholders — real duration in duration_minutes. */
+export function setsRepsForDbInsert(ex: AIExercise): { sets: number; reps: number } {
+  if (isAiExerciseCardio(ex)) {
+    return { sets: 1, reps: 1 };
+  }
+  const s = typeof ex.sets === 'number' ? ex.sets : parseInt(String(ex.sets ?? ''), 10);
+  const r = typeof ex.reps === 'number' ? ex.reps : parseInt(String(ex.reps ?? ''), 10);
+  return {
+    sets: Number.isInteger(s) && s >= 1 ? s : 1,
+    reps: Number.isInteger(r) && r >= 1 ? r : 1,
+  };
+}
+
+function parseDurationMinutes(ex: AIExercise): number | null {
+  const d = ex.duration_minutes;
+  const n = typeof d === 'number' ? d : parseInt(String(d ?? ''), 10);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
 /**
- * Inserts or updates an AI-generated workout in the SQLite database (Workouts, Days, Exercises).
+ * Inserts or updates an AI-generated workout in the SQLite database (Workouts, Days, and Exercises).
  * If a workout with the same workout_name exists, updates that row and replaces its Days and Exercises.
  */
 export async function insertAIWorkout(db: { withTransactionAsync: (fn: () => Promise<void>) => Promise<void>; runAsync: (sql: string, params?: unknown[]) => Promise<unknown>; getAllAsync: <T>(sql: string, params?: unknown[]) => Promise<T[]> }, workout: AIWorkout): Promise<void> {
+  await initWorkoutDb(db as { runAsync: typeof db.runAsync });
   await db.withTransactionAsync(async () => {
     const existing = await db.getAllAsync<{ workout_id: number }>(
       'SELECT workout_id FROM Workouts WHERE workout_name = ?;',
@@ -191,17 +223,55 @@ export async function insertAIWorkout(db: { withTransactionAsync: (fn: () => Pro
       if (!dayIdResult.length) throw new Error('Failed to retrieve day ID.');
       const dayId = dayIdResult[0].day_id;
 
-      for (const ex of day.exercises) {
-        await db.runAsync(
-          'INSERT INTO Exercises (day_id, exercise_name, sets, reps, rest_seconds) VALUES (?, ?, ?, ?, ?);',
-          [
-            dayId,
-            ex.exercise_name,
-            ex.sets,
-            ex.reps,
-            null,
-          ]
-        );
+      for (let i = 0; i < day.exercises.length; i++) {
+        const ex = day.exercises[i]!;
+        const { sets, reps } = setsRepsForDbInsert(ex);
+        const exerciseType = isAiExerciseCardio(ex) ? 'cardio' : 'strength';
+        const durationMinutes = isAiExerciseCardio(ex) ? parseDurationMinutes(ex) : null;
+        const cardioDist =
+          isAiExerciseCardio(ex) && ex.distance != null ? String(ex.distance) : null;
+        const restSeconds = DEFAULT_REST_SECONDS_BETWEEN_SETS;
+        try {
+          await db.runAsync(
+            'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, exercise_type, duration_minutes, cardio_distance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+            [
+              dayId,
+              ex.exercise_name,
+              sets,
+              reps,
+              ex.web_link ?? null,
+              ex.muscle_group ?? null,
+              ex.exercise_notes ?? null,
+              restSeconds,
+              i,
+              exerciseType,
+              durationMinutes,
+              cardioDist,
+            ],
+          );
+        } catch {
+          try {
+            await db.runAsync(
+              'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);',
+              [
+                dayId,
+                ex.exercise_name,
+                sets,
+                reps,
+                ex.web_link ?? null,
+                ex.muscle_group ?? null,
+                ex.exercise_notes ?? null,
+                restSeconds,
+                i,
+              ],
+            );
+          } catch {
+            await db.runAsync(
+              'INSERT INTO Exercises (day_id, exercise_name, sets, reps, rest_seconds) VALUES (?, ?, ?, ?, ?);',
+              [dayId, ex.exercise_name, sets, reps, restSeconds],
+            );
+          }
+        }
       }
     }
   });
