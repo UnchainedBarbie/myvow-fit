@@ -49,7 +49,9 @@ export default function WorkoutDetails() {
   const [exerciseName, setExerciseName] = useState('');
   const [exerciseSets, setExerciseSets] = useState('');
   const [exerciseReps, setExerciseReps] = useState('');
-  const [exerciseRestSeconds, setExerciseRestSeconds] = useState('');
+  const [exerciseRestSeconds, setExerciseRestSeconds] = useState(
+    String(DEFAULT_REST_SECONDS_BETWEEN_SETS),
+  );
   const [exerciseWebLink, setExerciseWebLink] = useState('');
   const [exerciseNotesInput, setExerciseNotesInput] = useState('');
   const [newExerciseMuscleGroup, setNewExerciseMuscleGroup] = useState<string | null>(null);
@@ -451,7 +453,7 @@ export default function WorkoutDetails() {
     setExerciseName('');
     setExerciseSets('');
     setExerciseReps('');
-    setExerciseRestSeconds('');
+    setExerciseRestSeconds(String(DEFAULT_REST_SECONDS_BETWEEN_SETS));
     setExerciseWebLink('');
     setExerciseNotesInput('');
     setNewExerciseMuscleGroup(null);
@@ -555,7 +557,13 @@ export default function WorkoutDetails() {
       return;
     }
 
-    const restSec = exerciseRestSeconds.trim() ? parseInt(exerciseRestSeconds.trim(), 10) : null;
+    const restParsed = exerciseRestSeconds.trim()
+      ? parseInt(exerciseRestSeconds.trim(), 10)
+      : NaN;
+    const restSec =
+      Number.isFinite(restParsed) && restParsed > 0
+        ? restParsed
+        : DEFAULT_REST_SECONDS_BETWEEN_SETS;
     await db.runAsync(
       'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);',
       [
@@ -783,7 +791,11 @@ export default function WorkoutDetails() {
     setEditingExercise(exercise);
     setWebLinkInput(exercise.web_link || '');
     setExerciseReps(exercise.reps.toString());
-    setExerciseRestSeconds(exercise.rest_seconds != null ? String(exercise.rest_seconds) : '');
+    setExerciseRestSeconds(
+      exercise.rest_seconds != null
+        ? String(exercise.rest_seconds)
+        : String(DEFAULT_REST_SECONDS_BETWEEN_SETS),
+    );
     setExerciseSets(exercise.sets.toString());
     setExerciseNotesInput(exercise.exercise_notes || '');
     setEditingMuscleGroup(exercise.muscle_group);
@@ -796,7 +808,7 @@ export default function WorkoutDetails() {
     setEditingExercise(null);
     setExerciseReps('');
     setExerciseSets('');
-    setExerciseRestSeconds('');
+    setExerciseRestSeconds(String(DEFAULT_REST_SECONDS_BETWEEN_SETS));
     setWebLinkInput('');
     setExerciseNotesInput('');
     setExerciseName('');
@@ -844,7 +856,13 @@ export default function WorkoutDetails() {
       return;
     }
 
-    const restSec = exerciseRestSeconds.trim() ? parseInt(exerciseRestSeconds.trim(), 10) : null;
+    const restParsedEdit = exerciseRestSeconds.trim()
+      ? parseInt(exerciseRestSeconds.trim(), 10)
+      : NaN;
+    const restSec =
+      Number.isFinite(restParsedEdit) && restParsedEdit > 0
+        ? restParsedEdit
+        : DEFAULT_REST_SECONDS_BETWEEN_SETS;
     try {
       await db.runAsync(
         'UPDATE Exercises SET web_link = ?, muscle_group = ?, exercise_notes = ?, sets = ?, reps = ?, exercise_name = ?, rest_seconds = ? WHERE exercise_id = ?',
@@ -1033,6 +1051,21 @@ export default function WorkoutDetails() {
                       </TouchableOpacity>
                     )}
                   </View>
+
+                  <TouchableOpacity
+                    onPress={() => openScheduleModalForDayIds([day.day_id])}
+                    disabled={isReordering}
+                    style={styles.reorderButton}
+                    hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+                    accessibilityRole="button"
+                    accessibilityLabel={t('addToCalendar') || 'Add to Calendar'}
+                  >
+                    <Ionicons
+                      name="calendar-outline"
+                      size={24}
+                      color={isReordering ? theme.border : theme.text}
+                    />
+                  </TouchableOpacity>
 
                   <TouchableOpacity
                     onPress={() => openAddExerciseModal(day.day_id)}

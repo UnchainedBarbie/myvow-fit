@@ -283,6 +283,11 @@ export async function initNutritionDb(db: SQLiteDatabase): Promise<void> {
   }
 
   await ensureMealPlansNutritionColumns(db);
+  try {
+    await db.execAsync(`ALTER TABLE FoodItems ADD COLUMN quantity REAL DEFAULT 1;`);
+  } catch (e) {
+    // ignore if exists
+  }
   await ensureLoggedFoodsSchema(db);
 }
 

@@ -21,7 +21,11 @@ import { useSQLiteContext } from 'expo-sqlite';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { initNutritionDb } from '../utils/nutritionDb';
-import { getRelevantUnits, pickDefaultUnitForFood, isPieceServingUnit } from '../utils/getRelevantUnits';
+import {
+  getRelevantUnits,
+  pickDefaultUnitForFood,
+  isPieceServingUnit,
+} from '../utils/getRelevantUnits';
 
 const SAGE = '#7C9A7E';
 
@@ -38,7 +42,7 @@ const MEAL_OPTIONS = ['Breakfast', 'Snack', 'Lunch', 'Dinner'] as const;
 function gramsPerUnit(unit: string): number {
   switch (unit) {
     case 'g': return 1;
-    case 'oz': return 28.35;
+    case 'oz': return 28.3495;
     case 'fl oz': return 29.5735;
     case 'serving': return 100;
     case 'cup': return 240;
@@ -83,6 +87,12 @@ export type FoodResult = {
   per100g?: { calories: number; protein: number; carbs: number; fat: number };
   /** Barcode, per-100g-only path: default unit when quantity defaults to 100. */
   defaultBarcodeMassUnit?: 'g' | 'ml';
+  /** USDA FDC: declared serving amount from API (household serving). */
+  usdaServingSizeAmount?: number;
+  /** USDA FDC: declared serving unit string from API. */
+  usdaServingSizeUnit?: string | null;
+  /** Grams for the full declared API serving when mass-convertible. */
+  usdaDeclaredServingGrams?: number | null;
 };
 
 /** Favorite from DB (same table as Profile uses). */
@@ -101,12 +111,150 @@ function favoriteSignature(name: string, brand: string | null): string {
   return `${name}|${brand ?? ''}`;
 }
 
+/** Map API / UI unit strings to canonical keys for gram math. */
+function normalizeUnitKeyForGrams(u: string): string {
+  const x = String(u).trim().toLowerCase();
+  if (!x) return '';
+  if (x === 'g' || x === 'gram' || x === 'grams') return 'g';
+  if (
+    x === 'ml' ||
+    x === 'milliliter' ||
+    x === 'milliliters' ||
+    x === 'millilitre'
+  ) {
+    return 'ml';
+  }
+  if (x === 'oz' || x === 'ounce' || x === 'ounces') return 'oz';
+  if (x === 'cup' || x === 'cups') return 'cup';
+  if (x === 'tbsp' || x === 'tablespoon' || x === 'tablespoons' || x === 'tbs') {
+    return 'tbsp';
+  }
+  if (x === 'tsp' || x === 'teaspoon' || x === 'teaspoons') return 'tsp';
+  if (x === 'slice' || x === 'slices' || x === 'piece' || x === 'pieces') {
+    return 'slice';
+  }
+  if (x === 'serving' || x === 'servings') return 'serving';
+  if (
+    x === 'fl oz' ||
+    x === 'floz' ||
+    x === 'fluid ounce' ||
+    x === 'fluid ounces'
+  ) {
+    return 'fl oz';
+  }
+  if (x === 'lb' || x === 'lbs' || x === 'pound' || x === 'pounds') return 'lb';
+  return x;
+}
+
+/** Canonical unit for quantity UI + totalGramsForUsdaPer100Food from USDA search servingSizeUnit. */
+function usdaApiServingUnitToUiUnit(unitRaw: string): string {
+  return normalizeUnitKeyForGrams(unitRaw) || 'serving';
+}
+
+function usdaServingAmountToQtyString(amt: number): string {
+  if (!Number.isFinite(amt) || amt <= 0) return '1';
+  if (Number.isInteger(amt)) return String(amt);
+  const s = parseFloat(amt.toFixed(4)).toString();
+  return s || String(amt);
+}
+
+/**
+ * Convert USDA declared household serving to total grams when the API unit is mass/volume.
+ */
+function convertUsdaDeclaredPortionToGrams(amount: number, unitRaw: string): number | null {
+  if (!(amount > 0)) return null;
+  const k = normalizeUnitKeyForGrams(unitRaw);
+  switch (k) {
+    case 'g':
+    case 'ml':
+      return amount;
+    case 'oz':
+      return amount * 28.3495;
+    case 'cup':
+      return amount * 240;
+    case 'tbsp':
+      return amount * 15;
+    case 'tsp':
+      return amount * 5;
+    case 'lb':
+      return amount * 453.59;
+    case 'fl oz':
+      return amount * 29.5735;
+    default:
+      return null;
+  }
+}
+
+function isUsdaSearchPer100Food(food: FoodResult | FavoriteFoodItem): food is FoodResult {
+  return (
+    typeof food === 'object' &&
+    food != null &&
+    'source' in food &&
+    food.source === 'usda' &&
+    !!food.per100g
+  );
+}
+
+/**
+ * Total grams of food for per-100g macro scaling (USDA search only).
+ * g/ml: quantity = grams/ml; oz: ×28.3495; serving: × API declared grams or 100g default.
+ */
+function totalGramsForUsdaPer100Food(food: FoodResult, quantity: number, unit: string): number {
+  const q = quantity > 0 ? quantity : 0;
+  const u = normalizeUnitKeyForGrams(unit);
+  const apiAmt = food.usdaServingSizeAmount;
+  const apiUnitNorm = normalizeUnitKeyForGrams(food.usdaServingSizeUnit ?? '');
+  const apiG = food.usdaDeclaredServingGrams;
+
+  if (u === 'g' || u === 'ml') return q;
+  if (u === 'oz') return q * 28.3495;
+
+  if (u === 'serving') {
+    return q * (apiG != null && apiG > 0 ? apiG : 100);
+  }
+
+  if (u === 'cup' || u === 'tbsp' || u === 'tsp') {
+    if (
+      apiG != null &&
+      apiG > 0 &&
+      apiAmt != null &&
+      apiAmt > 0 &&
+      apiUnitNorm === u
+    ) {
+      return q * (apiG / apiAmt);
+    }
+    return q * gramsPerUnit(u);
+  }
+
+  if (u === 'slice' || isPieceServingUnit(unit)) {
+    if (
+      apiG != null &&
+      apiG > 0 &&
+      apiAmt != null &&
+      apiAmt > 0 &&
+      (apiUnitNorm === 'slice' || apiUnitNorm === 'serving')
+    ) {
+      return q * (apiG / apiAmt);
+    }
+    return q * gramsPerUnit('slice');
+  }
+
+  if (u === 'fl oz') return q * 29.5735;
+  if (u === 'lb') return q * 453.59;
+
+  return q * gramsPerUnit(unit);
+}
+
 export type AddFoodModalProps = {
   visible: boolean;
   mealType: string;
   selectedDate: string;
   onClose: () => void;
   onFoodAdded?: () => void;
+  /** When set, choosing a food updates this log row instead of inserting a new one. */
+  replaceLoggedFoodId?: number | null;
+  /** Overrides header title (default: "Add Food", or "Change food" when replacing). */
+  headerTitle?: string;
 };
 
 function numNut(v: unknown): number {
@@ -249,7 +397,7 @@ function inferUsdaSrDefaultMassUnit(food: Record<string, unknown>): 'g' | 'ml' {
 
 /**
  * Map USDA `/foods/search` item to FoodResult.
- * Branded items with servingSize use per-serving nutrient values; SR Legacy (no serving) uses per 100g.
+ * Nutrients from search are treated as per 100g; declared servingSize/servingSizeUnit scale cup/tbsp/tsp/serving/slice.
  */
 function normalizeUsdaSearchFood(food: Record<string, unknown>): FoodResult | null {
   const fdcId = food.fdcId;
@@ -271,25 +419,6 @@ function normalizeUsdaSearchFood(food: Record<string, unknown>): FoodResult | nu
   const hasServing = servingSizeNum > 0 && unitStr.length > 0;
   const serving_size = formatUsdaServingSize(food);
 
-  const base: FoodResult = {
-    code: String(fdcId),
-    food_name: description,
-    brand,
-    calories: Math.round(calories),
-    protein: Math.round(protein * 10) / 10,
-    carbs: Math.round(carbs * 10) / 10,
-    fat: Math.round(fat * 10) / 10,
-    serving_size,
-    source: 'usda',
-  };
-
-  if (hasServing) {
-    return {
-      ...base,
-      macrosArePerServing: true,
-    };
-  }
-
   const per100g = {
     calories: Math.round(calories),
     protein: Math.round(protein * 10) / 10,
@@ -297,11 +426,30 @@ function normalizeUsdaSearchFood(food: Record<string, unknown>): FoodResult | nu
     fat: Math.round(fat * 10) / 10,
   };
 
+  const usdaDeclaredServingGrams = hasServing
+    ? convertUsdaDeclaredPortionToGrams(servingSizeNum, unitStr)
+    : null;
+
   return {
-    ...base,
+    code: String(fdcId),
+    food_name: description,
+    brand,
+    calories: per100g.calories,
+    protein: per100g.protein,
+    carbs: per100g.carbs,
+    fat: per100g.fat,
+    serving_size,
+    source: 'usda',
     macrosArePerServing: false,
     per100g,
     defaultBarcodeMassUnit: inferUsdaSrDefaultMassUnit(food),
+    ...(hasServing
+      ? {
+          usdaServingSizeAmount: servingSizeNum,
+          usdaServingSizeUnit: unitStr,
+          usdaDeclaredServingGrams,
+        }
+      : {}),
   };
 }
 
@@ -367,6 +515,7 @@ function trimmedServingSize(food: { serving_size?: string | null }): string {
  * Search/barcode: per-serving macros from API. Favorites: macros are per saved serving when `serving_size` is set.
  */
 function useServingPortionDefaults(food: FoodResult | FavoriteFoodItem): boolean {
+  if (isUsdaSearchPer100Food(food)) return false;
   if (!trimmedServingSize(food)) return false;
   if ('macrosArePerServing' in food && food.macrosArePerServing === true) return true;
   if ('favorite_id' in food) return true;
@@ -374,6 +523,14 @@ function useServingPortionDefaults(food: FoodResult | FavoriteFoodItem): boolean
 }
 
 function applyQuantityDefaultsForSelectedFood(food: FoodResult | FavoriteFoodItem) {
+  if (isUsdaSearchPer100Food(food)) {
+    const fr = food;
+    if (fr.usdaDeclaredServingGrams != null && fr.usdaDeclaredServingGrams > 0) {
+      return { qty: '1', unit: 'serving' as const };
+    }
+    const u = fr.defaultBarcodeMassUnit ?? 'g';
+    return { qty: '100', unit: u };
+  }
   if (useServingPortionDefaults(food)) {
     return { qty: '1', unit: 'serving' as const };
   }
@@ -393,6 +550,18 @@ function macrosForQuantity(
   unit: string,
 ): { calories: number; protein: number; carbs: number; fat: number } {
   const q = quantity > 0 ? quantity : 1;
+
+  if (isUsdaSearchPer100Food(food)) {
+    const grams = totalGramsForUsdaPer100Food(food, q, unit);
+    const factor = grams / 100;
+    const p = food.per100g!;
+    return {
+      calories: Math.round(p.calories * factor),
+      protein: Math.round(p.protein * factor * 10) / 10,
+      carbs: Math.round(p.carbs * factor * 10) / 10,
+      fat: Math.round(p.fat * factor * 10) / 10,
+    };
+  }
 
   if (
     'favorite_id' in food &&
@@ -458,12 +627,86 @@ function nutrientValueByNumber(nutrients: any[], nutrientNumber: string): number
   return Number(match?.value) || 0;
 }
 
+async function upsertLoggedFoodRow(
+  db: { runAsync: (sql: string, params?: unknown[]) => Promise<void> },
+  opts: {
+    replaceLoggedFoodId: number | null | undefined;
+    logId: number;
+    food_name: string;
+    brand: string | null;
+    meal_type_lower: string;
+    serving_size: string;
+    quantity: number;
+    calories: number;
+    protein: number;
+    carbs: number;
+    fat: number;
+  },
+): Promise<void> {
+  const {
+    replaceLoggedFoodId,
+    logId,
+    food_name,
+    brand,
+    meal_type_lower,
+    serving_size,
+    quantity,
+    calories,
+    protein,
+    carbs,
+    fat,
+  } = opts;
+  if (replaceLoggedFoodId != null) {
+    const args = [
+      food_name,
+      brand,
+      meal_type_lower,
+      serving_size,
+      quantity,
+      calories,
+      protein,
+      carbs,
+      fat,
+      replaceLoggedFoodId,
+    ];
+    try {
+      await db.runAsync(
+        'UPDATE LoggedFoods SET food_name = ?, brand = ?, meal_type = ?, unit = ?, quantity = ?, calories = ?, protein = ?, carbs = ?, fat = ? WHERE logged_food_id = ?',
+        args,
+      );
+    } catch {
+      await db.runAsync(
+        'UPDATE LoggedFoods SET food_name = ?, brand = ?, meal_type = ?, serving_size = ?, quantity = ?, calories = ?, protein = ?, carbs = ?, fat = ? WHERE logged_food_id = ?',
+        args,
+      );
+    }
+    return;
+  }
+  await db.runAsync(
+    `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type, serving_size, quantity, calories, protein, carbs, fat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      logId,
+      food_name,
+      brand,
+      meal_type_lower,
+      serving_size,
+      quantity,
+      calories,
+      protein,
+      carbs,
+      fat,
+    ],
+  );
+}
+
 export default function AddFoodModal({
   visible,
   mealType,
   selectedDate,
   onClose,
   onFoodAdded,
+  replaceLoggedFoodId = null,
+  headerTitle: headerTitleProp,
 }: AddFoodModalProps) {
   const { theme } = useTheme();
   const db = useSQLiteContext();
@@ -484,8 +727,12 @@ export default function AddFoodModal({
 
   const syncQuantityModalFromFood = useCallback((food: FoodResult | FavoriteFoodItem) => {
     const ss = trimmedServingSize(food) || null;
-    setQtyRelevantUnits(getRelevantUnits(food.food_name, ss));
     const def = applyQuantityDefaultsForSelectedFood(food);
+    let units = [...getRelevantUnits(food.food_name, ss)];
+    if (!units.some((u) => u.toLowerCase() === String(def.unit).toLowerCase())) {
+      units = [def.unit, ...units];
+    }
+    setQtyRelevantUnits(units);
     setQtyValue(def.qty);
     setQtyUnit(pickDefaultUnitForFood(food.food_name, ss, def.unit));
   }, []);
@@ -501,6 +748,10 @@ export default function AddFoodModal({
   const [manualProtein, setManualProtein] = useState('');
   const [manualCarbs, setManualCarbs] = useState('');
   const [manualFat, setManualFat] = useState('');
+
+  const resolvedHeaderTitle =
+    headerTitleProp ?? (replaceLoggedFoodId != null ? 'Change food' : 'Add Food');
+  const confirmLogLabel = replaceLoggedFoodId != null ? 'Save' : 'Add to Log';
 
   const loadFavorites = useCallback(async () => {
     try {
@@ -753,12 +1004,24 @@ export default function AddFoodModal({
     try {
       await initNutritionDb(db);
       await db.runAsync('INSERT OR IGNORE INTO DailyLog (log_date) VALUES (?)', [today]);
-      const logRow = await db.getFirstAsync<{ log_id: number }>('SELECT log_id FROM DailyLog WHERE log_date = ?', [today]);
-      if (!logRow) throw new Error('DailyLog row not found');
-      await db.runAsync(
-        `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type, serving_size, quantity, calories, protein, carbs, fat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [logRow.log_id, selectedFood.food_name, selectedFood.brand, qtyMealType.toLowerCase(), servingSizeForDb, quantity, computedCals, computedProtein, computedCarbs, computedFat]
+      const logRow = await db.getFirstAsync<{ log_id: number }>(
+        'SELECT log_id FROM DailyLog WHERE log_date = ?',
+        [today],
       );
+      if (!logRow) throw new Error('DailyLog row not found');
+      await upsertLoggedFoodRow(db, {
+        replaceLoggedFoodId,
+        logId: logRow.log_id,
+        food_name: selectedFood.food_name,
+        brand: selectedFood.brand,
+        meal_type_lower: qtyMealType.toLowerCase(),
+        serving_size: servingSizeForDb,
+        quantity,
+        calories: computedCals,
+        protein: computedProtein,
+        carbs: computedCarbs,
+        fat: computedFat,
+      });
       setShowQuantityModal(false);
       setSelectedFood(null);
       setUnitDropdownOpen(false);
@@ -788,21 +1051,19 @@ export default function AddFoodModal({
       await db.runAsync('INSERT OR IGNORE INTO DailyLog (log_date) VALUES (?)', [today]);
       const logRow = await db.getFirstAsync<{ log_id: number }>('SELECT log_id FROM DailyLog WHERE log_date = ?', [today]);
       if (!logRow) throw new Error('DailyLog row not found');
-      await db.runAsync(
-        `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type, serving_size, quantity, calories, protein, carbs, fat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          logRow.log_id,
-          manualFoodName.trim(),
-          manualBrand.trim() || null,
-          mealType.toLowerCase(),
-          servingSize,
-          1,
-          calories,
-          protein,
-          carbs,
-          fat,
-        ]
-      );
+      await upsertLoggedFoodRow(db, {
+        replaceLoggedFoodId,
+        logId: logRow.log_id,
+        food_name: manualFoodName.trim(),
+        brand: manualBrand.trim() || null,
+        meal_type_lower: mealType.toLowerCase(),
+        serving_size: servingSize,
+        quantity: 1,
+        calories,
+        protein,
+        carbs,
+        fat,
+      });
       onFoodAdded?.();
       resetManualForm();
       onClose();
@@ -819,7 +1080,7 @@ export default function AddFoodModal({
       <View style={[styles.safeArea, { backgroundColor: theme.background, paddingTop: topPadding, paddingBottom: insets.bottom }]}>
         <View style={styles.container}>
           <View style={[styles.header, { borderBottomColor: theme.border }]}>
-            <Text style={[styles.headerTitle, { color: theme.text }]}>Add Food</Text>
+            <Text style={[styles.headerTitle, { color: theme.text }]}>{resolvedHeaderTitle}</Text>
             <TouchableOpacity onPress={onClose} style={styles.closeBtn} hitSlop={{ top: 20, bottom: 20, left: 20, right: 20 }}>
               <Ionicons name="close" size={28} color={theme.text} />
             </TouchableOpacity>
@@ -955,7 +1216,7 @@ export default function AddFoodModal({
                         style={[styles.quantityBtn, { backgroundColor: SAGE }]}
                         onPress={handleAddManualToLog}
                       >
-                        <Text style={styles.quantityBtnText}>Add to Log</Text>
+                        <Text style={styles.quantityBtnText}>{confirmLogLabel}</Text>
                       </TouchableOpacity>
                     </View>
                     <Text style={[styles.quantityModalLabel, { color: theme.text, marginTop: 0 }]}>Food name</Text>
@@ -1086,7 +1347,7 @@ export default function AddFoodModal({
                       <Text style={[styles.quantityBtnText, { color: theme.text }]}>Cancel</Text>
                     </TouchableOpacity>
                     <TouchableOpacity style={[styles.quantityBtn, { backgroundColor: SAGE }]} onPress={handleAddToLog}>
-                      <Text style={styles.quantityBtnText}>Add to Log</Text>
+                      <Text style={styles.quantityBtnText}>{confirmLogLabel}</Text>
                     </TouchableOpacity>
                   </View>
                   <Text style={[styles.quantityModalTitle, { color: theme.text }]}>{selectedFood.food_name}</Text>

@@ -186,7 +186,7 @@ function emptyExerciseForm(mode: 'strength' | 'cardio'): DayExerciseForm {
     sets: mode === 'strength' ? '' : '1',
     reps: mode === 'strength' ? '' : '',
     muscle_groups: [],
-    restSeconds: '',
+    restSeconds: String(DEFAULT_REST_SECONDS_BETWEEN_SETS),
     durationMinutes: '',
     distance: '',
     distanceUnit: 'km',
@@ -375,12 +375,16 @@ export default function CreateWorkout() {
         const restSec = exercise.restSeconds.trim();
         const setsN = parseInt(exercise.sets, 10);
         const repsN = parseInt(exercise.reps, 10);
+        const restParsed = restSec ? parseInt(restSec, 10) : NaN;
         return {
           exerciseName: exercise.exerciseName,
           sets: Number.isFinite(setsN) && setsN > 0 ? setsN : 1,
           reps: Number.isFinite(repsN) && repsN > 0 ? repsN : 1,
           muscle_group: exercise.muscle_groups[0] ?? null,
-          rest_seconds: restSec ? parseInt(restSec, 10) : null,
+          rest_seconds:
+            Number.isFinite(restParsed) && restParsed > 0
+              ? restParsed
+              : DEFAULT_REST_SECONDS_BETWEEN_SETS,
         };
       }),
     }));

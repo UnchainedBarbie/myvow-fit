@@ -1,6 +1,6 @@
 /**
  * List of meal plans for a given week; tap to open detail. Swipe left to delete.
- * When empty: message only; Build with Sage / Build it myself / Copy from previous week sit below Weekly meal prep in the footer.
+ * When empty: message only; Build with Sage / Build it myself / Copy from previous week (brings plan templates into this week; tracker activates only via Set as Active) sit below Weekly meal prep in the footer.
  */
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import {
@@ -17,6 +17,7 @@ import {
   Share,
   Modal,
   Linking,
+  ScrollView,
 } from 'react-native';
 import { useTheme } from '../context/ThemeContext';
 import { useSQLiteContext } from 'expo-sqlite';
@@ -27,6 +28,7 @@ import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import { initMealPlansDb } from '../utils/initMealPlansDb';
 import { initNutritionDb } from '../utils/nutritionDb';
 import {
+  aggregateGroceryListJsonEntriesByNameAndUnit,
   buildPrepGuideTextFromUniqueFoodNames,
   buildGroceryListJsonFromPlanFoodRows,
   countWeeklyPlanDaysForGrocery,
@@ -34,17 +36,22 @@ import {
   generateGroceryListFromPlan,
   generatePrepGuideFromPlan,
   multiplyPlanFoodRowsForWeek,
+  parseGroceryListItemForAggregation,
 } from '../utils/generateMealPlanGroceryAndPrep';
+import { addDaysToLocalYmd } from '../utils/localDateYmd';
 
 const SAGE = '#7C9A7E';
 const CREAM_MODAL_BG = '#F5F0E8';
 
 type PlanRow = { meal_plan_id: number; name: string };
 
-function prevWeekMonday(weekStartIso: string): string {
-  const d = new Date(weekStartIso + 'T12:00:00');
-  d.setDate(d.getDate() - 7);
-  return d.toISOString().slice(0, 10);
+type CopyWeekOption = { weekStartYmd: string; weekEndYmd: string; label: string };
+
+function formatWeekRangeLabel(monYmd: string, sunYmd: string): string {
+  const mon = new Date(monYmd + 'T12:00:00');
+  const sun = new Date(sunYmd + 'T12:00:00');
+  const opts: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric' };
+  return `${mon.toLocaleDateString(undefined, opts)} - ${sun.toLocaleDateString(undefined, opts)}`;
 }
 
 /** weekStartIso is Monday; returns Sunday of that week (YYYY-MM-DD). */
@@ -100,27 +107,36 @@ function buildWeeklyPrepShareText(guideText: string): string {
 
 /**
  * Parse grocery_list JSON into merged rows for the weekly list UI.
- * @param dedupeByItemText When true (default), collapse duplicate category+item lines (e.g. merging multiple meal plans).
- *   When false, keep one UI row per JSON entry.
+ * @param dedupeByItemText When true (default), merge lines with the same food name (case-insensitive) and unit, summing quantities.
+ *   When false, keep one UI row per JSON entry (keys include index for stability).
  */
 function groceryJsonToMergedRows(parsed: unknown, dedupeByItemText = true): MergedGroceryRow[] {
   if (!Array.isArray(parsed)) return [];
-  const seenGrocery = dedupeByItemText ? new Set<string>() : null;
-  const items: MergedGroceryRow[] = [];
+  const raw: { category: string; item: string }[] = [];
   for (let i = 0; i < parsed.length; i++) {
     const entry = parsed[i];
-    const text = String((entry as { item?: string; text?: string })?.item ?? (entry as { text?: string })?.text ?? '').trim();
-    if (!text) continue;
+    const item = String(
+      (entry as { item?: string; text?: string })?.item ??
+        (entry as { text?: string })?.text ??
+        '',
+    ).trim();
+    if (!item) continue;
     const category = normalizeGroceryCategory((entry as { category?: string })?.category);
-    const dedupeKey = `${category}|${text.toLowerCase()}`;
-    if (seenGrocery) {
-      if (seenGrocery.has(dedupeKey)) continue;
-      seenGrocery.add(dedupeKey);
-      items.push({ key: dedupeKey, text, category });
-    } else {
-      items.push({ key: `${category}|${i}|${text.toLowerCase()}`, text, category });
-    }
+    raw.push({ category, item });
   }
+  const entries = dedupeByItemText
+    ? aggregateGroceryListJsonEntriesByNameAndUnit(raw)
+    : raw.map((r) => ({ category: r.category, item: r.item, checked: false }));
+
+  const items: MergedGroceryRow[] = entries.map((e, i) => {
+    const text = e.item.trim();
+    const category = normalizeGroceryCategory(e.category);
+    const p = parseGroceryListItemForAggregation(text);
+    const key = dedupeByItemText
+      ? `${category}|${p.nameKey}|${p.unitNorm}`
+      : `${category}|${p.nameKey}|${p.unitNorm}|${i}`;
+    return { key, text, category };
+  });
   items.sort((a, b) => {
     const ca = GROCERY_CATS.indexOf(a.category);
     const cb = GROCERY_CATS.indexOf(b.category);
@@ -156,6 +172,9 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
   const [prepSectionExpanded, setPrepSectionExpanded] = useState(false);
   const [renamingPlan, setRenamingPlan] = useState<PlanRow | null>(null);
   const [renameText, setRenameText] = useState('');
+  const [copyScheduleModalVisible, setCopyScheduleModalVisible] = useState(false);
+  const [copyWeekOptions, setCopyWeekOptions] = useState<CopyWeekOption[]>([]);
+  const [loadingCopyWeekOptions, setLoadingCopyWeekOptions] = useState(false);
 
   const activePlanIdsSignature = useMemo(
     () => [...activePlanIdsInWeek].sort((a, b) => a - b).join(','),
@@ -308,29 +327,31 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       }[];
 
       if (mergeGroceryFromDb) {
-        const deduped: MergedGroceryRow[] = [];
-        const seenKey = new Set<string>();
+        const allEntries: { category: string; item: string }[] = [];
         for (const p of planRows) {
           const raw = p.grocery_list;
           if (!raw) continue;
           try {
             const parsed = JSON.parse(raw);
-            for (const row of groceryJsonToMergedRows(parsed)) {
-              if (seenKey.has(row.key)) continue;
-              seenKey.add(row.key);
-              deduped.push(row);
+            if (!Array.isArray(parsed)) continue;
+            for (const entry of parsed) {
+              const item = String(
+                (entry as { item?: string; text?: string })?.item ??
+                  (entry as { text?: string })?.text ??
+                  '',
+              ).trim();
+              if (!item) continue;
+              allEntries.push({
+                category: normalizeGroceryCategory((entry as { category?: string })?.category),
+                item,
+              });
             }
           } catch {
             /* ignore malformed grocery JSON */
           }
         }
-        deduped.sort((a, b) => {
-          const ca = GROCERY_CATS.indexOf(a.category);
-          const cb = GROCERY_CATS.indexOf(b.category);
-          if (ca !== cb) return ca - cb;
-          return a.text.localeCompare(b.text);
-        });
-        setMergedGrocery(deduped);
+        const aggregated = aggregateGroceryListJsonEntriesByNameAndUnit(allEntries);
+        setMergedGrocery(groceryJsonToMergedRows(aggregated, false));
       }
 
       const fromPlanned = (await db
@@ -513,60 +534,77 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
     }
   };
 
-  const copyFromPreviousWeek = async () => {
-    const prevWeek = prevWeekMonday(weekStart);
-    setCopying(true);
+  const openCopyScheduleModal = useCallback(async () => {
+    setLoadingCopyWeekOptions(true);
+    setCopyScheduleModalVisible(true);
     try {
-      const prevPlans = await db.getAllAsync<{
-        meal_plan_id: number;
-        plan_name: string;
-        calories_target: number | null;
-        protein_target: number | null;
-        carbs_target: number | null;
-        fat_target: number | null;
-      }>(
-        'SELECT meal_plan_id, plan_name, calories_target, protein_target, carbs_target, fat_target FROM MealPlans WHERE week_start = ?',
-        [prevWeek]
-      );
-      for (const p of prevPlans) {
-        await db.runAsync(
-          `INSERT INTO MealPlans (plan_name, calories_target, protein_target, carbs_target, fat_target, week_start, created_date) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [p.plan_name + ' (copy)', p.calories_target, p.protein_target, p.carbs_target, p.fat_target, weekStart, new Date().toISOString()]
+      await initMealPlansDb(db);
+      // Anchor to the week shown on the Plans tab (not "today"), so e.g. viewing Apr 6–12
+      // offers Mar 30–Apr 5 as the prior week even when today is still in March.
+      const anchorMonday = weekStart;
+      const options: CopyWeekOption[] = [];
+      for (let i = 1; i <= 4; i++) {
+        const mon = addDaysToLocalYmd(anchorMonday, -7 * i);
+        const sun = addDaysToLocalYmd(mon, 6);
+        const countRow = await db.getFirstAsync<{ n: number }>(
+          'SELECT COUNT(*) as n FROM DayActivePlan WHERE date >= ? AND date <= ?',
+          [mon, sun],
         );
-        const newIdRow = await db.getFirstAsync<{ id: number }>('SELECT last_insert_rowid() as id');
-        const newPlanId = newIdRow?.id;
-        if (!newPlanId) continue;
-        const meals = await db.getAllAsync<{ meal_id: number; meal_name: string | null; meal_type: string | null; meal_order: number | null }>(
-          'SELECT meal_id, meal_name, meal_type, meal_order FROM PlannedMeals WHERE meal_plan_id = ?',
-          [p.meal_plan_id]
-        );
-        for (const m of meals) {
-          await db.runAsync(
-            'INSERT INTO PlannedMeals (meal_plan_id, meal_name, meal_type, meal_order) VALUES (?, ?, ?, ?)',
-            [newPlanId, m.meal_name, m.meal_type, m.meal_order ?? 0]
-          );
-          const newMealRow = await db.getFirstAsync<{ id: number }>('SELECT last_insert_rowid() as id');
-          const newMealId = newMealRow?.id;
-          if (!newMealId) continue;
-          const foods = await db.getAllAsync<{ food_name: string; brand: string | null; serving_size: string | null; calories: number; protein: number; carbs: number; fat: number }>(
-            'SELECT food_name, brand, serving_size, calories, protein, carbs, fat FROM FoodItems WHERE meal_id = ?',
-            [m.meal_id]
-          );
-          for (const f of foods) {
-            await db.runAsync(
-              'INSERT INTO FoodItems (meal_id, food_name, brand, serving_size, calories, protein, carbs, fat) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [newMealId, f.food_name, f.brand, f.serving_size, f.calories, f.protein, f.carbs, f.fat]
-            );
-          }
+        const n = Number(countRow?.n ?? 0);
+        if (n > 0) {
+          options.push({
+            weekStartYmd: mon,
+            weekEndYmd: sun,
+            label: formatWeekRangeLabel(mon, sun),
+          });
         }
       }
-      await loadPlans();
+      setCopyWeekOptions(options);
     } catch (e) {
-      console.error('copyFromPreviousWeek error:', e);
+      console.error('openCopyScheduleModal error:', e);
+      setCopyWeekOptions([]);
     } finally {
-      setCopying(false);
+      setLoadingCopyWeekOptions(false);
     }
-  };
+  }, [db, weekStart]);
+
+  const copyDayActivePlanFromWeekToCurrent = useCallback(
+    async (sourceMon: string, sourceSun: string) => {
+      const targetMon = weekStart;
+      setCopying(true);
+      try {
+        const srcRows = await db.getAllAsync<{ date: string; meal_plan_id: number }>(
+          'SELECT date, meal_plan_id FROM DayActivePlan WHERE date >= ? AND date <= ? ORDER BY date, meal_plan_id',
+          [sourceMon, sourceSun],
+        );
+        // Use source week's DayActivePlan only to learn which plan templates to attach to this week.
+        // Do not write DayActivePlan for the current week — that would load the nutrition tracker before the user taps Set as Active.
+        const copiedPlanIds = [...new Set(srcRows.map((r) => r.meal_plan_id))];
+        await db.withTransactionAsync(async () => {
+          for (const planId of copiedPlanIds) {
+            // Drop active-day rows for the week we copied from; otherwise they still look
+            // "active in the future" on the detail screen while week_start points at the new week.
+            await db.runAsync(
+              'DELETE FROM DayActivePlan WHERE meal_plan_id = ? AND date >= ? AND date <= ?',
+              [planId, sourceMon, sourceSun],
+            );
+            await db.runAsync('UPDATE MealPlans SET week_start = ? WHERE meal_plan_id = ?', [
+              targetMon,
+              planId,
+            ]);
+          }
+        });
+        setCopyScheduleModalVisible(false);
+        await loadPlans({ groceryForceDb: true });
+      } catch (e) {
+        console.error('copyDayActivePlanFromWeekToCurrent error:', e);
+        Alert.alert('Could not copy', 'Something went wrong updating your schedule. Try again.');
+      } finally {
+        setCopying(false);
+      }
+    },
+    [db, loadPlans, weekStart],
+  );
 
   const actionButtons = (
     <View style={styles.actionButtonsWrap}>
@@ -578,14 +616,10 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
       </TouchableOpacity>
       <TouchableOpacity
         style={[styles.emptyBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
-        onPress={copyFromPreviousWeek}
+        onPress={() => void openCopyScheduleModal()}
         disabled={copying}
       >
-        {copying ? (
-          <ActivityIndicator size="small" color={theme.text} />
-        ) : (
-          <Text style={[styles.emptyBtnText, { color: theme.text }]}>Copy from previous week</Text>
-        )}
+        <Text style={[styles.emptyBtnText, { color: theme.text }]}>Copy from previous week</Text>
       </TouchableOpacity>
     </View>
   );
@@ -954,6 +988,81 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
         </View>
       </Modal>
 
+      <Modal
+        visible={copyScheduleModalVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={() => !copying && setCopyScheduleModalVisible(false)}
+      >
+        <View style={styles.groceryModalOverlay}>
+          <TouchableOpacity
+            style={StyleSheet.absoluteFill}
+            activeOpacity={1}
+            onPress={() => !copying && setCopyScheduleModalVisible(false)}
+          />
+          <View
+            style={[
+              styles.groceryModalSheet,
+              {
+                paddingBottom: Math.max(insets.bottom, 20) + 8,
+                backgroundColor: CREAM_MODAL_BG,
+                borderColor: SAGE,
+                maxHeight: '75%',
+              },
+            ]}
+          >
+            <View style={styles.groceryModalHeaderRow}>
+              <Text style={styles.groceryModalTitle}>Copy schedule to this week</Text>
+              <TouchableOpacity
+                onPress={() => !copying && setCopyScheduleModalVisible(false)}
+                hitSlop={12}
+                accessibilityLabel="Close"
+              >
+                <Ionicons name="close" size={26} color="#333" />
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.groceryModalHint}>
+              Choose a past week that had meal plans set as active. Those plans will show for this week here
+              so you can open each one and tap Set as Active — the nutrition tracker stays empty until you do.
+            </Text>
+            {loadingCopyWeekOptions ? (
+              <ActivityIndicator size="large" color={SAGE} style={{ marginVertical: 28 }} />
+            ) : copying ? (
+              <ActivityIndicator size="large" color={SAGE} style={{ marginVertical: 28 }} />
+            ) : copyWeekOptions.length === 0 ? (
+              <Text style={[styles.copyScheduleEmptyText, { color: '#555' }]}>
+                No meal plan activity in the last four weeks.
+              </Text>
+            ) : (
+              <ScrollView
+                style={styles.copyScheduleScroll}
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+              >
+                {copyWeekOptions.map((opt) => (
+                  <TouchableOpacity
+                    key={opt.weekStartYmd}
+                    style={[styles.copyScheduleRow, { borderColor: 'rgba(124, 154, 126, 0.45)' }]}
+                    onPress={() => void copyDayActivePlanFromWeekToCurrent(opt.weekStartYmd, opt.weekEndYmd)}
+                    activeOpacity={0.85}
+                  >
+                    <Text style={styles.copyScheduleRowText}>{opt.label}</Text>
+                    <Ionicons name="chevron-forward" size={20} color="#333" />
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            )}
+            <TouchableOpacity
+              style={[styles.copyScheduleCancelBtn, { borderColor: theme.border }]}
+              onPress={() => !copying && setCopyScheduleModalVisible(false)}
+              disabled={copying}
+            >
+              <Text style={[styles.copyScheduleCancelText, { color: theme.text }]}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       {renamingPlan && (
         <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
           <View style={styles.renameOverlay}>
@@ -1247,4 +1356,40 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#fff',
   },
+  copyScheduleScroll: { maxHeight: 280, marginBottom: 8 },
+  copyScheduleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 10,
+    backgroundColor: 'rgba(255, 252, 247, 0.95)',
+  },
+  copyScheduleRowText: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#2c2c2c',
+    flex: 1,
+    paddingRight: 8,
+  },
+  copyScheduleEmptyText: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 15,
+    lineHeight: 22,
+    marginVertical: 20,
+    textAlign: 'center',
+  },
+  copyScheduleCancelBtn: {
+    marginTop: 4,
+    paddingVertical: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 252, 247, 0.95)',
+  },
+  copyScheduleCancelText: { fontFamily: 'Jost_400Regular', fontSize: 16, fontWeight: '600' },
 });

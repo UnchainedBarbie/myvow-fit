@@ -17,10 +17,11 @@ import {
   ActionSheetIOS,
   AppState,
   AppStateStatus,
+  InteractionManager,
 } from 'react-native';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { useTheme } from '../context/ThemeContext';
-import { useNavigation, useRoute } from '@react-navigation/native';
+import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/native';
 import { useSQLiteContext } from 'expo-sqlite';
 import { sortWorkoutPlanExercisesForDisplay } from '../utils/workoutDisplayUtils';
 import { DEFAULT_REST_SECONDS_BETWEEN_SETS } from '../utils/startedWorkoutPreferenceUtils';
@@ -33,6 +34,9 @@ import {
   loadConversation,
   clearConversation as clearSageStorage,
 } from '../utils/sageStorage';
+
+/** Max recent messages sent to the API before prepending preserved meal-plan context. */
+const SAGE_API_CONTEXT_TAIL_COUNT = 20;
 
 function sageAssistantMessage(content: string): SageMessage {
   return { role: 'assistant', content };
@@ -62,7 +66,8 @@ When the user is happy with a workout plan, output it as a JSON block wrapped in
           "sets": number,
           "reps": number,
           "muscle_group": "string",
-          "exercise_notes": "string"
+          "exercise_notes": "string",
+          "rest_seconds": number
         },
         {
           "exercise_name": "string",
@@ -70,7 +75,8 @@ When the user is happy with a workout plan, output it as a JSON block wrapped in
           "duration_minutes": number,
           "distance": "optional string with unit (km or miles)",
           "muscle_group": "string",
-          "exercise_notes": "string"
+          "exercise_notes": "string",
+          "rest_seconds": number
         }
       ]
     }
@@ -78,7 +84,14 @@ When the user is happy with a workout plan, output it as a JSON block wrapped in
 }
 </workout>
 
-The app uses a default of ${DEFAULT_REST_SECONDS_BETWEEN_SETS} seconds rest between sets for each strength exercise when the plan is saved. Whenever you present a workout plan to the user (your conversational text before they tap save), briefly mention this default — e.g. that rest between sets will start at ${DEFAULT_REST_SECONDS_BETWEEN_SETS} seconds per exercise and they can edit it in My Workouts.
+When you design a workout, every exercise MUST include an explicit rest time in seconds for recovery between sets (or after that block, as appropriate). In your conversational write-up before save, show it clearly on each line, e.g. "Rest: 60s" or "Rest: 90s" next to or directly under each exercise. In the <workout> JSON, each exercise object MUST include "rest_seconds" as a positive integer.
+
+Choose rest_seconds by exercise demand (vary within these ranges; pick sensible values, not always the same number):
+- Cardio, warmup, cooldown, and other light work: 45–60 seconds.
+- Moderate compound or accessory work (e.g. rows, presses, lunges): 60–90 seconds.
+- Heavy compound lifts (e.g. squats, deadlifts, heavy bench): 90–120 seconds.
+
+If rest_seconds is missing from JSON, the app may fall back to ${DEFAULT_REST_SECONDS_BETWEEN_SETS} seconds when saving — always provide rest_seconds so the plan matches what you described.
 
 When generating a workout plan, each exercise must include a type field: 'strength' or 'cardio'. Strength exercises must include sets and reps. Cardio exercises must include duration (in minutes) and optionally distance (in km or miles), and must NOT include sets or reps. Examples of cardio exercises: walking, running, cycling, rowing, jump rope, elliptical. Warmup and cooldown exercises that involve movement (walking, jogging, stretching) should be marked as cardio type.
 
@@ -188,7 +201,7 @@ function formatWorkoutSummary(workout: AIWorkout): string {
   lines.push(`📋 ${workout.workout_name}`);
   lines.push('');
   lines.push(
-    `⏱ Rest between sets: ${DEFAULT_REST_SECONDS_BETWEEN_SETS}s default per exercise (edit in My Workouts after saving).`,
+    '⏱ Rest between sets: per-exercise rest_seconds from your plan when present; otherwise app default (edit in My Workouts after saving).',
   );
   lines.push('');
 
@@ -213,11 +226,21 @@ function formatWorkoutSummary(workout: AIWorkout): string {
           ex.distance != null && String(ex.distance).trim() !== ''
             ? `, ${String(ex.distance).trim()}`
             : '';
-        lines.push(`  • ${ex.exercise_name} — ${durStr}${dist}`);
+        const rsC = ex.rest_seconds;
+        const restC =
+          typeof rsC === 'number' && Number.isFinite(rsC) && rsC > 0
+            ? ` · Rest: ${Math.round(rsC)}s`
+            : '';
+        lines.push(`  • ${ex.exercise_name} — ${durStr}${dist}${restC}`);
       } else {
         const s = ex.sets ?? 0;
         const r = ex.reps ?? 0;
-        lines.push(`  • ${ex.exercise_name} — ${s} sets x ${r} reps`);
+        const rsS = ex.rest_seconds;
+        const restS =
+          typeof rsS === 'number' && Number.isFinite(rsS) && rsS > 0
+            ? ` · Rest: ${Math.round(rsS)}s`
+            : '';
+        lines.push(`  • ${ex.exercise_name} — ${s} sets x ${r} reps${restS}`);
       }
     });
     lines.push('');
@@ -503,6 +526,57 @@ function formatMealPlanSummary(plan: AIMealPlan): string {
   return lines.join('\n').trimEnd();
 }
 
+/**
+ * Prose meal plans (no tags) often use Breakfast:/Lunch:/etc. Require at least two such headers
+ * so single phrases like "lunch: salad" do not qualify alone.
+ */
+function assistantMessageHasMealPlanSectionHeaders(content: string): boolean {
+  if (!content || content.length > 200_000) return false;
+  const headerRes = [
+    /\bbreakfast\s*:/i,
+    /\bbrunch\s*:/i,
+    /\bsnack\s*:/i,
+    /\blunch\s*:/i,
+    /\bdinner\s*:/i,
+  ];
+  let hits = 0;
+  for (const re of headerRes) {
+    if (re.test(content)) hits++;
+  }
+  return hits >= 2;
+}
+
+/** True for assistant messages that carry meal plan JSON, sectioned plan text, or post–Save Meal Plan confirmations. */
+function messageCarriesMealPlanContext(m: SageMessage): boolean {
+  if (m.role !== 'assistant') return false;
+  const c = m.content;
+  if (/<mealplan\b[\s\S]*?<\/mealplan>/i.test(c)) return true;
+  if (parseMealPlanFromAssistantMessage(c).plan) return true;
+  if (/meal plan is saved to your nutrition plans/i.test(c)) return true;
+  return assistantMessageHasMealPlanSectionHeaders(c);
+}
+
+/**
+ * Keeps the last `tailCount` messages, plus any earlier messages that contain meal plan context
+ * (tagged JSON, parseable plans, section headers, or save confirmations), in chronological order.
+ */
+function buildSageMessagesForApiContext(
+  allMessages: SageMessage[],
+  tailCount: number = SAGE_API_CONTEXT_TAIL_COUNT,
+): SageMessage[] {
+  const n = allMessages.length;
+  if (n <= tailCount) return allMessages;
+
+  const tailStart = n - tailCount;
+  const preserved: SageMessage[] = [];
+  for (let i = 0; i < tailStart; i++) {
+    if (messageCarriesMealPlanContext(allMessages[i])) {
+      preserved.push(allMessages[i]);
+    }
+  }
+  return [...preserved, ...allMessages.slice(-tailCount)];
+}
+
 function isGroceryListContent(content: string): boolean {
   const lower = content.toLowerCase();
   return (
@@ -519,7 +593,7 @@ export default function Sage() {
   const route = useRoute();
   const [messages, setMessages] = useState<SageMessage[]>([]);
   const [savedVowMessageIndexes, setSavedVowMessageIndexes] = useState<number[]>([]);
-  const [input, setInput] = useState('');
+  const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(false);
   const [sendingReceipt, setSendingReceipt] = useState(false);
   const [lastSavedMealPlanId, setLastSavedMealPlanId] = useState<number | null>(
@@ -531,14 +605,20 @@ export default function Sage() {
   const speechTranscriptRef = useRef('');
   const inputRef = useRef('');
   const listRef = useRef<FlatList<SageMessage>>(null);
+  /** After first non-empty messages, further updates use animated scroll. */
+  const listScrollInitialRef = useRef(false);
+  /** While true, scroll to end on layout/content changes so the list opens at the latest message. */
+  const snapToBottomAfterFocusRef = useRef(false);
+  /** Latest messages for useFocusEffect (avoid re-running focus scroll on every message). */
+  const messagesRef = useRef<SageMessage[]>([]);
   const isMountedRef = useRef(true);
   const requestAbortRef = useRef<AbortController | null>(null);
 
-  /** Clears the message field immediately (state + refs) so submit paths stay in sync before the next render. */
+  /** Clears the controlled message field (state + refs) after a successful send or when resetting. */
   const clearComposer = useCallback(() => {
     inputRef.current = '';
     speechTranscriptRef.current = '';
-    setInput('');
+    setInputText('');
   }, []);
 
   const abortInFlightRequest = useCallback(() => {
@@ -576,7 +656,7 @@ export default function Sage() {
     const t = speechTranscriptRef.current.trim();
     speechTranscriptRef.current = '';
     if (t) {
-      setInput((prev) => {
+      setInputText((prev) => {
         const next = prev ? `${prev} ${t}` : t;
         inputRef.current = next;
         return next;
@@ -674,21 +754,64 @@ export default function Sage() {
 
   useEffect(() => {
     if (routeParams.initialPrompt) {
-      setInput(routeParams.initialPrompt);
+      setInputText(routeParams.initialPrompt);
     }
   }, [routeParams.initialPrompt]);
 
   useEffect(() => {
-    inputRef.current = input;
-  }, [input]);
+    inputRef.current = inputText;
+  }, [inputText]);
+
+  messagesRef.current = messages;
 
   useEffect(() => {
-    if (!messages.length) return;
+    if (!messages.length) {
+      listScrollInitialRef.current = false;
+      return;
+    }
     saveConversation(messages);
     requestAnimationFrame(() => {
-      listRef.current?.scrollToEnd({ animated: true });
+      if (!listScrollInitialRef.current) {
+        listScrollInitialRef.current = true;
+        listRef.current?.scrollToEnd({ animated: false });
+      } else {
+        listRef.current?.scrollToEnd({ animated: true });
+      }
     });
   }, [messages]);
+
+  useFocusEffect(
+    useCallback(() => {
+      snapToBottomAfterFocusRef.current = true;
+
+      const scrollToBottom = () => {
+        listRef.current?.scrollToEnd({ animated: false });
+      };
+
+      scrollToBottom();
+      const raf1 = requestAnimationFrame(() => {
+        scrollToBottom();
+        requestAnimationFrame(scrollToBottom);
+      });
+
+      const interactionTask = InteractionManager.runAfterInteractions(() => {
+        scrollToBottom();
+        setTimeout(scrollToBottom, 50);
+        setTimeout(scrollToBottom, 200);
+      });
+
+      const clearSnapTimer = setTimeout(() => {
+        snapToBottomAfterFocusRef.current = false;
+      }, 600);
+
+      return () => {
+        cancelAnimationFrame(raf1);
+        snapToBottomAfterFocusRef.current = false;
+        clearTimeout(clearSnapTimer);
+        interactionTask.cancel();
+      };
+    }, []),
+  );
 
   const handleClear = async () => {
     await clearSageStorage();
@@ -813,18 +936,19 @@ export default function Sage() {
             : liveSpoken;
         speechTranscriptRef.current = '';
         inputRef.current = merged;
-        setInput(merged);
+        setInputText(merged);
       }
     }
 
     const trimmed = inputRef.current.trim();
     if (!trimmed || loading) return;
+    inputRef.current = '';
+    setInputText('');
     const nextMessages: SageMessage[] = [
       ...messages,
       { role: 'user', content: trimmed },
     ];
     setMessages(nextMessages);
-    clearComposer();
     setLoading(true);
 
     try {
@@ -835,7 +959,7 @@ export default function Sage() {
         ? `${SYSTEM_PROMPT}\n\n${userContext}`
         : SYSTEM_PROMPT;
 
-      const messagesForApi = nextMessages.slice(-20);
+      const messagesForApi = buildSageMessagesForApiContext(nextMessages);
       abortInFlightRequest();
       const controller = new AbortController();
       requestAbortRef.current = controller;
@@ -1213,7 +1337,7 @@ export default function Sage() {
   };
 
   const processReceiptImage = async (base64Data: string) => {
-    const trimmed = input.trim();
+    const trimmed = inputText.trim();
 
     const userContext = await buildUserContext();
     const systemPrompt = userContext
@@ -1236,7 +1360,7 @@ export default function Sage() {
       const controller = new AbortController();
       requestAbortRef.current = controller;
 
-      const tailForApi = nextMessages.slice(-20);
+      const tailForApi = buildSageMessagesForApiContext(nextMessages);
       const anthropicMessages = tailForApi.map((m) => ({
         role: m.role,
         content: [{ type: 'text', text: m.content }] as any[],
@@ -1299,6 +1423,7 @@ export default function Sage() {
       if (isMountedRef.current) {
         setMessages(updated);
         await saveConversation(updated);
+        clearComposer();
       }
     } catch (e) {
       const isAbort =
@@ -1664,99 +1789,6 @@ export default function Sage() {
             </View>
           </View>
         )}
-        {isGroceryList && (lastSavedMealPlanId != null || (route.params as { groceryListForPlanId?: number })?.groceryListForPlanId != null) && (
-          <TouchableOpacity
-            style={[
-              styles.saveButton,
-              { borderColor: theme.border, marginTop: 4 },
-            ]}
-            onPress={async () => {
-              try {
-                const targetPlanId = (route.params as { groceryListForPlanId?: number })?.groceryListForPlanId ?? lastSavedMealPlanId;
-                if (targetPlanId != null) {
-                  const lines = item.content
-                    .split('\n')
-                    .map((l) => l.trim())
-                    .filter(Boolean);
-                  type GroceryJsonItem = {
-                    category: string;
-                    item: string;
-                    checked: boolean;
-                  };
-                  const parsedItems: GroceryJsonItem[] = [];
-                  let currentCategory: string = 'Other';
-                  const categoryMap: Record<string, string> = {
-                    produce: 'Produce',
-                    protein: 'Meat & Fish',
-                    'meat & fish': 'Meat & Fish',
-                    dairy: 'Dairy',
-                    pantry: 'Pantry',
-                    other: 'Other',
-                  };
-                  lines.forEach((line) => {
-                    const lower = line.toLowerCase();
-                    if (lower.endsWith(':')) {
-                      const base = lower.slice(0, -1).trim();
-                      currentCategory =
-                        categoryMap[base] || categoryMap[base.split(' ')[0]] || 'Other';
-                      return;
-                    }
-                    let text = line.replace(/^\[[ xX]\]\s*/, '');
-                    text = text.replace(/^[-•]\s*/, '').trim();
-                    if (!text) return;
-                    parsedItems.push({
-                      category: currentCategory,
-                      item: text,
-                      checked: false,
-                    });
-                  });
-
-                  await db.runAsync(
-                    'UPDATE MealPlans SET grocery_list = ? WHERE meal_plan_id = ?;',
-                    [JSON.stringify(parsedItems), targetPlanId],
-                  );
-                  await AsyncStorage.removeItem(
-                    `@grocery_list_${targetPlanId}`,
-                  );
-
-                  const confirmation: SageMessage = {
-                    role: 'assistant',
-                    content:
-                      'Saved this grocery list to your meal plan. You can view it under Nutrition → Meal Plans.',
-                  };
-                  const updated = [...messages, confirmation];
-                  setMessages(updated);
-                  await saveConversation(updated);
-                } else {
-                  await AsyncStorage.setItem(
-                    '@sage_last_grocery_list',
-                    item.content,
-                  );
-                  const confirmation: SageMessage = {
-                    role: 'assistant',
-                    content:
-                      'Got it — I saved this grocery list so you can reuse it later.',
-                  };
-                  const updated = [...messages, confirmation];
-                  setMessages(updated);
-                  await saveConversation(updated);
-                }
-              } catch (e) {
-                console.error('Error saving grocery list from Sage:', e);
-              }
-            }}
-          >
-            <Ionicons
-              name="save-outline"
-              size={18}
-              color={theme.text}
-              style={{ marginRight: 6 }}
-            />
-            <Text style={{ color: theme.text, fontWeight: '600' }}>
-              Save as Grocery List ✓
-            </Text>
-          </TouchableOpacity>
-        )}
       </View>
     );
   };
@@ -1778,9 +1810,16 @@ export default function Sage() {
             keyExtractor={(_, index) => String(index)}
             renderItem={renderItem}
             contentContainerStyle={styles.listContent}
-            onContentSizeChange={() =>
-              listRef.current?.scrollToEnd({ animated: true })
-            }
+            onContentSizeChange={() => {
+              if (snapToBottomAfterFocusRef.current) {
+                listRef.current?.scrollToEnd({ animated: false });
+              }
+            }}
+            onLayout={() => {
+              if (snapToBottomAfterFocusRef.current) {
+                listRef.current?.scrollToEnd({ animated: false });
+              }
+            }}
             onScroll={(
               e: NativeSyntheticEvent<NativeScrollEvent>,
             ) => {
@@ -1808,10 +1847,10 @@ export default function Sage() {
               style={[styles.input, { color: theme.text }]}
               placeholder="Message..."
               placeholderTextColor={theme.textSecondary || theme.text}
-              value={input}
+              value={inputText}
               onChangeText={(text) => {
                 inputRef.current = text;
-                setInput(text);
+                setInputText(text);
               }}
               multiline
               returnKeyType="send"
@@ -1851,7 +1890,7 @@ export default function Sage() {
                 { backgroundColor: theme.buttonBackground },
               ]}
               onPress={sendMessage}
-              disabled={loading || (!input.trim() && !isRecording)}
+              disabled={loading || (!inputText.trim() && !isRecording)}
             >
               {loading ? (
                 <ActivityIndicator color={theme.buttonText} size="small" />

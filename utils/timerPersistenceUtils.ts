@@ -92,6 +92,32 @@ export function mergeExerciseSetsWithSnapshot<
   });
 }
 
+const setProgressKey = (exercise_name: string, set_number: number) =>
+  `${exercise_name}\0${set_number}`;
+
+/**
+ * Reorder merged in-memory sets to match snapshot sequence (e.g. user reordered exercises mid-workout).
+ * Returns `merged` unchanged if snapshot does not contain exactly the same sets as keys.
+ */
+export function orderMergedSetsLikeSnapshot<
+  T extends { exercise_name: string; set_number: number },
+>(merged: T[], snapshot: SetProgressSnapshot[]): T[] {
+  if (snapshot.length === 0 || snapshot.length !== merged.length) return merged;
+  const map = new Map(
+    merged.map((s) => [setProgressKey(s.exercise_name, s.set_number), s] as const),
+  );
+  if (map.size !== merged.length) return merged;
+  const out: T[] = [];
+  for (const snap of snapshot) {
+    const key = setProgressKey(snap.exercise_name, snap.set_number);
+    const row = map.get(key);
+    if (!row) return merged;
+    out.push(row);
+    map.delete(key);
+  }
+  return map.size === 0 ? out : merged;
+}
+
 // Utility functions for timer state management
 export const timerStateUtils = {
   /**

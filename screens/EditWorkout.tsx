@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -16,6 +16,7 @@ import { useSQLiteContext } from 'expo-sqlite';
 import { useTheme } from '../context/ThemeContext';
 import { useTranslation } from 'react-i18next';
 import DraggableFlatList, { RenderItemParams } from 'react-native-draggable-flatlist';
+import { RectButton, Swipeable } from 'react-native-gesture-handler';
 import { sortWorkoutPlanExercisesForDisplay } from '../utils/workoutDisplayUtils';
 import { initWorkoutDb } from '../utils/initWorkoutDb';
 import {
@@ -371,7 +372,7 @@ export default function EditWorkout() {
                   exercise.web_link,
                   exercise.muscle_group,
                   exercise.exercise_notes,
-                  exercise.rest_seconds ?? null,
+                  exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
                   sortIdx,
                   'strength',
                 ],
@@ -387,7 +388,7 @@ export default function EditWorkout() {
                   exercise.web_link,
                   exercise.muscle_group,
                   exercise.exercise_notes,
-                  exercise.rest_seconds ?? null,
+                  exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
                 ],
               );
             }
@@ -491,11 +492,52 @@ export default function EditWorkout() {
     );
   };
 
+  const removeExerciseFromDay = useCallback(
+    (dayId: number, exerciseId: number) => {
+      const day = days.find((d) => d.day_id === dayId);
+      if (!day) return;
+      if (day.exercises.length <= 1) {
+        Alert.alert(t('errorTitle'), t('cannotDeleteLastExercise'));
+        return;
+      }
+      setDays((prev) =>
+        prev.map((d) =>
+          d.day_id === dayId
+            ? { ...d, exercises: d.exercises.filter((e) => e.exercise_id !== exerciseId) }
+            : d,
+        ),
+      );
+    },
+    [days, t],
+  );
+
   const renderExerciseItem = ({ item, drag, isActive }: RenderItemParams<Exercise>, day: Day) => {
+    let exerciseSwipeRef: Swipeable | null = null;
     const index = day.exercises.findIndex((e) => e.exercise_id === item.exercise_id);
     const showCardio = isCardioExerciseInEditor(workoutType, item);
 
     return (
+      <Swipeable
+        ref={(r) => {
+          exerciseSwipeRef = r;
+        }}
+        enabled={!isActive}
+        friction={2}
+        overshootLeft={false}
+        overshootRight={false}
+        renderRightActions={() => (
+          <RectButton
+            style={styles.exerciseSwipeDelete}
+            onPress={() => {
+              exerciseSwipeRef?.close();
+              removeExerciseFromDay(day.day_id, item.exercise_id);
+            }}
+          >
+            <Ionicons name="trash-outline" size={20} color="#fff" />
+            <Text style={styles.exerciseSwipeDeleteText}>{t('Delete')}</Text>
+          </RectButton>
+        )}
+      >
       <TouchableOpacity
         onLongPress={drag}
         disabled={isActive}
@@ -617,7 +659,11 @@ export default function EditWorkout() {
               />
               <TextInput
                 style={[styles.restInput, { color: theme.text }]}
-                value={item.rest_seconds != null ? String(item.rest_seconds) : ''}
+                value={
+                  item.rest_seconds != null
+                    ? String(item.rest_seconds)
+                    : String(DEFAULT_REST_SECONDS_BETWEEN_SETS)
+                }
                 onChangeText={(text) => {
                   const sanitized = text.replace(/[^0-9]/g, '');
                   handleExerciseChange(
@@ -635,6 +681,7 @@ export default function EditWorkout() {
           )}
         </View>
       </TouchableOpacity>
+      </Swipeable>
     );
   };
 
@@ -859,6 +906,21 @@ const styles = StyleSheet.create({
     padding: 10, 
     borderRadius: 10, 
     backgroundColor: 'transparent',
+  },
+  exerciseSwipeDelete: {
+    justifyContent: 'center',
+    alignItems: 'center',
+    width: 88,
+    backgroundColor: '#c62828',
+    borderTopLeftRadius: 10,
+    borderBottomLeftRadius: 10,
+    flex: 1,
+  },
+  exerciseSwipeDeleteText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 13,
+    marginTop: 4,
   },
   dragHandle: {
     marginRight: 30,

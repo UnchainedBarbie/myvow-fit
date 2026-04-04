@@ -29,3 +29,19 @@ export function getLocalWeekMondaySundayYmd(now: Date = new Date()): {
     weekEndYmd: formatLocalYmd(sunday),
   };
 }
+
+/** Add calendar days to a YYYY-MM-DD string (local date arithmetic). */
+export function addDaysToLocalYmd(ymd: string, deltaDays: number): string {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(y, m - 1, d + deltaDays);
+  return formatLocalYmd(dt);
+}
+
+/** Whole days from `fromYmd` to `toYmd` (local calendar). */
+export function daysBetweenLocalYmd(fromYmd: string, toYmd: string): number {
+  const t = (s: string) => {
+    const [y, m, d] = s.split('-').map(Number);
+    return new Date(y, m - 1, d).getTime();
+  };
+  return Math.round((t(toYmd) - t(fromYmd)) / 86400000);
+}

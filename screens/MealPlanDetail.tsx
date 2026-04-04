@@ -31,8 +31,23 @@ import {
 import { initNutritionDb } from '../utils/nutritionDb';
 import { foodItemServingToTrackerFields } from '../utils/foodItemServingToTrackerRow';
 import { useDrawerMenu } from '../context/DrawerMenuContext';
+import {
+  addDaysToLocalYmd,
+  getLocalWeekMondaySundayYmd,
+  localTodayYmd,
+} from '../utils/localDateYmd';
 
 const SAGE = '#7C9A7E';
+
+const JS_GET_DAY_TO_WEEKDAY_KEY: (
+  | 'sun'
+  | 'mon'
+  | 'tue'
+  | 'wed'
+  | 'thu'
+  | 'fri'
+  | 'sat'
+)[] = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const DAYS: DayOfWeek[] = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 const DAY_LABELS: Record<DayOfWeek, string> = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun' };
 
@@ -120,7 +135,7 @@ type PlanMeal = {
   foods: PlanFood[];
 };
 
-/** Readable schedule line for share/copy (expanded day keys). */
+/** Readable schedule line for share (expanded day keys). */
 function scheduleDaysToSummary(days: Set<string>): string {
   if (days.size === 0) return 'Not set';
   const labels = DAYS.filter((d) => days.has(d)).map((d) => DAY_LABELS[d]);
@@ -444,11 +459,24 @@ export default function MealPlanDetail() {
 
   const loadFutureActiveFlag = useCallback(async () => {
     if (!meal_plan_id) return;
-    const today = new Date().toISOString().split('T')[0];
+    const today = localTodayYmd();
     try {
+      await initMealPlansDb(db);
+      const planRow = await db.getFirstAsync<{ week_start: string | null }>(
+        'SELECT week_start FROM MealPlans WHERE meal_plan_id = ?',
+        [meal_plan_id],
+      );
+      const ws = planRow?.week_start?.trim();
+      if (!ws) {
+        setHasFutureActiveAssignments(false);
+        return;
+      }
+      const weekEnd = addDaysToLocalYmd(ws, 6);
       const row = await db.getFirstAsync<{ x: number }>(
-        'SELECT 1 AS x FROM DayActivePlan WHERE meal_plan_id = ? AND date > ? LIMIT 1',
-        [meal_plan_id, today],
+        `SELECT 1 AS x FROM DayActivePlan
+         WHERE meal_plan_id = ? AND date > ? AND date >= ? AND date <= ?
+         LIMIT 1`,
+        [meal_plan_id, today, ws, weekEnd],
       );
       setHasFutureActiveAssignments(!!row);
     } catch {
@@ -483,22 +511,6 @@ export default function MealPlanDetail() {
     () => formatMealPlanShareText(name ?? 'Meal plan', planMeals, scheduleSummary),
     [name, planMeals, scheduleSummary],
   );
-
-  const copyMealPlan = useCallback(async () => {
-    try {
-      // Dynamic import so startup doesn't require ExpoClipboard native code.
-      // Rebuild your dev client with expo-clipboard linked for copy to work.
-      const Clipboard = await import('expo-clipboard');
-      await Clipboard.setStringAsync(mealPlanShareText);
-      Alert.alert('Copied', 'Meal plan copied to the clipboard.');
-    } catch (e) {
-      console.warn('copyMealPlan', e);
-      Alert.alert(
-        'Copy unavailable',
-        'Clipboard needs native code in your build. Run a new development build, or use Share instead.',
-      );
-    }
-  }, [mealPlanShareText]);
 
   const shareMealPlan = useCallback(async () => {
     try {
@@ -607,7 +619,7 @@ export default function MealPlanDetail() {
           text: 'Continue',
           onPress: async () => {
             try {
-              const today = new Date().toISOString().split('T')[0];
+              const today = localTodayYmd();
               await db.runAsync('DELETE FROM DayActivePlan WHERE meal_plan_id = ? AND date > ?', [
                 meal_plan_id,
                 today,
@@ -624,7 +636,6 @@ export default function MealPlanDetail() {
   };
 
   const setAsActive = () => {
-    const today = new Date().toISOString().split('T')[0];
     const plan = { meal_plan_id, name };
     Alert.alert(
       'Set as Active',
@@ -635,6 +646,7 @@ export default function MealPlanDetail() {
           text: 'Set as Active',
           onPress: async () => {
             try {
+              const today = localTodayYmd();
               console.log('[SetAsActive] Step 0: today =', today, 'plan_id =', plan.meal_plan_id);
 
               // Step 0.5: Mark this plan as active for this whole week (Mon–Sun) in DayActivePlan
@@ -648,36 +660,17 @@ export default function MealPlanDetail() {
               const scheduledDays = expandMealPlanScheduleToWeekdayKeys(scheduleRows);
               console.log('[SetAsActive] scheduledDays:', Array.from(scheduledDays), 'scheduleRows:', scheduleRows);
 
-              const DAYS: ('sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat')[] = [
-                'sun',
-                'mon',
-                'tue',
-                'wed',
-                'thu',
-                'fri',
-                'sat',
-              ];
-
-              const base = new Date(today + 'T12:00:00');
-              const day = base.getDay(); // 0=Sun,1=Mon
-              const mondayOffset = day === 0 ? -6 : 1 - day;
-              const monday = new Date(base);
-              monday.setDate(base.getDate() + mondayOffset);
-              const monday_iso = monday.toISOString().slice(0, 10);
-              const sundayEnd = new Date(monday);
-              sundayEnd.setDate(monday.getDate() + 6);
-              const sunday_iso = sundayEnd.toISOString().slice(0, 10);
+              const { weekStartYmd, weekEndYmd } = getLocalWeekMondaySundayYmd();
 
               await db.runAsync(
                 'DELETE FROM DayActivePlan WHERE meal_plan_id = ? AND date >= ? AND date <= ?',
-                [plan.meal_plan_id, monday_iso, sunday_iso],
+                [plan.meal_plan_id, weekStartYmd, weekEndYmd],
               );
 
               for (let i = 0; i < 7; i++) {
-                const d = new Date(monday);
-                d.setDate(monday.getDate() + i);
-                const iso = d.toISOString().slice(0, 10);
-                const weekdayKey = DAYS[d.getDay()]; // 'sun'...'sat'
+                const iso = addDaysToLocalYmd(weekStartYmd, i);
+                const [y, mo, dnum] = iso.split('-').map(Number);
+                const weekdayKey = JS_GET_DAY_TO_WEEKDAY_KEY[new Date(y, mo - 1, dnum).getDay()];
                 if (scheduledDays.size === 0 || scheduledDays.has(weekdayKey)) {
                   // If no schedule rows exist, treat as manual-only: apply to all days.
                   await db.runAsync(
@@ -688,85 +681,94 @@ export default function MealPlanDetail() {
                 }
               }
 
-              // Step 1: INSERT OR IGNORE into DailyLog
-              await db.runAsync(
-                'INSERT OR IGNORE INTO DailyLog (log_date, meal_plan_id) VALUES (?, ?)',
-                [today, plan.meal_plan_id]
-              );
-              console.log('[SetAsActive] Step 1: INSERT OR IGNORE DailyLog done');
+              const [yt, mt, dt] = today.split('-').map(Number);
+              const todayWeekdayKey =
+                JS_GET_DAY_TO_WEEKDAY_KEY[new Date(yt, mt - 1, dt).getDay()];
+              const shouldPrefillToday =
+                scheduledDays.size === 0 || scheduledDays.has(todayWeekdayKey);
 
-              // Step 2: UPDATE DailyLog SET meal_plan_id
-              await db.runAsync(
-                'UPDATE DailyLog SET meal_plan_id = ? WHERE log_date = ?',
-                [plan.meal_plan_id, today]
-              );
-              console.log('[SetAsActive] Step 2: UPDATE DailyLog done');
+              // Only attach the plan to today's tracker when today is a scheduled day (or schedule is empty = all days).
+              if (shouldPrefillToday) {
+                // Step 1: INSERT OR IGNORE into DailyLog
+                await db.runAsync(
+                  'INSERT OR IGNORE INTO DailyLog (log_date, meal_plan_id) VALUES (?, ?)',
+                  [today, plan.meal_plan_id],
+                );
+                console.log('[SetAsActive] Step 1: INSERT OR IGNORE DailyLog done');
 
-              // Step 3: GET log_id from DailyLog
-              const logRows = await db.getAllAsync<{ log_id: number }>(
-                'SELECT log_id FROM DailyLog WHERE log_date = ?',
-                [today]
-              );
-              const logRow = logRows[0];
-              console.log('[SetAsActive] Step 3: log_id =', logRow?.log_id);
+                // Step 2: UPDATE DailyLog SET meal_plan_id
+                await db.runAsync('UPDATE DailyLog SET meal_plan_id = ? WHERE log_date = ?', [
+                  plan.meal_plan_id,
+                  today,
+                ]);
+                console.log('[SetAsActive] Step 2: UPDATE DailyLog done');
 
-              if (!logRow) {
-                console.log('[SetAsActive] FAIL: no DailyLog row for today');
-                navigation.navigate('Nutrition' as never, { activeTab: 'plans' } as never);
-                Alert.alert('Error', 'Could not get or create daily log.');
-                return;
-              }
+                // Step 3: GET log_id from DailyLog
+                const logRows = await db.getAllAsync<{ log_id: number }>(
+                  'SELECT log_id FROM DailyLog WHERE log_date = ?',
+                  [today],
+                );
+                const logRow = logRows[0];
+                console.log('[SetAsActive] Step 3: log_id =', logRow?.log_id);
 
-              // Step 4: DELETE existing LoggedFoods for that log_id
-              await db.runAsync('DELETE FROM LoggedFoods WHERE log_id = ?', [logRow.log_id]);
-              console.log('[SetAsActive] Step 4: DELETE LoggedFoods done');
+                if (!logRow) {
+                  console.log('[SetAsActive] FAIL: no DailyLog row for today');
+                  navigation.navigate('Nutrition' as never, { activeTab: 'plans' } as never);
+                  Alert.alert('Error', 'Could not get or create daily log.');
+                  return;
+                }
 
-              // Step 5: SELECT all foods via PlannedMeals JOIN FoodItems
-              const foods = await db.getAllAsync<{
-                meal_type: string;
-                meal_order: number;
-                food_name: string;
-                brand: string | null;
-                serving_size: string | null;
-                calories: number;
-                protein: number;
-                carbs: number;
-                fat: number;
-              }>(
-                `SELECT pm.meal_type, pm.meal_order, fi.food_name, fi.brand,
+                // Step 4: DELETE existing LoggedFoods for that log_id
+                await db.runAsync('DELETE FROM LoggedFoods WHERE log_id = ?', [logRow.log_id]);
+                console.log('[SetAsActive] Step 4: DELETE LoggedFoods done');
+
+                // Step 5: SELECT all foods via PlannedMeals JOIN FoodItems
+                const foods = await db.getAllAsync<{
+                  meal_type: string;
+                  meal_order: number;
+                  food_name: string;
+                  brand: string | null;
+                  serving_size: string | null;
+                  calories: number;
+                  protein: number;
+                  carbs: number;
+                  fat: number;
+                }>(
+                  `SELECT pm.meal_type, pm.meal_order, fi.food_name, fi.brand,
                  fi.serving_size, fi.calories, fi.protein, fi.carbs, fi.fat
                  FROM PlannedMeals pm
                  JOIN FoodItems fi ON fi.meal_id = pm.meal_id
                  WHERE pm.meal_plan_id = ?
                  ORDER BY pm.meal_order`,
-                [plan.meal_plan_id]
-              );
-              console.log('[SetAsActive] Step 5: foods from plan =', foods.length);
+                  [plan.meal_plan_id],
+                );
+                console.log('[SetAsActive] Step 5: foods from plan =', foods.length);
 
-              // Step 6: INSERT each food into LoggedFoods for today
-              let count = 0;
-              for (const food of foods) {
-                const { quantity, unitToken } = foodItemServingToTrackerFields(food.serving_size);
-                await db.runAsync(
-                  `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type,
+                // Step 6: INSERT each food into LoggedFoods for today
+                let count = 0;
+                for (const food of foods) {
+                  const { quantity, unitToken } = foodItemServingToTrackerFields(food.serving_size);
+                  await db.runAsync(
+                    `INSERT INTO LoggedFoods (log_id, food_name, brand, meal_type,
                    serving_size, quantity, calories, protein, carbs, fat)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                  [
-                    logRow.log_id,
-                    food.food_name,
-                    food.brand,
-                    food.meal_type,
-                    unitToken,
-                    quantity,
-                    food.calories ?? 0,
-                    food.protein ?? 0,
-                    food.carbs ?? 0,
-                    food.fat ?? 0,
-                  ]
-                );
-                count += 1;
+                    [
+                      logRow.log_id,
+                      food.food_name,
+                      food.brand,
+                      food.meal_type,
+                      unitToken,
+                      quantity,
+                      food.calories ?? 0,
+                      food.protein ?? 0,
+                      food.carbs ?? 0,
+                      food.fat ?? 0,
+                    ],
+                  );
+                  count += 1;
+                }
+                console.log('[SetAsActive] Step 6: LoggedFoods inserted for today =', count);
               }
-              console.log('[SetAsActive] Step 6: LoggedFoods inserted for today =', count);
 
               await loadFutureActiveFlag();
 
@@ -813,14 +815,6 @@ export default function MealPlanDetail() {
           {name}
         </Text>
         <View style={styles.headerActions}>
-          <TouchableOpacity
-            onPress={copyMealPlan}
-            style={styles.headerIconBtn}
-            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-            accessibilityLabel="Copy meal plan"
-          >
-            <Ionicons name="copy-outline" size={22} color={SAGE} />
-          </TouchableOpacity>
           <TouchableOpacity
             onPress={shareMealPlan}
             style={styles.headerIconBtn}

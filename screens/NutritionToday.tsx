@@ -15,7 +15,10 @@ import {
   Modal,
   TextInput,
   Pressable,
+  KeyboardAvoidingView,
+  Dimensions,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../context/ThemeContext';
 import { useSQLiteContext, type SQLiteDatabase } from 'expo-sqlite';
 import Ionicons from 'react-native-vector-icons/Ionicons';
@@ -23,7 +26,7 @@ import { Swipeable, RectButton } from 'react-native-gesture-handler';
 import { initMealPlansDb, type DayOfWeek } from '../utils/initMealPlansDb';
 import { initNutritionDb } from '../utils/nutritionDb';
 import { foodItemServingToTrackerFields } from '../utils/foodItemServingToTrackerRow';
-import { isPieceServingUnit } from '../utils/getRelevantUnits';
+import { isPieceServingUnit, preferSizeUnitOverWholeServingText } from '../utils/getRelevantUnits';
 import AddFoodModal from './AddFoodModal';
 
 function favoriteSignature(name: string, brand: string | null): string {
@@ -158,6 +161,54 @@ function per100FromTotals(
     fat: Math.round(fat * factor * 100) / 100,
   };
 }
+
+/**
+ * Edit modal only: if serving/unit text starts with a vulgar fraction (e.g. "1/4 avocado (50g)", "1/2 cup"),
+ * show quantity as the decimal value of that fraction and unit as the remainder. Save path unchanged.
+ */
+function quantityAndUnitForEditForm(
+  storedQuantity: number,
+  unitOrServingSize: string,
+): { quantityStr: string; unitStr: string } {
+  const raw = String(unitOrServingSize ?? '').trim();
+  if (!raw) {
+    return { quantityStr: String(storedQuantity || 1), unitStr: preferSizeUnitOverWholeServingText('serving') };
+  }
+  const m = raw.match(/^\s*(\d+)\s*\/\s*(\d+)(?:\s+(.*))?$/);
+  if (!m) {
+    return {
+      quantityStr: String(storedQuantity || 1),
+      unitStr: preferSizeUnitOverWholeServingText(raw),
+    };
+  }
+  const num = parseInt(m[1], 10);
+  const den = parseInt(m[2], 10);
+  if (!Number.isFinite(num) || !Number.isFinite(den) || den <= 0 || num < 0) {
+    return {
+      quantityStr: String(storedQuantity || 1),
+      unitStr: preferSizeUnitOverWholeServingText(raw),
+    };
+  }
+  const frac = num / den;
+  if (!Number.isFinite(frac)) {
+    return {
+      quantityStr: String(storedQuantity || 1),
+      unitStr: preferSizeUnitOverWholeServingText(raw),
+    };
+  }
+  const rest = (m[3] ?? '').trim();
+  const qtyDecimal = frac;
+  let quantityStr: string;
+  if (Number.isInteger(qtyDecimal)) {
+    quantityStr = String(qtyDecimal);
+  } else {
+    quantityStr = parseFloat(qtyDecimal.toFixed(6)).toString();
+  }
+  return {
+    quantityStr,
+    unitStr: preferSizeUnitOverWholeServingText(rest || 'serving'),
+  };
+}
 const MEAL_TYPES = ['breakfast', 'snack', 'lunch', 'dinner'] as const;
 const MEAL_LABELS: Record<(typeof MEAL_TYPES)[number], string> = {
   breakfast: 'Breakfast',
@@ -198,6 +249,39 @@ export type LoggedFood = {
   fat: number;
 };
 
+function formatQtyForList(n: number): string {
+  if (!Number.isFinite(n)) return '1';
+  if (Number.isInteger(n)) return String(n);
+  return parseFloat(n.toFixed(4)).toString();
+}
+
+/** One line for meal list: "1 cup", "2 oz"; if unit starts with a fraction, effective amount is quantity × fraction. */
+function formatFoodPortionListLine(food: LoggedFood): string {
+  const q = food.quantity ?? 1;
+  const raw = String(food.unit ?? 'serving').trim();
+  if (!raw) {
+    return `${formatQtyForList(q)} serving${q === 1 ? '' : 's'}`;
+  }
+  const lower = raw.toLowerCase();
+  if (lower === 'serving' || lower === 'servings') {
+    return `${formatQtyForList(q)} ${q === 1 ? 'serving' : 'servings'}`;
+  }
+  const m = raw.match(/^\s*(\d+)\s*\/\s*(\d+)(?:\s+(.*))?$/);
+  if (m) {
+    const num = parseInt(m[1], 10);
+    const den = parseInt(m[2], 10);
+    if (Number.isFinite(num) && Number.isFinite(den) && den > 0 && num >= 0) {
+      const frac = num / den;
+      if (Number.isFinite(frac)) {
+        const rest = (m[3] ?? '').trim() || 'serving';
+        const total = q * frac;
+        return `${formatQtyForList(total)} ${rest}`.trim();
+      }
+    }
+  }
+  return `${formatQtyForList(q)} ${raw}`.trim();
+}
+
 type MealMacroTotals = { calories: number; protein: number; carbs: number; fat: number };
 
 function sumMealNutrition(foodsInMeal: LoggedFood[]): MealMacroTotals {
@@ -226,6 +310,8 @@ type NutritionTodayProps = {
 
 export default function NutritionToday({ selectedDate, onLoadPlan, reload }: NutritionTodayProps) {
   const isLoadingRef = useRef(false);
+  const insets = useSafeAreaInsets();
+  const windowHeight = Dimensions.get('window').height;
   const { theme } = useTheme();
   const db = useSQLiteContext();
   const [scheduledPlan, setScheduledPlan] = useState<PlanInfo | null>(null);
@@ -240,6 +326,8 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
   const [editPer100, setEditPer100] = useState<{ calories: number; protein: number; carbs: number; fat: number } | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [addMealType, setAddMealType] = useState<string>('breakfast');
+  /** When non-null, AddFoodModal updates this row instead of inserting. */
+  const [replaceLoggedFoodId, setReplaceLoggedFoodId] = useState<number | null>(null);
   const [unitDropdownOpen, setUnitDropdownOpen] = useState(false);
   const [planDebug, setPlanDebug] = useState<{ scheduleRows: number; dayOfWeek: string; source: string; planName: string } | null>(null);
   const [favoritedSignatures, setFavoritedSignatures] = useState<Set<string>>(new Set());
@@ -282,11 +370,26 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
     // When viewing today, try DailyLog + LoggedFoods (log_id) first (Set as Active flow)
     if (selectedDate === todayIsoForLoad) {
       try {
-        const logRows = await db.getAllAsync<{ log_id: number }>(
-          'SELECT log_id FROM DailyLog WHERE log_date = ?',
-          [selectedDate]
+        await initMealPlansDb(db);
+        const logRows = await db.getAllAsync<{ log_id: number; meal_plan_id: number | null }>(
+          'SELECT log_id, meal_plan_id FROM DailyLog WHERE log_date = ?',
+          [selectedDate],
         );
-        const logRow = logRows[0];
+        let logRow = logRows[0];
+        if (logRow != null && logRow.meal_plan_id != null) {
+          const dapOk = await db
+            .getAllAsync<{ n: number }>(
+              'SELECT 1 AS n FROM DayActivePlan WHERE date = ? AND meal_plan_id = ? LIMIT 1',
+              [selectedDate, logRow.meal_plan_id],
+            )
+            .catch(() => [] as { n: number }[]);
+          if (dapOk.length === 0) {
+            await initNutritionDb(db);
+            await db.runAsync('UPDATE DailyLog SET meal_plan_id = NULL WHERE log_date = ?', [selectedDate]);
+            await db.runAsync('DELETE FROM LoggedFoods WHERE log_id = ?', [logRow.log_id]);
+            logRow = { log_id: logRow.log_id, meal_plan_id: null };
+          }
+        }
         if (logRow) {
           const rows = await db.getAllAsync<{
             logged_food_id: number;
@@ -617,14 +720,14 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
   const openEdit = (food: LoggedFood) => {
     setEditingFood(food);
     const q = food.quantity || 1;
-    const u = food.unit || 'serving';
-    const per100 = per100FromTotals(q, u, food.calories ?? 0, food.protein ?? 0, food.carbs ?? 0, food.fat ?? 0);
+    const { quantityStr, unitStr } = quantityAndUnitForEditForm(food.quantity ?? 1, food.unit || 'serving');
+    const per100 = per100FromTotals(q, unitStr, food.calories ?? 0, food.protein ?? 0, food.carbs ?? 0, food.fat ?? 0);
     setEditPer100(per100);
     setEditForm({
       food_name: food.food_name,
       brand: food.brand ?? '',
-      quantity: String(food.quantity),
-      unit: u,
+      quantity: quantityStr,
+      unit: unitStr,
       meal_type: food.meal_type || 'Lunch',
       calories: String(food.calories ?? 0),
       protein: String(food.protein ?? 0),
@@ -681,6 +784,19 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
     setUnitDropdownOpen(false);
     setEditPer100(null);
   }, []);
+
+  const openChangeFoodFromEdit = useCallback(() => {
+    if (!editingFood) return;
+    const m = (editingFood.meal_type || 'lunch').toLowerCase();
+    const validMeal = MEAL_TYPES.includes(m as (typeof MEAL_TYPES)[number]) ? m : 'lunch';
+    setAddMealType(validMeal);
+    setReplaceLoggedFoodId(editingFood.logged_food_id);
+    setEditModalVisible(false);
+    setEditingFood(null);
+    setEditPer100(null);
+    setUnitDropdownOpen(false);
+    setShowAddModal(true);
+  }, [editingFood]);
 
   const confirmDelete = (food: LoggedFood) => {
     const mealLabel = food.meal_type || 'meal';
@@ -829,7 +945,11 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
         visible={showAddModal}
         mealType={addMealType}
         selectedDate={selectedDate}
-        onClose={() => setShowAddModal(false)}
+        replaceLoggedFoodId={replaceLoggedFoodId}
+        onClose={() => {
+          setShowAddModal(false);
+          setReplaceLoggedFoodId(null);
+        }}
         onFoodAdded={loadLoggedFoods}
       />
       <Modal
@@ -877,76 +997,112 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
         animationType="slide"
         onRequestClose={closeEditModal}
       >
-        <View style={styles.modalOverlay}>
+        <View style={styles.editFoodModalRoot}>
           <TouchableWithoutFeedback onPress={closeEditModal}>
-            <View style={styles.modalBackdropTap} />
+            <View style={styles.editFoodModalDim} />
           </TouchableWithoutFeedback>
-          <View style={[styles.modalBox, { backgroundColor: theme.background }]}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>Edit food</Text>
-            <Text style={[styles.modalLabel, { color: theme.text }]}>Food name</Text>
-            <TextInput style={[styles.modalInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.food_name} onChangeText={(v) => setEditForm((f) => ({ ...f, food_name: v }))} placeholder="Name" placeholderTextColor="#888" />
-            <Text style={[styles.modalLabel, { color: theme.text }]}>Brand</Text>
-            <TextInput style={[styles.modalInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.brand} onChangeText={(v) => setEditForm((f) => ({ ...f, brand: v }))} placeholder="Brand (optional)" placeholderTextColor="#888" />
-            <Text style={[styles.modalLabel, { color: theme.text }]}>Quantity</Text>
-            <TextInput style={[styles.modalInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.quantity} onChangeText={updateEditQuantity} placeholder="1" keyboardType="decimal-pad" />
-            <Text style={[styles.modalLabel, { color: theme.text }]}>Unit</Text>
-            <TouchableOpacity
-              style={[styles.modalInput, styles.unitDropdownTrigger, { backgroundColor: theme.card, borderColor: theme.border }]}
-              onPress={() => setUnitDropdownOpen((o) => !o)}
+          <KeyboardAvoidingView
+            style={[
+              styles.editFoodModalKav,
+              {
+                paddingTop: Math.max(insets.top, 12) + 8,
+                paddingBottom: Math.max(insets.bottom, 12),
+              },
+            ]}
+            behavior="padding"
+            keyboardVerticalOffset={0}
+          >
+            <View
+              style={[
+                styles.modalBox,
+                {
+                  backgroundColor: theme.background,
+                  maxHeight: windowHeight * 0.88,
+                },
+              ]}
             >
-              <Text style={{ color: theme.text, fontSize: 16 }}>{editForm.unit || 'serving'}</Text>
-              <Ionicons name={unitDropdownOpen ? 'chevron-up' : 'chevron-down'} size={20} color={theme.text} />
-            </TouchableOpacity>
-            {unitDropdownOpen && (
-              <View style={[styles.unitDropdownList, { backgroundColor: theme.card, borderColor: theme.border }]}>
-                <ScrollView style={styles.unitDropdownScroll} nestedScrollEnabled showsVerticalScrollIndicator={false}>
-                  {UNIT_OPTIONS.map((u) => (
-                    <TouchableOpacity
-                      key={u}
-                      style={[styles.unitDropdownOption, { backgroundColor: editForm.unit === u ? (theme.primary || SAGE) : 'transparent' }]}
-                      onPress={() => updateEditUnit(u)}
-                    >
-                      <Text style={[styles.unitDropdownOptionText, { color: editForm.unit === u ? '#fff' : theme.text }]}>{u}</Text>
+              <ScrollView
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode="on-drag"
+                showsVerticalScrollIndicator={false}
+                nestedScrollEnabled
+                contentContainerStyle={styles.editFoodModalScrollContent}
+              >
+                <Text style={[styles.modalTitle, { color: theme.text }]}>Edit food</Text>
+                <TouchableOpacity
+                  style={[styles.changeFoodBtn, { borderColor: SAGE }]}
+                  onPress={openChangeFoodFromEdit}
+                  activeOpacity={0.75}
+                >
+                  <Ionicons name="swap-horizontal-outline" size={18} color={SAGE} style={{ marginRight: 8 }} />
+                  <Text style={[styles.changeFoodBtnText, { color: SAGE }]}>Change food</Text>
+                </TouchableOpacity>
+                <Text style={[styles.modalLabel, { color: theme.text }]}>Food name</Text>
+                <TextInput style={[styles.modalInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.food_name} onChangeText={(v) => setEditForm((f) => ({ ...f, food_name: v }))} placeholder="Name" placeholderTextColor="#888" />
+                <Text style={[styles.modalLabel, { color: theme.text }]}>Brand</Text>
+                <TextInput style={[styles.modalInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.brand} onChangeText={(v) => setEditForm((f) => ({ ...f, brand: v }))} placeholder="Brand (optional)" placeholderTextColor="#888" />
+                <Text style={[styles.modalLabel, { color: theme.text }]}>Quantity</Text>
+                <TextInput style={[styles.modalInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.quantity} onChangeText={updateEditQuantity} placeholder="1" keyboardType="decimal-pad" />
+                <Text style={[styles.modalLabel, { color: theme.text }]}>Unit</Text>
+                <TouchableOpacity
+                  style={[styles.modalInput, styles.unitDropdownTrigger, { backgroundColor: theme.card, borderColor: theme.border }]}
+                  onPress={() => setUnitDropdownOpen((o) => !o)}
+                >
+                  <Text style={{ color: theme.text, fontSize: 16 }}>{editForm.unit || 'serving'}</Text>
+                  <Ionicons name={unitDropdownOpen ? 'chevron-up' : 'chevron-down'} size={20} color={theme.text} />
+                </TouchableOpacity>
+                {unitDropdownOpen && (
+                  <View style={[styles.unitDropdownList, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                    <ScrollView style={styles.unitDropdownScroll} nestedScrollEnabled showsVerticalScrollIndicator={false}>
+                      {UNIT_OPTIONS.map((u) => (
+                        <TouchableOpacity
+                          key={u}
+                          style={[styles.unitDropdownOption, { backgroundColor: editForm.unit === u ? (theme.primary || SAGE) : 'transparent' }]}
+                          onPress={() => updateEditUnit(u)}
+                        >
+                          <Text style={[styles.unitDropdownOptionText, { color: editForm.unit === u ? '#fff' : theme.text }]}>{u}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                  </View>
+                )}
+                <Text style={[styles.modalLabel, { color: theme.text }]}>Meal</Text>
+                <View style={styles.mealTypeRow}>
+                  {MEAL_ORDER.map((m) => (
+                    <TouchableOpacity key={m} style={[styles.mealTypeChip, editForm.meal_type === m && styles.mealTypeChipActive, { borderColor: theme.border, backgroundColor: editForm.meal_type === m ? SAGE : theme.card }]} onPress={() => setEditForm((f) => ({ ...f, meal_type: m }))}>
+                      <Text style={[styles.mealTypeChipText, { color: editForm.meal_type === m ? '#fff' : theme.text }]}>{m}</Text>
                     </TouchableOpacity>
                   ))}
-                </ScrollView>
-              </View>
-            )}
-            <Text style={[styles.modalLabel, { color: theme.text }]}>Meal</Text>
-            <View style={styles.mealTypeRow}>
-              {MEAL_ORDER.map((m) => (
-                <TouchableOpacity key={m} style={[styles.mealTypeChip, editForm.meal_type === m && styles.mealTypeChipActive, { borderColor: theme.border, backgroundColor: editForm.meal_type === m ? SAGE : theme.card }]} onPress={() => setEditForm((f) => ({ ...f, meal_type: m }))}>
-                  <Text style={[styles.mealTypeChipText, { color: editForm.meal_type === m ? '#fff' : theme.text }]}>{m}</Text>
-                </TouchableOpacity>
-              ))}
+                </View>
+                <View style={styles.macroInputRow}>
+                  <View style={styles.macroCell}>
+                    <Text style={[styles.macroCellLabel, { color: theme.text }]}>Calories</Text>
+                    <TextInput style={[styles.macroInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.calories} editable={false} />
+                  </View>
+                  <View style={styles.macroCell}>
+                    <Text style={[styles.macroCellLabel, { color: theme.text }]}>Protein</Text>
+                    <TextInput style={[styles.macroInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.protein} editable={false} />
+                  </View>
+                  <View style={styles.macroCell}>
+                    <Text style={[styles.macroCellLabel, { color: theme.text }]}>Carbs</Text>
+                    <TextInput style={[styles.macroInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.carbs} editable={false} />
+                  </View>
+                  <View style={styles.macroCell}>
+                    <Text style={[styles.macroCellLabel, { color: theme.text }]}>Fat</Text>
+                    <TextInput style={[styles.macroInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.fat} editable={false} />
+                  </View>
+                </View>
+                <View style={styles.modalActions}>
+                  <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.card }]} onPress={closeEditModal}>
+                    <Text style={[styles.modalBtnText, { color: theme.text }]}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.modalBtn, { backgroundColor: SAGE }]} onPress={saveEdit}>
+                    <Text style={styles.modalBtnText}>Save</Text>
+                  </TouchableOpacity>
+                </View>
+              </ScrollView>
             </View>
-            <View style={styles.macroInputRow}>
-              <View style={styles.macroCell}>
-                <Text style={[styles.macroCellLabel, { color: theme.text }]}>Calories</Text>
-                <TextInput style={[styles.macroInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.calories} editable={false} />
-              </View>
-              <View style={styles.macroCell}>
-                <Text style={[styles.macroCellLabel, { color: theme.text }]}>Protein</Text>
-                <TextInput style={[styles.macroInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.protein} editable={false} />
-              </View>
-              <View style={styles.macroCell}>
-                <Text style={[styles.macroCellLabel, { color: theme.text }]}>Carbs</Text>
-                <TextInput style={[styles.macroInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.carbs} editable={false} />
-              </View>
-              <View style={styles.macroCell}>
-                <Text style={[styles.macroCellLabel, { color: theme.text }]}>Fat</Text>
-                <TextInput style={[styles.macroInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]} value={editForm.fat} editable={false} />
-              </View>
-            </View>
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.card }]} onPress={closeEditModal}>
-                <Text style={[styles.modalBtnText, { color: theme.text }]}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: SAGE }]} onPress={saveEdit}>
-                <Text style={styles.modalBtnText}>Save</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
+          </KeyboardAvoidingView>
         </View>
       </Modal>
     </ScrollView>
@@ -995,6 +1151,9 @@ function FoodRow({
           delayLongPress={400}
         >
           <Text style={[styles.foodRowName, { color: theme.text }]} numberOfLines={1}>{food.food_name}{food.brand ? ` · ${food.brand}` : ''}</Text>
+          <Text style={[styles.foodRowPortion, { color: theme.textSecondary ?? '#888' }]} numberOfLines={2}>
+            {formatFoodPortionListLine(food)}
+          </Text>
           <Text style={[styles.foodRowMacros, { color: theme.text }]}>{Math.round(food.calories)} cal · {Math.round(food.protein)}P / {Math.round(food.carbs)}C / {Math.round(food.fat)}F</Text>
         </Pressable>
         <TouchableOpacity style={styles.heartBtn} onPress={onToggleFavorite} hitSlop={8}>
@@ -1046,6 +1205,7 @@ const styles = StyleSheet.create({
   foodRowContent: { flex: 1, minWidth: 0 },
   heartBtn: { padding: 4 },
   foodRowName: { fontSize: 15 },
+  foodRowPortion: { fontSize: 12, marginTop: 2 },
   foodRowMacros: { fontSize: 12, opacity: 0.8, marginTop: 2 },
   editBtn: { backgroundColor: '#E67E22', justifyContent: 'center', alignItems: 'center', width: 72 },
   deleteBtn: { backgroundColor: '#C0392B', justifyContent: 'center', alignItems: 'center', width: 72 },
@@ -1079,8 +1239,41 @@ const styles = StyleSheet.create({
   foodActionsModalRowText: { fontSize: 16, fontWeight: '600' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' },
   modalBackdropTap: { flex: 1 },
-  modalBox: { borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, paddingBottom: 32 },
-  modalTitle: { fontSize: 20, fontWeight: '700', marginBottom: 16 },
+  editFoodModalRoot: {
+    flex: 1,
+  },
+  editFoodModalDim: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+  },
+  editFoodModalKav: {
+    flex: 1,
+    justifyContent: 'flex-start',
+    paddingHorizontal: 16,
+  },
+  editFoodModalScrollContent: {
+    flexGrow: 1,
+    paddingBottom: 8,
+  },
+  modalBox: {
+    borderRadius: 20,
+    padding: 20,
+    paddingBottom: 20,
+    width: '100%',
+    alignSelf: 'center',
+  },
+  modalTitle: { fontSize: 20, fontWeight: '700', marginBottom: 8 },
+  changeFoodBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 14,
+  },
+  changeFoodBtnText: { fontSize: 15, fontWeight: '600' },
   modalLabel: { fontSize: 14, fontWeight: '600', marginBottom: 6, marginTop: 10 },
   modalInput: { borderWidth: 1, borderRadius: 10, padding: 12, fontSize: 16 },
   unitDropdownTrigger: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },

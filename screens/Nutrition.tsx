@@ -25,8 +25,13 @@ import NutritionToday from './NutritionToday';
 import MealPlanList from './MealPlanList';
 import { useDrawerMenu } from '../context/DrawerMenuContext';
 import { initMealPlansDb } from '../utils/initMealPlansDb';
+import {
+  aggregateGroceryListJsonEntriesByNameAndUnit,
+  parseGroceryListItemForAggregation,
+} from '../utils/generateMealPlanGroceryAndPrep';
 import { foodItemServingToTrackerFields } from '../utils/foodItemServingToTrackerRow';
 import { getRelevantUnits, pickDefaultUnitForFood, isPieceServingUnit } from '../utils/getRelevantUnits';
+import { localTodayYmd } from '../utils/localDateYmd';
 
 type MacroTotals = {
   calories: number;
@@ -195,7 +200,7 @@ export default function Nutrition() {
     setSelectedDate(d);
   };
   const selectedIso = formatYmdDate(selectedDate);
-  const todayIso = formatYmdDate(new Date());
+  const todayIso = localTodayYmd();
   const weekStart = getMonday(selectedIso);
   const weekDays = [0, 1, 2, 3, 4, 5, 6].map((i) => addDaysIso(weekStart, i));
   const goPrevWeek = () => {
@@ -246,48 +251,51 @@ export default function Nutrition() {
         activeIds.has(p.meal_plan_id),
       );
 
-      // Aggregate grocery items across active plans
-      const items: GroceryItem[] = [];
+      const allEntries: { category: string; item: string }[] = [];
       activePlans.forEach((p) => {
         if (!p.grocery_list) return;
         try {
           const parsed = JSON.parse(p.grocery_list);
-          if (Array.isArray(parsed)) {
-            parsed.forEach((entry: any, index: number) => {
-              const text = (entry.item ?? entry.text ?? '').trim();
-              if (!text) return;
-              let category = String(entry.category || 'Other').trim();
-              if (category === 'Protein') category = 'Meat & Fish';
-              const cat = category as GroceryItem['category'];
-              items.push({
-                id: `${p.meal_plan_id}_${index}_${text}`,
-                text,
-                category:
-                  cat === 'Produce' ||
-                  cat === 'Meat & Fish' ||
-                  cat === 'Dairy' ||
-                  cat === 'Pantry' ||
-                  cat === 'Other'
-                    ? cat
-                    : 'Other',
-                checked: false,
-              });
-            });
-          }
+          if (!Array.isArray(parsed)) return;
+          parsed.forEach((entry: any) => {
+            const text = (entry.item ?? entry.text ?? '').trim();
+            if (!text) return;
+            let category = String(entry.category || 'Other').trim();
+            if (category === 'Protein') category = 'Meat & Fish';
+            const cat =
+              category === 'Produce' ||
+              category === 'Meat & Fish' ||
+              category === 'Dairy' ||
+              category === 'Pantry' ||
+              category === 'Other'
+                ? category
+                : 'Other';
+            allEntries.push({ category: cat, item: text });
+          });
         } catch {
           // ignore malformed JSON for now
         }
       });
 
-      // De-duplicate by category+text
-      const seen = new Set<string>();
-      const unique = items.filter((it) => {
-        const key = `${it.category}|${it.text}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
+      const aggregated = aggregateGroceryListJsonEntriesByNameAndUnit(allEntries);
+      const catOrder = ['Produce', 'Meat & Fish', 'Dairy', 'Pantry', 'Other'] as const;
+      const items: GroceryItem[] = aggregated.map((e, i) => {
+        const cat = e.category as GroceryItem['category'];
+        const p = parseGroceryListItemForAggregation(e.item);
+        return {
+          id: `${cat}|${p.nameKey}|${p.unitNorm}|${i}`,
+          text: e.item,
+          category: cat,
+          checked: false,
+        };
       });
-      setWeeklyGrocery(unique);
+      items.sort((a, b) => {
+        const ca = catOrder.indexOf(a.category as (typeof catOrder)[number]);
+        const cb = catOrder.indexOf(b.category as (typeof catOrder)[number]);
+        if (ca !== cb) return ca - cb;
+        return a.text.localeCompare(b.text);
+      });
+      setWeeklyGrocery(items);
 
       // Aggregate prep guides
       const prepBlocks: { plan_name: string; text: string }[] = [];

@@ -17,6 +17,8 @@ export interface AIExercise {
   web_link?: string | null;
   muscle_group?: string | null;
   exercise_notes?: string | null;
+  /** Rest after / between sets for this exercise (seconds). Sage <workout> JSON. */
+  rest_seconds?: number | null;
 }
 
 export interface AIDay {
@@ -183,6 +185,14 @@ export function setsRepsForDbInsert(ex: AIExercise): { sets: number; reps: numbe
   };
 }
 
+/** Per-exercise rest from Sage JSON, or app default between sets. */
+export function restSecondsForDbInsert(ex: AIExercise): number {
+  const r = ex.rest_seconds;
+  const n = typeof r === 'number' ? r : parseInt(String(r ?? ''), 10);
+  if (Number.isInteger(n) && n >= 0) return n;
+  return DEFAULT_REST_SECONDS_BETWEEN_SETS;
+}
+
 function parseDurationMinutes(ex: AIExercise): number | null {
   const d = ex.duration_minutes;
   const n = typeof d === 'number' ? d : parseInt(String(d ?? ''), 10);
@@ -230,7 +240,7 @@ export async function insertAIWorkout(db: { withTransactionAsync: (fn: () => Pro
         const durationMinutes = isAiExerciseCardio(ex) ? parseDurationMinutes(ex) : null;
         const cardioDist =
           isAiExerciseCardio(ex) && ex.distance != null ? String(ex.distance) : null;
-        const restSeconds = DEFAULT_REST_SECONDS_BETWEEN_SETS;
+        const restSeconds = restSecondsForDbInsert(ex);
         try {
           await db.runAsync(
             'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, exercise_type, duration_minutes, cardio_distance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',

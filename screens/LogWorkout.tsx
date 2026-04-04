@@ -356,7 +356,7 @@ export default function LogWorkout() {
         return (
           <TouchableOpacity
             style={[
-              styles.listItem,
+              styles.workoutDayListItem,
               { backgroundColor: theme.card, borderColor: theme.border },
               selectedWorkout === item.item.workout_id && { backgroundColor: theme.buttonBackground },
             ]}
@@ -377,7 +377,7 @@ export default function LogWorkout() {
         return (
           <TouchableOpacity
             style={[
-              styles.listItem,
+              styles.workoutDayListItem,
               { backgroundColor: theme.card, borderColor: theme.border },
               selectedDay === item.item.day_id && { backgroundColor: theme.buttonBackground },
             ]}
@@ -402,20 +402,7 @@ export default function LogWorkout() {
               { backgroundColor: theme.card, borderColor: theme.border },
               notifyMe === item.item.value && { backgroundColor: theme.buttonBackground },
             ]}
-            onPress={() => {
-              if (item.item.value && !notificationPermissionGranted) {
-                Alert.alert(
-                  'Notifications Disabled',
-                  'You need to enable notifications in Settings first.',
-                  [
-                    { text: 'Cancel', style: 'cancel' },
-                    { text: 'Go to Settings', onPress: () => navigation.navigate('Settings' as never) },
-                  ]
-                );
-              } else {
-                setNotifyMe(item.item.value);
-              }
-            }}
+            onPress={() => setNotifyMe(item.item.value)}
           >
             <Text
               style={[
@@ -541,12 +528,27 @@ const styles = StyleSheet.create({
   Title: {
     fontSize: 22,
     fontWeight: '800',
-    marginVertical: 15,
+    marginTop: 4,
+    marginBottom: 12,
     color: '#000000',
     textAlign: 'center',
   },
   listItem: {
     padding: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.2)',
+    borderRadius: 12,
+    marginBottom: 12,
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 5,
+    elevation: 3,
+  },
+  workoutDayListItem: {
+    paddingVertical: 10,
+    paddingHorizontal: 20,
     borderWidth: 1,
     borderColor: 'rgba(0, 0, 0, 0.2)',
     borderRadius: 12,

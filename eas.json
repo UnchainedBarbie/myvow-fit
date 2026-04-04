@@ -1,0 +1,30 @@
+{
+  "cli": {
+    "version": ">= 18.4.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_USDA_API_KEY": "DpuWzQ1qlJEdNWwcMs022DtJlXvUmj57XG9PdBB1"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_USDA_API_KEY": "DpuWzQ1qlJEdNWwcMs022DtJlXvUmj57XG9PdBB1"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_USDA_API_KEY": "DpuWzQ1qlJEdNWwcMs022DtJlXvUmj57XG9PdBB1"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

@@ -116,18 +116,6 @@ export default function WorkoutList({
                   {workout.workout_name}
                 </Text>
                 <TouchableOpacity
-                  onPress={(e) => {
-                    e?.stopPropagation?.();
-                    (navigation.getParent?.() ?? navigation).navigate('My Calendar', {
-                      preselectedWorkoutId: workout.workout_id,
-                      preselectedWorkoutName: workout.workout_name,
-                    });
-                  }}
-                  style={styles.scheduleButton}
-                >
-                  <Text style={[styles.scheduleButtonText, { color: theme.primary || '#7C9A7E' }]}>Add to Schedule</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
                   onPress={() => handleExportWorkout(workout.workout_id)}
                 >
                   <Ionicons
@@ -217,8 +205,6 @@ const styles = StyleSheet.create({
     minWidth: 0,
     gap: 8,
   },
-  scheduleButton: { paddingVertical: 4, paddingHorizontal: 8 },
-  scheduleButtonText: { fontSize: 13, fontWeight: '600' },
   shareIcon: {
     marginLeft: 10,
   },

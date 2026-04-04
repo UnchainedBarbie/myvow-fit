@@ -7,9 +7,10 @@ import {
   TouchableOpacity,
   Alert,
   Modal,
-  ViewStyle,
   Platform,
   StatusBar,
+  LayoutAnimation,
+  UIManager,
 } from 'react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import {
@@ -51,6 +52,13 @@ import {
   getActiveWorkoutSession,
 } from '../utils/activeWorkoutSession';
 import { timerStateUtils } from '../utils/timerPersistenceUtils';
+import { deriveCalendarDayCellModel } from '../utils/calendarDayCellState';
+import {
+  fetchCalendarInsights,
+  type CalendarInsights,
+} from '../utils/calendarInsights';
+import { CalendarDayCell } from '../components/CalendarDayCell';
+import { CalendarProgressSummary } from '../components/CalendarProgressSummary';
 
 type MyCalendarNavigationProp = StackNavigationProp<
   WorkoutLogStackParamList,
@@ -98,6 +106,8 @@ export default function MyCalendar() {
   const [workouts, setWorkouts] = useState<Map<string, WorkoutEntry[]>>(
     new Map(),
   );
+  const [calendarInsights, setCalendarInsights] =
+    useState<CalendarInsights | null>(null);
 
   // State for the modal
   const [modalVisible, setModalVisible] = useState(false);
@@ -139,6 +149,41 @@ export default function MyCalendar() {
   const [workoutToReschedule, setWorkoutToReschedule] = useState<WorkoutEntry | null>(null);
   const [rescheduleNewDate, setRescheduleNewDate] = useState<Date>(() => new Date());
   const [showRescheduleDatePicker, setShowRescheduleDatePicker] = useState(false);
+
+  const [scheduleWorkoutPickerVisible, setScheduleWorkoutPickerVisible] =
+    useState(false);
+  const [savedWorkoutsForSchedule, setSavedWorkoutsForSchedule] = useState<
+    { workout_id: number; workout_name: string }[]
+  >([]);
+  type SchedulePickerDayRow = { day_id: number; day_name: string };
+  const [schedulePickerStep, setSchedulePickerStep] = useState<
+    'workout' | 'day'
+  >('workout');
+  const [schedulePickerDays, setSchedulePickerDays] = useState<
+    SchedulePickerDayRow[]
+  >([]);
+  const [schedulePickerPendingWorkoutId, setSchedulePickerPendingWorkoutId] =
+    useState<number | null>(null);
+
+  const resetSchedulePickerUi = useCallback(() => {
+    setSchedulePickerStep('workout');
+    setSchedulePickerDays([]);
+    setSchedulePickerPendingWorkoutId(null);
+  }, []);
+
+  const closeScheduleWorkoutPicker = useCallback(() => {
+    resetSchedulePickerUi();
+    setScheduleWorkoutPickerVisible(false);
+  }, [resetSchedulePickerUi]);
+
+  useEffect(() => {
+    if (
+      Platform.OS === 'android' &&
+      UIManager.setLayoutAnimationEnabledExperimental
+    ) {
+      UIManager.setLayoutAnimationEnabledExperimental(true);
+    }
+  }, []);
 
   // Run this check only ONCE when the component mounts
   useEffect(() => {
@@ -318,6 +363,35 @@ export default function MyCalendar() {
     [db],
   );
 
+  /**
+   * Re-materialize recurring rows, re-query Workout_Log + Weight_Log for the visible grid,
+   * and rebuild `workouts` so day cells show logged / missed / upcoming correctly.
+   */
+  const reloadCalendarIndicators = useCallback(
+    async (opts?: { shouldAbort?: () => boolean }) => {
+      const abort = opts?.shouldAbort ?? (() => false);
+      try {
+        await checkRecurringWorkouts(currentDate, CALENDAR_GRID_FIRST_WEEKDAY);
+        if (abort()) return;
+        await fetchWorkoutsForGrid(currentDate);
+        if (abort()) return;
+        try {
+          const insights = await fetchCalendarInsights(db);
+          if (!abort()) setCalendarInsights(insights);
+        } catch (insErr) {
+          console.error('MyCalendar: calendar insights', insErr);
+        }
+        if (abort()) return;
+        const session = await getActiveWorkoutSession();
+        if (abort()) return;
+        setActiveWorkoutLogId(session?.workoutLogId ?? null);
+      } catch (e) {
+        console.error('MyCalendar: reloadCalendarIndicators', e);
+      }
+    },
+    [currentDate, checkRecurringWorkouts, db, fetchWorkoutsForGrid],
+  );
+
   const shiftDayModalBy = useCallback(
     async (delta: number) => {
       if (detailedWorkoutRef.current) return;
@@ -346,6 +420,164 @@ export default function MyCalendar() {
     [fetchWorkoutEntriesForLocalDay],
   );
 
+  const localDayStartUnixSec = useCallback((d: Date) => {
+    return Math.floor(
+      new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000,
+    );
+  }, []);
+
+  const openScheduleWorkoutPicker = useCallback(async () => {
+    try {
+      resetSchedulePickerUi();
+      await db
+        .runAsync(
+          "ALTER TABLE Workouts ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';",
+        )
+        .catch(() => {});
+      const rows = await db.getAllAsync<{
+        workout_id: number;
+        workout_name: string;
+      }>(
+        'SELECT workout_id, workout_name FROM Workouts ORDER BY workout_name;',
+      );
+      setSavedWorkoutsForSchedule(rows);
+      setScheduleWorkoutPickerVisible(true);
+    } catch (e) {
+      console.error('MyCalendar: load workouts for schedule picker', e);
+      Alert.alert(t('errorTitle'), t('fetchWorkoutDetailsError'));
+    }
+  }, [db, resetSchedulePickerUi, t]);
+
+  const scheduleSavedWorkoutForSelectedDay = useCallback(
+    async (workoutId: number, planDay: SchedulePickerDayRow) => {
+      const dayDate = selectedDateRef.current;
+      if (!dayDate) return;
+      try {
+        await db.runAsync('ALTER TABLE Workout_Log ADD COLUMN notification_id TEXT;').catch(() => {});
+        await db.runAsync('ALTER TABLE Workout_Log ADD COLUMN completion_time INTEGER;').catch(() => {});
+        await db
+          .runAsync(
+            "ALTER TABLE Workout_Log ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';",
+          )
+          .catch(() => {});
+        await db
+          .runAsync(
+            "ALTER TABLE Workouts ADD COLUMN workout_type TEXT NOT NULL DEFAULT 'strength';",
+          )
+          .catch(() => {});
+
+        const [workoutRow] = await db.getAllAsync<{
+          workout_name: string;
+          workout_type: string | null;
+        }>('SELECT workout_name, workout_type FROM Workouts WHERE workout_id = ?;', [
+          workoutId,
+        ]);
+        if (!workoutRow) {
+          Alert.alert(t('errorTitle'), t('fetchWorkoutDetailsError'));
+          return;
+        }
+
+        const workoutDate = localDayStartUnixSec(dayDate);
+        const workoutType =
+          (workoutRow.workout_type || 'strength').toLowerCase() === 'cardio'
+            ? 'cardio'
+            : 'strength';
+
+        const existingLog = await db.getAllAsync<{ workout_log_id: number }>(
+          `SELECT workout_log_id 
+           FROM Workout_Log 
+           WHERE workout_date = ? 
+             AND day_name = ? 
+             AND workout_name = ?;`,
+          [workoutDate, planDay.day_name, workoutRow.workout_name.trim()],
+        );
+        if (existingLog.length > 0) {
+          Alert.alert(t('duplicateLogTitle'), t('duplicateLogMessage'));
+          return;
+        }
+
+        const { lastInsertRowId: workoutLogId } = await db.runAsync(
+          'INSERT INTO Workout_Log (workout_date, day_name, workout_name, notification_id, workout_type) VALUES (?, ?, ?, ?, ?);',
+          [
+            workoutDate,
+            planDay.day_name,
+            workoutRow.workout_name.trim(),
+            null,
+            workoutType,
+          ],
+        );
+
+        if (workoutType !== 'cardio') {
+          const exercises = await db.getAllAsync<{
+            exercise_name: string;
+            sets: number;
+            reps: number;
+            web_link: string | null;
+            muscle_group: string | null;
+            exercise_notes: string | null;
+            rest_seconds: number | null;
+          }>(
+            'SELECT exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds FROM Exercises WHERE day_id = ? ORDER BY exercise_id;',
+            [planDay.day_id],
+          );
+          for (const exercise of exercises) {
+            await db.runAsync(
+              'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+              [
+                workoutLogId,
+                exercise.exercise_name,
+                exercise.sets,
+                exercise.reps,
+                exercise.web_link,
+                exercise.muscle_group,
+                exercise.exercise_notes,
+                exercise.rest_seconds ?? null,
+              ],
+            );
+          }
+        }
+
+        closeScheduleWorkoutPicker();
+        setModalVisible(false);
+        setDetailedWorkout(null);
+        await reloadCalendarIndicators();
+      } catch (e) {
+        console.error('MyCalendar: schedule workout for day', e);
+        Alert.alert(
+          t('errorTitle'),
+          t('failedToAddToCalendar') || 'Failed to schedule workout.',
+        );
+      }
+    },
+    [closeScheduleWorkoutPicker, db, localDayStartUnixSec, reloadCalendarIndicators, t],
+  );
+
+  const handleScheduleWorkoutChosenInPicker = useCallback(
+    async (workoutId: number) => {
+      try {
+        const rows = await db.getAllAsync<SchedulePickerDayRow>(
+          'SELECT day_id, day_name FROM Days WHERE workout_id = ? ORDER BY day_id ASC;',
+          [workoutId],
+        );
+        if (!rows.length) {
+          Alert.alert(t('errorTitle'), t('noDaysAvailable'));
+          return;
+        }
+        if (rows.length === 1) {
+          await scheduleSavedWorkoutForSelectedDay(workoutId, rows[0]!);
+          return;
+        }
+        setSchedulePickerPendingWorkoutId(workoutId);
+        setSchedulePickerDays(rows);
+        setSchedulePickerStep('day');
+      } catch (e) {
+        console.error('MyCalendar: load days for schedule picker', e);
+        Alert.alert(t('errorTitle'), t('fetchWorkoutDetailsError'));
+      }
+    },
+    [db, scheduleSavedWorkoutForSelectedDay, t],
+  );
+
   const dayModalSwipeGesture = useMemo(() => {
     if (detailedWorkout) {
       return Gesture.Pan().enabled(false);
@@ -366,29 +598,20 @@ export default function MyCalendar() {
       });
   }, [detailedWorkout, shiftDayModalBy]);
 
-  // Materialize recurring rows for the visible grid, then load workouts
+  // Every time this screen gains focus: re-query logs and recompute day indicators.
   useFocusEffect(
     useCallback(() => {
       let cancelled = false;
-      (async () => {
-        console.log(
-          'MyCalendar: Screen focused, materializing recurring & fetching grid.',
-        );
-        await checkRecurringWorkouts(currentDate, CALENDAR_GRID_FIRST_WEEKDAY);
-        if (!cancelled) {
-          await fetchWorkoutsForGrid(currentDate);
-        }
-        if (!cancelled) {
-          const session = await getActiveWorkoutSession();
-          if (!cancelled) {
-            setActiveWorkoutLogId(session?.workoutLogId ?? null);
-          }
-        }
-      })();
+      console.log(
+        'MyCalendar: Screen focused, reloading calendar indicators.',
+      );
+      void reloadCalendarIndicators({
+        shouldAbort: () => cancelled,
+      });
       return () => {
         cancelled = true;
       };
-    }, [currentDate, checkRecurringWorkouts, fetchWorkoutsForGrid]),
+    }, [reloadCalendarIndicators]),
   );
 
   const dismissActiveWorkoutBanner = useCallback(async () => {
@@ -498,25 +721,19 @@ export default function MyCalendar() {
   };
 
   useEffect(() => {
-    const handleRefresh = async () => {
-      console.log('DEBUG: Refresh signal received, starting async process.');
-      await checkRecurringWorkouts(currentDate, CALENDAR_GRID_FIRST_WEEKDAY);
-      console.log('Recurring workouts check complete.');
-      await fetchWorkoutsForGrid(currentDate);
-      console.log('Calendar grid data re-fetched.');
-      navigation.setParams({ refresh: false });
+    if (!route.params?.refresh) return;
+    let alive = true;
+    (async () => {
+      console.log('MyCalendar: refresh param set, reloading calendar indicators.');
+      await reloadCalendarIndicators({ shouldAbort: () => !alive });
+      if (alive) {
+        navigation.setParams({ refresh: false });
+      }
+    })();
+    return () => {
+      alive = false;
     };
-
-    if (route.params?.refresh) {
-      handleRefresh();
-    }
-  }, [
-    route.params?.refresh,
-    navigation,
-    fetchWorkoutsForGrid,
-    currentDate,
-    checkRecurringWorkouts,
-  ]);
+  }, [route.params?.refresh, reloadCalendarIndicators, navigation]);
 
   const closeUntrackedModal = () => {
     setUntrackedChoiceModalVisible(false);
@@ -555,7 +772,7 @@ export default function MyCalendar() {
         `DELETE FROM Logged_Exercises WHERE workout_log_id = ?;`,
         [workout_log_id],
       );
-      fetchWorkoutsForGrid(currentDate);
+      void reloadCalendarIndicators();
 
       setSelectedDateWorkouts((prev) => {
         const updated = prev.filter(
@@ -642,7 +859,7 @@ export default function MyCalendar() {
       );
       setRescheduleModalVisible(false);
       setWorkoutToReschedule(null);
-      fetchWorkoutsForGrid(currentDate);
+      void reloadCalendarIndicators();
       setSelectedDateWorkouts((prev) => {
         const updated = prev.filter((w) => w.workout.workout_log_id !== workout_log_id);
         if (updated.length === 0) setModalVisible(false);
@@ -653,7 +870,7 @@ export default function MyCalendar() {
       console.error('Reschedule error:', err);
       Alert.alert(t('errorTitle'), t('failedToReschedule') || 'Failed to update workout date.');
     }
-  }, [workoutToReschedule, rescheduleNewDate, db, cancelNotification, scheduleNotification, currentDate, fetchWorkoutsForGrid, t]);
+  }, [workoutToReschedule, rescheduleNewDate, db, cancelNotification, scheduleNotification, reloadCalendarIndicators, t]);
 
   const formatDate = (timestamp: number): string => {
     const date = new Date(timestamp * 1000);
@@ -701,17 +918,32 @@ export default function MyCalendar() {
     return `${paddedMinutes}:${paddedSeconds}`;
   };
 
-  const handlePrevMonth = () => {
+  const bumpMonth = useCallback((delta: number) => {
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
     setCurrentDate(
-      (prevDate) => new Date(prevDate.getFullYear(), prevDate.getMonth() - 1, 1),
+      (prevDate) =>
+        new Date(prevDate.getFullYear(), prevDate.getMonth() + delta, 1),
     );
-  };
+  }, []);
 
-  const handleNextMonth = () => {
-    setCurrentDate(
-      (prevDate) => new Date(prevDate.getFullYear(), prevDate.getMonth() + 1, 1),
-    );
-  };
+  const handlePrevMonth = useCallback(() => bumpMonth(-1), [bumpMonth]);
+  const handleNextMonth = useCallback(() => bumpMonth(1), [bumpMonth]);
+
+  const monthSwipeGesture = useMemo(
+    () =>
+      Gesture.Pan()
+        .activeOffsetX([-20, 20])
+        .failOffsetY([-18, 18])
+        .onEnd((e) => {
+          const { translationX, velocityX } = e;
+          if (translationX < -56 || velocityX < -320) {
+            runOnJS(bumpMonth)(1);
+          } else if (translationX > 56 || velocityX > 320) {
+            runOnJS(bumpMonth)(-1);
+          }
+        }),
+    [bumpMonth],
+  );
 
   const getMonthName = (date: Date) => {
     const months = [
@@ -741,8 +973,16 @@ export default function MyCalendar() {
 
     weekDays.forEach((day, index) => {
       gridItems.push(
-        <View key={`weekday-${index}`} style={styles.gridCell}>
-          <Text style={[styles.weekDayText, { color: theme.text }]}>{day}</Text>
+        <View
+          key={`weekday-${index}`}
+          style={[
+            styles.weekdayHeaderCell,
+            { borderBottomColor: theme.border },
+          ]}
+        >
+          <Text style={[styles.weekDayText, { color: theme.textSecondary }]}>
+            {day}
+          </Text>
         </View>,
       );
     });
@@ -774,71 +1014,45 @@ export default function MyCalendar() {
       const workoutEntries = workouts.get(dateKey);
 
       const isCurrentMonth = cellMonth === month;
-      const isToday =
-        today.getFullYear() === cellYear &&
-        today.getMonth() === cellMonth &&
-        today.getDate() === day;
-      const isPast = cellDate.setHours(0, 0, 0, 0) < today.setHours(0, 0, 0, 0);
-      const isFuture =
-        cellDate.setHours(0, 0, 0, 0) > today.setHours(0, 0, 0, 0);
+      const todayMid = new Date(
+        today.getFullYear(),
+        today.getMonth(),
+        today.getDate(),
+      ).getTime();
+      const cellMid = new Date(cellYear, cellMonth, day).getTime();
+      const isToday = cellMid === todayMid;
+      const isPast = cellMid < todayMid;
+      const isFuture = cellMid > todayMid;
 
-      const dayCellStyles: ViewStyle[] = [styles.dayCellContainer];
-      const textStyle: any[] = [
-        styles.dayText,
-        isCurrentMonth
-          ? { color: theme.text }
-          : { color: theme.text, opacity: 0.3 },
-      ];
+      const hasWorkouts = !!(workoutEntries && workoutEntries.length > 0);
+      const isAnyLogged =
+        hasWorkouts && workoutEntries!.some((entry) => entry.isLogged);
 
-      let isAnyLogged = false;
-      if (workoutEntries && workoutEntries.length > 0) {
-        isAnyLogged = workoutEntries.some((entry) => entry.isLogged);
-        if (isAnyLogged) {
-          dayCellStyles.push({ backgroundColor: theme.buttonBackground });
-          textStyle.splice(1, 1, { color: theme.buttonText });
-        } else if (isPast || isToday) {
-          dayCellStyles.push(styles.untrackedDay, { borderColor: theme.text });
-        } else if (isFuture) {
-          dayCellStyles.push(styles.upcomingDay);
-        }
-      }
+      const model = deriveCalendarDayCellModel({
+        hasWorkouts,
+        isAnyLogged,
+        isPast,
+        isFuture,
+        isToday,
+        isCurrentMonth,
+      });
 
       gridItems.push(
-        <TouchableOpacity
+        <CalendarDayCell
           key={dateKey}
-          style={styles.gridCell}
+          day={day}
+          model={model}
+          theme={{
+            text: theme.text,
+            buttonBackground: theme.buttonBackground,
+            buttonText: theme.buttonText,
+            textSecondary: theme.textSecondary,
+            primary: theme.primary,
+          }}
           onPress={() => {
             handleDatePress(cellDate, workoutEntries);
           }}
-        >
-          <View style={dayCellStyles}>
-            <Text style={textStyle}>{day}</Text>
-            {isToday && (
-              <View
-                style={[
-                  styles.todayIndicator,
-                  {
-                    backgroundColor: isAnyLogged
-                      ? theme.buttonText
-                      : theme.text,
-                  },
-                ]}
-              />
-            )}
-            {workoutEntries && workoutEntries.length > 1 && (
-              <View
-                style={[
-                  styles.multipleWorkoutIndicator,
-                  {
-                    backgroundColor: isAnyLogged
-                      ? theme.buttonText
-                      : theme.text,
-                  },
-                ]}
-              />
-            )}
-          </View>
-        </TouchableOpacity>,
+        />,
       );
     }
     return gridItems;
@@ -849,7 +1063,7 @@ export default function MyCalendar() {
     <ScrollView
       style={{ flex: 1, backgroundColor: theme.background }}
       showsVerticalScrollIndicator={false}
-      contentContainerStyle={[styles.contentContainer, { paddingTop: 24 }]}
+      contentContainerStyle={[styles.contentContainer, { paddingTop: 18 }]}
     >
       {activeWorkoutLogId != null && (
         <View
@@ -958,99 +1172,75 @@ export default function MyCalendar() {
           { backgroundColor: theme.card, borderColor: theme.border },
         ]}
       >
-        <View style={styles.calendarHeader}>
-          <TouchableOpacity onPress={handlePrevMonth}>
-            <Ionicons name='chevron-back' size={scale(24)} color={theme.text} />
-          </TouchableOpacity>
-          <Text style={[styles.calendarMonthText, { color: theme.text }]}>
-            {`${getMonthName(currentDate)} ${currentDate.getFullYear()}`}
-          </Text>
-          <TouchableOpacity onPress={handleNextMonth}>
-            <Ionicons
-              name='chevron-forward'
-              size={scale(24)}
-              color={theme.text}
-            />
-          </TouchableOpacity>
-        </View>
-        <View style={styles.daysGrid}>{renderCalendarGrid()}</View>
-      </View>
-
-      {/* Legend Section */}
-      <View style={styles.legendContainer}>
-        {/* First Column of Legend */}
-        <View style={styles.legendColumn}>
-          {/* Today Item */}
-          <View style={styles.legendItem}>
-            <View style={styles.todayLegendIcon}>
-              <Text style={[styles.legendIconText, { color: theme.text }]}>
-                1
-              </Text>
-              <View
-                style={[
-                  styles.todayIndicator,
-                  { backgroundColor: theme.text, bottom: -4 },
-                ]}
-              />
-            </View>
-            <Text style={[styles.legendText, { color: theme.text }]}>
-              {t('This Week') || 'This Week'}
-            </Text>
-          </View>
-          {/* Untracked Item */}
-          <View style={styles.legendItem}>
-            <View
-              style={[
-                styles.legendIcon,
-                styles.untrackedLegendIcon,
-                { borderColor: theme.text },
-              ]}
-            >
-              <Text style={[styles.legendIconText, { color: theme.text }]}>
-                3
-              </Text>
-            </View>
-            <Text style={[styles.legendText, { color: theme.text }]}>
-              {t('Missed') || 'Missed'}
-            </Text>
-          </View>
-        </View>
-
-        {/* Second Column of Legend */}
-        <View style={styles.legendColumn}>
-          {/* Logged Item */}
-          <View style={styles.legendItem}>
-            <View
-              style={[
-                styles.legendIcon,
-                { backgroundColor: theme.buttonBackground },
-              ]}
-            >
-              <Text
-                style={[styles.legendIconText, { color: theme.buttonText }]}
+        <GestureDetector gesture={monthSwipeGesture}>
+          <View>
+            <View style={styles.calendarHeader}>
+              <TouchableOpacity
+                onPress={handlePrevMonth}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                accessibilityRole="button"
+                accessibilityLabel={t('prevMonthA11y', {
+                  defaultValue: 'Previous month',
+                })}
               >
-                2
-              </Text>
+                <Ionicons name="chevron-back" size={scale(26)} color={theme.text} />
+              </TouchableOpacity>
+              <View style={styles.calendarTitleBlock}>
+                <Text style={[styles.calendarMonthText, { color: theme.text }]}>
+                  {getMonthName(currentDate)}
+                </Text>
+                <Text
+                  style={[styles.calendarYearSub, { color: theme.textSecondary }]}
+                >
+                  {currentDate.getFullYear()}
+                </Text>
+              </View>
+              <TouchableOpacity
+                onPress={handleNextMonth}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                accessibilityRole="button"
+                accessibilityLabel={t('nextMonthA11y', {
+                  defaultValue: 'Next month',
+                })}
+              >
+                <Ionicons
+                  name="chevron-forward"
+                  size={scale(26)}
+                  color={theme.text}
+                />
+              </TouchableOpacity>
             </View>
-            <Text style={[styles.legendText, { color: theme.text }]}>
-              {t('Logged')}
-            </Text>
+            <View style={styles.daysGrid}>{renderCalendarGrid()}</View>
           </View>
-          {/* Upcoming Item */}
-          <View style={styles.legendItem}>
-            <View style={[styles.legendIcon, styles.upcomingDay]}>
-              <Text style={[styles.legendIconText, { color: theme.text }]}>
-                4
-              </Text>
-            </View>
-            <Text style={[styles.legendText, { color: theme.text }]}>
-              {t('Upcoming')}
-            </Text>
-          </View>
-        </View>
+        </GestureDetector>
       </View>
-      <Text style={[styles.tipText, { color: theme.text }]}>
-        {t('scheduleTip')}
+
+      {calendarInsights ? (
+        <CalendarProgressSummary
+          insights={calendarInsights}
+          theme={{
+            card:
+              theme.type === 'dark'
+                ? 'rgba(255,255,255,0.07)'
+                : theme.card,
+            text: theme.text,
+            textSecondary: theme.textSecondary,
+            border: theme.border,
+            buttonBackground: theme.buttonBackground,
+          }}
+          t={t}
+          dateFormat={
+            dateFormat === 'mm-dd-yyyy' ? 'mm-dd-yyyy' : 'dd-mm-yyyy'
+          }
+        />
+      ) : null}
+      <Text
+        style={[styles.calendarMicroLegend, { color: theme.textSecondary }]}
+      >
+        {t('calendarMicroHint', {
+          defaultValue:
+            'Ring = today · green = logged · bar = scheduled · ✕ = missed',
+        })}
       </Text>
 
       {/* Modal for Workout Details - only mount when open so it doesn't block the reschedule modal */}
@@ -1060,6 +1250,10 @@ export default function MyCalendar() {
         transparent={true}
         animationType='fade'
         onRequestClose={() => {
+          if (scheduleWorkoutPickerVisible) {
+            closeScheduleWorkoutPicker();
+            return;
+          }
           setModalVisible(false);
           setDetailedWorkout(null);
         }}
@@ -1072,79 +1266,107 @@ export default function MyCalendar() {
         <View
           style={[
             styles.modalContainer,
+            styles.modalContainerRelative,
             { backgroundColor: 'rgba(0, 0, 0, 0.5)' },
           ]}
         >
           <GestureDetector gesture={dayModalSwipeGesture}>
           <View style={[styles.modalContent, { backgroundColor: theme.card }]}>
-            <View style={styles.modalHeader}>
-              {detailedWorkout ? (
-                <TouchableOpacity
-                  style={styles.modalLeftButton}
-                  onPress={() => {
-                    setDetailedWorkout(null);
-                    setExercises([]);
-                    setCompletionTime(null);
-                  }}
-                >
-                  <Ionicons
-                    name='arrow-back'
-                    size={scale(24)}
-                    color={theme.text}
-                  />
-                </TouchableOpacity>
-              ) : (
-                <View style={styles.modalLeftButton} />
-              )}
-
-              <TouchableOpacity
-                style={styles.modalRightButton}
-                onPress={() => {
-                  setModalVisible(false);
-                  setDetailedWorkout(null);
-                }}
-              >
-                <Ionicons name='close' size={scale(24)} color={theme.text} />
-              </TouchableOpacity>
-            </View>
-
             {detailedWorkout ? (
               <>
-                <Text style={[styles.modalTitle, { color: theme.text }]}>
-                  {detailedWorkout.workout.workout_name.trim() ===
-                  detailedWorkout.workout.day_name.trim()
-                    ? formatWorkoutHeaderTitle(
-                        detailedWorkout.workout.workout_name,
-                        detailedWorkout.workout.day_name
-                      )
-                    : detailedWorkout.workout.workout_name}
-                </Text>
-                {!!detailedWorkout.workout.workout_type && (
-                  <Text style={[styles.modalSubtitle, { color: theme.textSecondary, marginTop: 2 }]}>
-                    {detailedWorkout.workout.workout_type === 'cardio' ? 'Cardio' : 'Strength'}
-                  </Text>
-                )}
-                <Text style={[styles.modalSubtitle, { color: theme.text }]}>
-                  {detailedWorkout.workout.workout_name.trim() ===
-                  detailedWorkout.workout.day_name.trim()
-                    ? formatDate(detailedWorkout.workout.workout_date)
-                    : `${detailedWorkout.workout.day_name} | ${formatDate(detailedWorkout.workout.workout_date)}`}
-                </Text>
-                {completionTime && (
-                  <View style={styles.completionTimeContainer}>
+                <View style={styles.modalDetailHeaderRow}>
+                  <TouchableOpacity
+                    style={styles.modalBarIconHit}
+                    onPress={() => {
+                      setDetailedWorkout(null);
+                      setExercises([]);
+                      setCompletionTime(null);
+                    }}
+                  >
                     <Ionicons
-                      name='time-outline'
-                      size={scale(16)}
+                      name='arrow-back'
+                      size={scale(24)}
                       color={theme.text}
                     />
+                  </TouchableOpacity>
+                  <View
+                    style={[
+                      styles.modalWorkoutTitleCard,
+                      {
+                        borderColor: theme.border,
+                        backgroundColor: theme.background,
+                      },
+                    ]}
+                  >
                     <Text
-                      style={[styles.completionTimeText, { color: theme.text }]}
+                      style={[
+                        styles.modalTitle,
+                        styles.modalTitleInWorkoutCard,
+                        { color: theme.text },
+                      ]}
                     >
-                      {' '}
-                      {formatCompletionTime(completionTime)}
+                      {detailedWorkout.workout.workout_name.trim() ===
+                      detailedWorkout.workout.day_name.trim()
+                        ? formatWorkoutHeaderTitle(
+                            detailedWorkout.workout.workout_name,
+                            detailedWorkout.workout.day_name
+                          )
+                        : detailedWorkout.workout.workout_name}
                     </Text>
+                    {!!detailedWorkout.workout.workout_type && (
+                      <Text
+                        style={[
+                          styles.modalSubtitle,
+                          styles.modalSubtitleInWorkoutCard,
+                          { color: theme.textSecondary, marginTop: 2 },
+                        ]}
+                      >
+                        {detailedWorkout.workout.workout_type === 'cardio'
+                          ? 'Cardio'
+                          : 'Strength'}
+                      </Text>
+                    )}
+                    <Text
+                      style={[
+                        styles.modalSubtitle,
+                        styles.modalSubtitleInWorkoutCard,
+                        { color: theme.text },
+                      ]}
+                    >
+                      {detailedWorkout.workout.workout_name.trim() ===
+                      detailedWorkout.workout.day_name.trim()
+                        ? formatDate(detailedWorkout.workout.workout_date)
+                        : `${detailedWorkout.workout.day_name} | ${formatDate(detailedWorkout.workout.workout_date)}`}
+                    </Text>
+                    {completionTime && (
+                      <View style={styles.completionTimeContainer}>
+                        <Ionicons
+                          name='time-outline'
+                          size={scale(16)}
+                          color={theme.text}
+                        />
+                        <Text
+                          style={[
+                            styles.completionTimeText,
+                            { color: theme.text },
+                          ]}
+                        >
+                          {' '}
+                          {formatCompletionTime(completionTime)}
+                        </Text>
+                      </View>
+                    )}
                   </View>
-                )}
+                  <TouchableOpacity
+                    style={styles.modalBarIconHit}
+                    onPress={() => {
+                      setModalVisible(false);
+                      setDetailedWorkout(null);
+                    }}
+                  >
+                    <Ionicons name='close' size={scale(24)} color={theme.text} />
+                  </TouchableOpacity>
+                </View>
                 <GestureScrollView style={{ width: '100%', maxHeight: 400 }} showsVerticalScrollIndicator={false}>
                   {exercises.length > 0 ? (
                     exercises.map((exercise, index) => (
@@ -1192,11 +1414,212 @@ export default function MyCalendar() {
               </>
             ) : (
               <>
-                <Text style={[styles.modalTitle, { color: theme.text }]}>
+                <View style={styles.modalListHeaderRow}>
+                  <TouchableOpacity
+                    style={styles.modalBarIconHit}
+                    onPress={() => {
+                      setModalVisible(false);
+                      setDetailedWorkout(null);
+                    }}
+                  >
+                    <Ionicons name='close' size={scale(24)} color={theme.text} />
+                  </TouchableOpacity>
+                </View>
+                <Text
+                  style={[
+                    styles.modalTitle,
+                    styles.modalTitleDayList,
+                    { color: theme.text },
+                  ]}
+                >
                   {selectedDate
                     ? formatDate(selectedDate.getTime() / 1000)
                     : ''}
                 </Text>
+                {selectedDateWorkouts.length > 0 ? (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={styles.dayModalQuickActionsScroll}
+                    contentContainerStyle={styles.dayModalQuickActionsContent}
+                  >
+                    <TouchableOpacity
+                      style={[
+                        styles.quickChip,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: theme.background,
+                        },
+                      ]}
+                      onPress={() => {
+                        const startOne = (entry: WorkoutEntry) => {
+                          setModalVisible(false);
+                          navigation.navigate('StartedWorkoutInterface', {
+                            workout_log_id: entry.workout.workout_log_id,
+                          });
+                        };
+                        if (selectedDateWorkouts.length === 1) {
+                          startOne(selectedDateWorkouts[0]);
+                        } else {
+                          Alert.alert(
+                            t('startWorkout') || 'Start Workout',
+                            t('whichWorkoutToStart') ||
+                              'Which workout do you want to start?',
+                            selectedDateWorkouts
+                              .map((entry) => ({
+                                text: entry.workout.day_name.trim(),
+                                onPress: () => startOne(entry),
+                              }))
+                              .concat([
+                                { text: t('Cancel'), style: 'cancel' as const },
+                              ]),
+                          );
+                        }
+                      }}
+                    >
+                      <Ionicons
+                        name="play-circle-outline"
+                        size={scale(18)}
+                        color={theme.buttonBackground}
+                      />
+                      <Text
+                        style={[styles.quickChipLabel, { color: theme.text }]}
+                      >
+                        {t('startWorkout') || 'Start'}
+                      </Text>
+                    </TouchableOpacity>
+                    {selectedDateWorkouts.some((e) => !e.isLogged) ? (
+                    <TouchableOpacity
+                      style={[
+                        styles.quickChip,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: theme.background,
+                        },
+                      ]}
+                      onPress={() => {
+                        const unlogged = selectedDateWorkouts.filter(
+                          (e) => !e.isLogged,
+                        );
+                        if (unlogged.length === 0) return;
+                        const openLog = (entry: WorkoutEntry) => {
+                          setModalVisible(false);
+                          navigation.navigate('LogWeights', {
+                            workout_log_id: entry.workout.workout_log_id,
+                          });
+                        };
+                        if (unlogged.length === 1) {
+                          openLog(unlogged[0]);
+                        } else {
+                          Alert.alert(
+                            t('logWeights') || 'Log workout',
+                            t('whichWorkoutToLog') ||
+                              'Which workout do you want to log?',
+                            unlogged
+                              .map((entry) => ({
+                                text: `${entry.workout.day_name} — ${entry.workout.workout_name}`,
+                                onPress: () => openLog(entry),
+                              }))
+                              .concat([
+                                { text: t('Cancel'), style: 'cancel' as const },
+                              ]),
+                          );
+                        }
+                      }}
+                    >
+                      <Ionicons
+                        name="create-outline"
+                        size={scale(18)}
+                        color={theme.buttonBackground}
+                      />
+                      <Text
+                        style={[styles.quickChipLabel, { color: theme.text }]}
+                      >
+                        {t('logWeights') || 'Log'}
+                      </Text>
+                    </TouchableOpacity>
+                    ) : null}
+                    <TouchableOpacity
+                      style={[
+                        styles.quickChip,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: theme.background,
+                        },
+                      ]}
+                      onPress={() => {
+                        if (selectedDateWorkouts.length === 1) {
+                          openRescheduleFlow(selectedDateWorkouts[0]);
+                        } else {
+                          Alert.alert(
+                            t('rescheduleWorkout') || 'Reschedule',
+                            t('reschedulePickWorkout') ||
+                              'Which workout do you want to reschedule?',
+                            selectedDateWorkouts
+                              .map((entry) => ({
+                                text: entry.workout.workout_name,
+                                onPress: () => openRescheduleFlow(entry),
+                              }))
+                              .concat([
+                                { text: t('Cancel'), style: 'cancel' as const },
+                              ]),
+                          );
+                        }
+                      }}
+                    >
+                      <Ionicons
+                        name="calendar-outline"
+                        size={scale(18)}
+                        color={theme.buttonBackground}
+                      />
+                      <Text
+                        style={[styles.quickChipLabel, { color: theme.text }]}
+                      >
+                        {t('rescheduleWorkout') || 'Move'}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.quickChip,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: theme.background,
+                        },
+                      ]}
+                      onPress={() => void openScheduleWorkoutPicker()}
+                    >
+                      <Ionicons
+                        name="add"
+                        size={scale(18)}
+                        color={theme.buttonBackground}
+                      />
+                      <Text
+                        style={[styles.quickChipLabel, { color: theme.text }]}
+                      >
+                        {t('scheduleWorkoutLog')}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.quickChip,
+                        {
+                          borderColor: 'rgba(192, 57, 43, 0.45)',
+                          backgroundColor: theme.background,
+                        },
+                      ]}
+                      onPress={handleDeleteWorkoutPress}
+                    >
+                      <Ionicons
+                        name="trash-outline"
+                        size={scale(18)}
+                        color="#C0392B"
+                      />
+                      <Text style={[styles.quickChipLabel, { color: '#C0392B' }]}>
+                        {t('remove') || 'Remove'}
+                      </Text>
+                    </TouchableOpacity>
+                  </ScrollView>
+                ) : null}
                 {(() => {
                   if (selectedDateWorkouts.length === 0) {
                     return (
@@ -1243,29 +1666,41 @@ export default function MyCalendar() {
                             }}
                           >
                             <View style={{ flex: 1 }}>
-                              <Text
-                                style={[
-                                  styles.modalWorkoutName,
-                                  { color: theme.text },
-                                ]}
-                              >
-                                {entry.workout.workout_name.trim() === entry.workout.day_name.trim()
-                                  ? formatWorkoutHeaderTitle(
-                                      entry.workout.workout_name,
-                                      entry.workout.day_name
-                                    )
-                                  : entry.workout.workout_name}
-                              </Text>
-                              {entry.workout.workout_name.trim() !==
-                                entry.workout.day_name.trim() && (
+                              {entry.workout.workout_name.trim() ===
+                              entry.workout.day_name.trim() ? (
                                 <Text
                                   style={[
-                                    styles.modalWorkoutDay,
+                                    styles.modalDayListDayTitle,
                                     { color: theme.text },
                                   ]}
                                 >
-                                  {entry.workout.day_name}
+                                  {formatWorkoutHeaderTitle(
+                                    entry.workout.workout_name,
+                                    entry.workout.day_name
+                                  )}
                                 </Text>
+                              ) : (
+                                <>
+                                  <Text
+                                    style={[
+                                      styles.modalDayListDayTitle,
+                                      { color: theme.text },
+                                    ]}
+                                  >
+                                    {entry.workout.day_name}
+                                  </Text>
+                                  <Text
+                                    style={[
+                                      styles.modalDayListWorkoutSubtitle,
+                                      {
+                                        color: theme.text,
+                                        marginTop: moderateScale(4),
+                                      },
+                                    ]}
+                                  >
+                                    {entry.workout.workout_name}
+                                  </Text>
+                                </>
                               )}
                             </View>
                           </TouchableOpacity>
@@ -1274,127 +1709,20 @@ export default function MyCalendar() {
                     </>
                   );
                 })()}
-                {selectedDateWorkouts.length > 0 ? (
-                  <>
-                    <TouchableOpacity
-                      style={[
-                        styles.actionButton,
-                        {
-                          backgroundColor: theme.buttonBackground,
-                          marginTop: 20,
-                          width: '100%',
-                        },
-                      ]}
-                      onPress={() => {
-                        const startWorkout = (entry: WorkoutEntry) => {
-                          setModalVisible(false);
-                          navigation.navigate('StartedWorkoutInterface', {
-                            workout_log_id: entry.workout.workout_log_id,
-                          });
-                        };
-                        if (selectedDateWorkouts.length === 1) {
-                          startWorkout(selectedDateWorkouts[0]);
-                        } else {
-                          Alert.alert(
-                            t('startWorkout') || 'Start Workout',
-                            t('whichWorkoutToStart') || 'Which workout do you want to start?',
-                            selectedDateWorkouts.map((entry) => ({
-                              text: entry.workout.workout_name,
-                              onPress: () => startWorkout(entry),
-                            })).concat([{ text: t('Cancel'), style: 'cancel' as const }])
-                          );
-                        }
-                      }}
-                    >
-                      <Ionicons
-                        name='stopwatch-outline'
-                        size={scale(22)}
-                        color={theme.buttonText}
-                        style={styles.icon}
-                      />
-                      <Text
-                        style={[
-                          styles.actionButtonText,
-                          { color: theme.buttonText },
-                        ]}
-                      >
-                        {t('startWorkout') || 'Start Workout'}
-                      </Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[
-                        styles.actionButton,
-                        {
-                          backgroundColor: theme.buttonBackground,
-                          marginTop: 12,
-                          width: '100%',
-                        },
-                      ]}
-                      onPress={() => {
-                        if (selectedDateWorkouts.length === 1) {
-                          openRescheduleFlow(selectedDateWorkouts[0]);
-                        } else {
-                          Alert.alert(
-                            t('rescheduleWorkout') || 'Reschedule Workout',
-                            t('reschedulePickWorkout') || 'Which workout do you want to reschedule?',
-                            selectedDateWorkouts.map((entry) => ({
-                              text: entry.workout.workout_name,
-                              onPress: () => openRescheduleFlow(entry),
-                            })).concat([{ text: t('Cancel'), style: 'cancel' as const }])
-                          );
-                        }
-                      }}
-                    >
-                      <Ionicons
-                        name='calendar-outline'
-                        size={scale(22)}
-                        color={theme.buttonText}
-                        style={styles.icon}
-                      />
-                      <Text
-                        style={[
-                          styles.actionButtonText,
-                          { color: theme.buttonText },
-                        ]}
-                      >
-                        {t('rescheduleWorkout') || 'Reschedule Workout'}
-                      </Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[styles.deleteWorkoutButton, { marginTop: 12 }]}
-                      onPress={handleDeleteWorkoutPress}
-                    >
-                      <Ionicons
-                        name='trash-outline'
-                        size={scale(20)}
-                        color="#C0392B"
-                        style={styles.icon}
-                      />
-                      <Text style={[styles.deleteWorkoutButtonText, { color: '#C0392B' }]}>
-                        {t('deleteWorkout') || 'Delete Workout'}
-                      </Text>
-                    </TouchableOpacity>
-                  </>
-                ) : (
+                {selectedDateWorkouts.length === 0 ? (
                   <TouchableOpacity
                     style={[
                       styles.actionButton,
                       {
                         backgroundColor: theme.buttonBackground,
-                        marginTop: 10,
+                        marginTop: 4,
                         width: '100%',
                       },
                     ]}
-                    onPress={() => {
-                      if (!selectedDate) return;
-                      navigation.navigate('LogWorkout', {
-                        selectedDate: selectedDate.toISOString(),
-                      });
-                      setModalVisible(false);
-                    }}
+                    onPress={() => void openScheduleWorkoutPicker()}
                   >
                     <Ionicons
-                      name='add'
+                      name="add"
                       size={scale(22)}
                       color={theme.buttonText}
                       style={styles.icon}
@@ -1405,14 +1733,158 @@ export default function MyCalendar() {
                         { color: theme.buttonText },
                       ]}
                     >
-                      {t('scheduleWorkout')}
+                      {t('scheduleWorkoutLog')}
                     </Text>
                   </TouchableOpacity>
-                )}
+                ) : null}
               </>
             )}
           </View>
           </GestureDetector>
+
+          {scheduleWorkoutPickerVisible ? (
+            <View
+              style={styles.schedulePickerOverlay}
+              pointerEvents="box-none"
+            >
+              <TouchableOpacity
+                style={[StyleSheet.absoluteFillObject, styles.schedulePickerBackdrop]}
+                activeOpacity={1}
+                onPress={closeScheduleWorkoutPicker}
+                accessibilityRole="button"
+                accessibilityLabel={t('Cancel')}
+              />
+              <View
+                style={[
+                  styles.modalContent,
+                  styles.schedulePickerModalContent,
+                  styles.schedulePickerSheet,
+                  { backgroundColor: theme.card },
+                ]}
+                pointerEvents="auto"
+              >
+                <View
+                  style={[
+                    styles.modalListHeaderRow,
+                    schedulePickerStep === 'day'
+                      ? { justifyContent: 'space-between' }
+                      : { justifyContent: 'flex-end' },
+                  ]}
+                >
+                  {schedulePickerStep === 'day' ? (
+                    <TouchableOpacity
+                      style={styles.modalBarIconHit}
+                      onPress={resetSchedulePickerUi}
+                      accessibilityRole="button"
+                      accessibilityLabel={t('Back')}
+                    >
+                      <Ionicons
+                        name="chevron-back"
+                        size={scale(24)}
+                        color={theme.text}
+                      />
+                    </TouchableOpacity>
+                  ) : null}
+                  <TouchableOpacity
+                    style={styles.modalBarIconHit}
+                    onPress={closeScheduleWorkoutPicker}
+                    accessibilityRole="button"
+                    accessibilityLabel={t('Cancel')}
+                  >
+                    <Ionicons name="close" size={scale(24)} color={theme.text} />
+                  </TouchableOpacity>
+                </View>
+                <Text
+                  style={[
+                    styles.modalTitle,
+                    styles.modalTitleDayList,
+                    { color: theme.text },
+                  ]}
+                >
+                  {schedulePickerStep === 'day'
+                    ? t('selectDay')
+                    : t('chooseWorkoutToSchedule')}
+                </Text>
+                {schedulePickerStep === 'workout' ? (
+                  savedWorkoutsForSchedule.length === 0 ? (
+                    <Text
+                      style={[
+                        styles.emptyText,
+                        { color: theme.text, paddingVertical: 16 },
+                      ]}
+                    >
+                      {t('noWorkoutsInLibrary')}
+                    </Text>
+                  ) : (
+                    <ScrollView
+                      style={styles.schedulePickerScroll}
+                      keyboardShouldPersistTaps="handled"
+                      showsVerticalScrollIndicator={false}
+                    >
+                      {savedWorkoutsForSchedule.map((w) => (
+                        <TouchableOpacity
+                          key={w.workout_id}
+                          style={[
+                            styles.modalWorkoutItem,
+                            {
+                              backgroundColor: theme.background,
+                              borderColor: theme.border,
+                            },
+                          ]}
+                          onPress={() =>
+                            void handleScheduleWorkoutChosenInPicker(w.workout_id)
+                          }
+                        >
+                          <Text
+                            style={[
+                              styles.modalWorkoutName,
+                              { color: theme.text },
+                            ]}
+                          >
+                            {w.workout_name}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                  )
+                ) : schedulePickerPendingWorkoutId != null ? (
+                  <ScrollView
+                    style={styles.schedulePickerScroll}
+                    keyboardShouldPersistTaps="handled"
+                    showsVerticalScrollIndicator={false}
+                  >
+                    {schedulePickerDays.map((d) => (
+                      <TouchableOpacity
+                        key={d.day_id}
+                        style={[
+                          styles.modalWorkoutItem,
+                          {
+                            backgroundColor: theme.background,
+                            borderColor: theme.border,
+                          },
+                        ]}
+                        onPress={() =>
+                          void scheduleSavedWorkoutForSelectedDay(
+                            schedulePickerPendingWorkoutId,
+                            d,
+                          )
+                        }
+                      >
+                        <Text
+                          style={[
+                            styles.modalWorkoutName,
+                            { color: theme.text },
+                          ]}
+                        >
+                          {d.day_name}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                ) : null}
+              </View>
+            </View>
+          ) : null}
         </View>
       </Modal>
       )}
@@ -1585,30 +2057,54 @@ export default function MyCalendar() {
           ]}
         >
           <View style={[styles.modalContent, { backgroundColor: theme.card }]}>
-            <TouchableOpacity
-              style={[styles.modalCloseButton, { right: 10 }]}
-              onPress={closeUntrackedModal}
-            >
-              <Ionicons name='close' size={scale(24)} color={theme.text} />
-            </TouchableOpacity>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>
-              {selectedUntrackedWorkout &&
-              selectedUntrackedWorkout.workout.workout_name.trim() ===
-                selectedUntrackedWorkout.workout.day_name.trim()
-                ? formatWorkoutHeaderTitle(
-                    selectedUntrackedWorkout.workout.workout_name,
-                    selectedUntrackedWorkout.workout.day_name
-                  )
-                : selectedUntrackedWorkout?.workout.workout_name}
-            </Text>
-            {selectedUntrackedWorkout && (
-              <Text style={[styles.modalSubtitle, { color: theme.text }]}>
-                {selectedUntrackedWorkout.workout.workout_name.trim() ===
-                selectedUntrackedWorkout.workout.day_name.trim()
-                  ? formatDate(selectedUntrackedWorkout.workout.workout_date)
-                  : `${selectedUntrackedWorkout.workout.day_name} | ${formatDate(selectedUntrackedWorkout.workout.workout_date)}`}
-              </Text>
-            )}
+            <View style={styles.modalDetailHeaderRow}>
+              <View
+                style={[
+                  styles.modalWorkoutTitleCard,
+                  {
+                    borderColor: theme.border,
+                    backgroundColor: theme.background,
+                  },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.modalTitle,
+                    styles.modalTitleInWorkoutCard,
+                    { color: theme.text },
+                  ]}
+                >
+                  {selectedUntrackedWorkout &&
+                  selectedUntrackedWorkout.workout.workout_name.trim() ===
+                    selectedUntrackedWorkout.workout.day_name.trim()
+                    ? formatWorkoutHeaderTitle(
+                        selectedUntrackedWorkout.workout.workout_name,
+                        selectedUntrackedWorkout.workout.day_name
+                      )
+                    : selectedUntrackedWorkout?.workout.workout_name}
+                </Text>
+                {selectedUntrackedWorkout && (
+                  <Text
+                    style={[
+                      styles.modalSubtitle,
+                      styles.modalSubtitleInWorkoutCard,
+                      { color: theme.text },
+                    ]}
+                  >
+                    {selectedUntrackedWorkout.workout.workout_name.trim() ===
+                    selectedUntrackedWorkout.workout.day_name.trim()
+                      ? formatDate(selectedUntrackedWorkout.workout.workout_date)
+                      : `${selectedUntrackedWorkout.workout.day_name} | ${formatDate(selectedUntrackedWorkout.workout.workout_date)}`}
+                  </Text>
+                )}
+              </View>
+              <TouchableOpacity
+                style={styles.modalBarIconHit}
+                onPress={closeUntrackedModal}
+              >
+                <Ionicons name='close' size={scale(24)} color={theme.text} />
+              </TouchableOpacity>
+            </View>
             <ScrollView
               style={{
                 width: '100%',
@@ -1740,13 +2236,6 @@ const styles = StyleSheet.create({
   icon: {
     marginRight: scale(8),
   },
-  tipText: {
-    marginTop: verticalScale(10),
-    textAlign: 'center',
-    fontSize: moderateScale(14),
-    fontStyle: 'italic',
-    opacity: 0.8,
-  },
 
   modalTipText: {
     marginTop: verticalScale(10),
@@ -1761,6 +2250,30 @@ const styles = StyleSheet.create({
     minWidth: 280,
     elevation: 5,
     zIndex: 1,
+  },
+  schedulePickerModalContent: {
+    maxHeight: '75%',
+    alignSelf: 'center',
+  },
+  schedulePickerOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1000,
+    elevation: 20,
+  },
+  schedulePickerBackdrop: {
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  schedulePickerSheet: {
+    width: '90%',
+    maxWidth: 400,
+    zIndex: 1001,
+    elevation: 21,
+  },
+  schedulePickerScroll: {
+    width: '100%',
+    maxHeight: 340,
   },
   rescheduleLabel: {
     fontSize: moderateScale(14),
@@ -1858,108 +2371,91 @@ const styles = StyleSheet.create({
     width: '100%',
     maxWidth: 400,
     borderRadius: 20,
-    padding: moderateScale(15),
-    marginTop: verticalScale(5),
+    paddingVertical: moderateScale(12),
+    paddingHorizontal: moderateScale(12),
+    marginTop: verticalScale(4),
     borderWidth: 1,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    elevation: 4,
   },
   calendarHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: verticalScale(10),
+    marginBottom: verticalScale(8),
+    paddingHorizontal: scale(2),
+  },
+  calendarTitleBlock: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: scale(4),
   },
   calendarMonthText: {
-    fontSize: moderateScale(20),
-    fontWeight: 'bold',
+    fontSize: moderateScale(24),
+    fontWeight: '900',
+    letterSpacing: -0.3,
+  },
+  calendarYearSub: {
+    fontSize: moderateScale(14),
+    fontWeight: '600',
+    marginTop: verticalScale(2),
+    opacity: 0.85,
   },
   daysGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
   },
-  gridCell: {
+  weekdayHeaderCell: {
     width: `${100 / 7}%`,
     justifyContent: 'center',
     alignItems: 'center',
-    paddingVertical: verticalScale(2),
+    paddingBottom: verticalScale(6),
+    marginBottom: verticalScale(2),
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
   weekDayText: {
-    fontSize: moderateScale(14),
-    fontWeight: '600',
-    opacity: 0.6,
-    paddingVertical: verticalScale(1),
+    fontSize: moderateScale(11),
+    fontWeight: '700',
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
   },
-  dayCellContainer: {
-    width: '90%',
-    aspectRatio: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderRadius: 100,
+  calendarMicroLegend: {
+    fontSize: moderateScale(11),
+    textAlign: 'center',
+    marginTop: verticalScale(8),
+    marginBottom: verticalScale(6),
+    paddingHorizontal: scale(16),
+    lineHeight: moderateScale(15),
+    opacity: 0.75,
   },
-  dayText: {
-    fontSize: moderateScale(16),
-    fontWeight: '500',
-  },
-  todayIndicator: {
-    width: scale(16),
-    height: verticalScale(2),
-    borderRadius: 2,
-    position: 'absolute',
-    bottom: verticalScale(3),
-  },
-  untrackedDay: {
-    borderWidth: 2,
-  },
-  upcomingDay: {
-    backgroundColor: 'rgba(128, 128, 128, 0.2)',
-  },
-  // Legend Styles
-  legendContainer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
+  dayModalQuickActionsScroll: {
     width: '100%',
-    maxWidth: 400,
-    marginTop: verticalScale(20),
+    maxHeight: verticalScale(44),
+    marginBottom: verticalScale(10),
+    flexGrow: 0,
   },
-  legendColumn: {
-    marginHorizontal: scale(25),
-  },
-  legendItem: {
+  dayModalQuickActionsContent: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: verticalScale(20),
+    paddingRight: scale(8),
   },
-  legendIcon: {
-    width: scale(24),
-    height: scale(24),
-    borderRadius: scale(12),
-    marginRight: scale(8),
-    justifyContent: 'center',
+  quickChip: {
+    flexDirection: 'row',
     alignItems: 'center',
-  },
-  todayLegendIcon: {
-    width: scale(24),
-    height: scale(24),
+    paddingVertical: verticalScale(8),
+    paddingHorizontal: scale(12),
+    borderRadius: 20,
+    borderWidth: 1,
     marginRight: scale(8),
-    justifyContent: 'center',
-    alignItems: 'center',
-    position: 'relative',
   },
-  untrackedLegendIcon: {
-    borderWidth: 2,
-    backgroundColor: 'transparent',
-  },
-  legendIconText: {
-    fontSize: moderateScale(12),
-    fontWeight: 'bold',
-    lineHeight: Platform.OS === 'ios' ? moderateScale(24) : moderateScale(22),
-  },
-  legendText: {
-    fontSize: moderateScale(14),
+  quickChipLabel: {
+    marginLeft: scale(6),
+    fontSize: moderateScale(13),
+    fontWeight: '700',
   },
   // Modal Styles
   modalContainer: {
@@ -1967,29 +2463,42 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+  modalContainerRelative: {
+    position: 'relative',
+  },
   modalContent: {
     borderRadius: 20,
     padding: moderateScale(20),
     width: '90%',
     maxWidth: 400,
     alignItems: 'center',
+    position: 'relative',
   },
-  modalHeader: {
+  modalDetailHeaderRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    width: '100%',
+    marginBottom: moderateScale(12),
+  },
+  modalListHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
     alignItems: 'center',
     width: '100%',
-    position: 'absolute',
-    top: verticalScale(15),
-    paddingLeft: 0,
-    paddingRight: 0,
-    zIndex: 1,
+    marginBottom: moderateScale(8),
   },
-  modalLeftButton: {
-    padding: moderateScale(5),
+  modalWorkoutTitleCard: {
+    flex: 1,
+    minWidth: 0,
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: moderateScale(12),
+    marginHorizontal: moderateScale(4),
   },
-  modalRightButton: {
+  modalBarIconHit: {
     padding: moderateScale(5),
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   modalTitle: {
     fontSize: moderateScale(24),
@@ -1997,6 +2506,19 @@ const styles = StyleSheet.create({
     marginBottom: verticalScale(10),
     textAlign: 'center',
     marginTop: verticalScale(20),
+  },
+  modalTitleInWorkoutCard: {
+    marginTop: 0,
+    marginBottom: verticalScale(6),
+    textAlign: 'left',
+  },
+  modalTitleDayList: {
+    marginTop: 0,
+    width: '100%',
+  },
+  modalSubtitleInWorkoutCard: {
+    textAlign: 'left',
+    marginBottom: verticalScale(8),
   },
   modalSubtitle: {
     fontSize: moderateScale(18),
@@ -2015,14 +2537,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     opacity: 0.8,
   },
-  multipleWorkoutIndicator: {
-    width: scale(6),
-    height: scale(6),
-    borderRadius: scale(3),
-    position: 'absolute',
-    top: verticalScale(5),
-    right: scale(5),
-  },
   modalWorkoutItem: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2035,9 +2549,16 @@ const styles = StyleSheet.create({
     fontSize: moderateScale(18),
     fontWeight: 'bold',
   },
-  modalWorkoutDay: {
+  /** Calendar day modal: workout day (e.g. Push) — primary line */
+  modalDayListDayTitle: {
+    fontSize: moderateScale(20),
+    fontWeight: '700',
+  },
+  /** Calendar day modal: plan/workout name — secondary line */
+  modalDayListWorkoutSubtitle: {
     fontSize: moderateScale(14),
-    opacity: 0.8,
+    fontWeight: '400',
+    opacity: 0.9,
   },
   modalLegendContainer: {
     flexDirection: 'row',
@@ -2072,11 +2593,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     width: '80%',
-  },
-  modalCloseButton: {
-    position: 'absolute',
-    top: verticalScale(10),
-    marginRight: scale(10),
   },
   activeWorkoutBanner: {
     flexDirection: 'row',

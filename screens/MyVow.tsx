@@ -6,31 +6,31 @@
  * - Progress: circular rings (Workout, Nutrition, Activity, Hydration) always visible
  * - History: past vows and streaks
  */
-import React, { useState, useCallback, useEffect } from 'react';
+import { useHeaderHeight } from '@react-navigation/elements';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { useSQLiteContext } from 'expo-sqlite';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  ScrollView,
-  Modal,
-  TextInput,
+  ActivityIndicator,
   Alert,
-  Share,
-  ActivityIndicator,``
   Dimensions,
   Keyboard,
   KeyboardAvoidingView,
+  Modal,
   Platform,
+  ScrollView,
+  Share,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
-import Svg, { Circle } from 'react-native-svg';
-import { useTheme } from '../context/ThemeContext';
-import { useSQLiteContext } from 'expo-sqlite';
-import { useNavigation, useFocusEffect } from '@react-navigation/native';
-import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import Svg, { Circle } from 'react-native-svg';
 import Ionicons from 'react-native-vector-icons/Ionicons';
-import { initVowsDb, type VowRow, type VowCheckInRow } from '../utils/initVowsDb';
+import { useTheme } from '../context/ThemeContext';
+import { initVowsDb, type VowCheckInRow, type VowRow } from '../utils/initVowsDb';
 import { getLocalWeekMondaySundayYmd, localTodayYmd } from '../utils/localDateYmd';
 
 const SAGE = '#7C9A7E';

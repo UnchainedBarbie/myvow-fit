@@ -1,4 +1,9 @@
-import { RouteProp, useNavigation, useRoute } from '@react-navigation/native';
+import {
+  RouteProp,
+  useNavigation,
+  useRoute,
+} from '@react-navigation/native';
+import { StackNavigationProp } from '@react-navigation/stack';
 import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Notifications from 'expo-notifications';
@@ -20,13 +25,27 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  TouchableWithoutFeedback,
   Vibration,
   View
 } from 'react-native';
 import { AutoSizeText, ResizeTextMode } from 'react-native-auto-size-text';
+import DraggableFlatList, {
+  DragEndParams,
+  ScaleDecorator,
+} from 'react-native-draggable-flatlist';
+import {
+  GestureHandlerRootView,
+  RectButton,
+  Swipeable,
+} from 'react-native-gesture-handler';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { WorkoutLogStackParamList } from '../App';
+
+type StartedWorkoutNavigationProp = StackNavigationProp<
+  WorkoutLogStackParamList,
+  'StartedWorkoutInterface'
+>;
 import { useSettings } from '../context/SettingsContext';
 import { useTheme } from '../context/ThemeContext';
 import {
@@ -38,6 +57,7 @@ import { loadRestTimerPreferences, saveRestTimerPreferences } from '../utils/sta
 import {
   createTimerState,
   mergeExerciseSetsWithSnapshot,
+  orderMergedSetsLikeSnapshot,
   PersistedTimerPayload,
   timerCalculations,
   TimerState,
@@ -87,6 +107,72 @@ function sortLoggedExercisesForWorkout<
   return sortWorkoutPlanExercisesForDisplay(list);
 }
 
+/** Rebuild flat set list to match a new exercise order (set order within each exercise unchanged). */
+function reorderAllSetsByExerciseOrder(
+  sets: ExerciseSet[],
+  orderedExercises: Exercise[],
+): ExerciseSet[] {
+  const byExId = new Map<number, ExerciseSet[]>();
+  for (const s of sets) {
+    const list = byExId.get(s.exercise_id);
+    if (list) list.push(s);
+    else byExId.set(s.exercise_id, [s]);
+  }
+  for (const list of byExId.values()) {
+    list.sort((a, b) => a.set_number - b.set_number);
+  }
+  const out: ExerciseSet[] = [];
+  for (const ex of orderedExercises) {
+    const chunk = byExId.get(ex.logged_exercise_id);
+    if (chunk?.length) out.push(...chunk);
+  }
+  return out;
+}
+
+function mapExercisesWithLoggedFlag(
+  ordered: Omit<Exercise, 'exercise_fully_logged'>[],
+  sets: ExerciseSet[],
+): Exercise[] {
+  const byId = new Map<number, ExerciseSet[]>();
+  for (const s of sets) {
+    const L = byId.get(s.exercise_id);
+    if (L) L.push(s);
+    else byId.set(s.exercise_id, [s]);
+  }
+  return ordered.map((e) => {
+    const chunk = byId.get(e.logged_exercise_id) ?? [];
+    return {
+      ...e,
+      exercise_fully_logged: chunk.length > 0 && chunk.every((s) => s.set_logged),
+    };
+  });
+}
+
+/** Order exercise rows to match first-seen exercise_id sequence in `sets` (keeps list modal / flow aligned). */
+function orderLoggedExercisesLikeSets(
+  sets: ExerciseSet[],
+  exercisesSource: Omit<Exercise, 'exercise_fully_logged'>[],
+): Exercise[] {
+  const seen = new Set<number>();
+  const ids: number[] = [];
+  for (const s of sets) {
+    if (!seen.has(s.exercise_id)) {
+      seen.add(s.exercise_id);
+      ids.push(s.exercise_id);
+    }
+  }
+  const byId = new Map(exercisesSource.map((e) => [e.logged_exercise_id, e] as const));
+  const ordered: Omit<Exercise, 'exercise_fully_logged'>[] = [];
+  for (const id of ids) {
+    const e = byId.get(id);
+    if (e) ordered.push(e);
+  }
+  for (const e of exercisesSource) {
+    if (!seen.has(e.logged_exercise_id)) ordered.push(e);
+  }
+  return mapExercisesWithLoggedFlag(ordered, sets);
+}
+
 /** Empty weight → 0 (bodyweight). Returns null if invalid. */
 function parseWeightForLog(raw: string): number | null {
   const t = raw.trim().replace(',', '.');
@@ -98,7 +184,7 @@ function parseWeightForLog(raw: string): number | null {
 
 function isValidRepsAndWeight(repsDone: string, weight: string): boolean {
   const reps = parseInt(repsDone.trim(), 10);
-  if (repsDone.trim() === '' || Number.isNaN(reps) || reps <= 0) return false;
+  if (repsDone.trim() === '' || Number.isNaN(reps) || reps < 0) return false;
   return parseWeightForLog(weight) !== null;
 }
 
@@ -162,7 +248,7 @@ function formatCardioMinutesLine(raw: string): string {
 }
 
 export default function StartedWorkoutInterface() {
-  const navigation = useNavigation();
+  const navigation = useNavigation<StartedWorkoutNavigationProp>();
   const route = useRoute<StartedWorkoutRouteProps>();
   const { theme } = useTheme();
   const { t } = useTranslation();
@@ -787,20 +873,15 @@ export default function StartedWorkoutInterface() {
             persistedPayload.setsSnapshot &&
             persistedPayload.setsSnapshot.length > 0
           ) {
-            finalSets = mergeExerciseSetsWithSnapshot(setsData, persistedPayload.setsSnapshot);
+            const merged = mergeExerciseSetsWithSnapshot(
+              setsData,
+              persistedPayload.setsSnapshot,
+            );
+            finalSets = orderMergedSetsLikeSnapshot(merged, persistedPayload.setsSnapshot);
           }
         }
 
-        setExercises(
-          exercisesResult.map((e) => {
-            const exSets = finalSets.filter((s) => s.exercise_id === e.logged_exercise_id);
-            return {
-              ...e,
-              exercise_fully_logged:
-                exSets.length > 0 && exSets.every((s) => s.set_logged),
-            };
-          }),
-        );
+        setExercises(orderLoggedExercisesLikeSets(finalSets, exercisesResult));
         setAllSets(finalSets);
         allSetsRef.current = finalSets;
 
@@ -953,15 +1034,15 @@ export default function StartedWorkoutInterface() {
 
     stopRestTimer();
     restTimerRef.current = setInterval(() => {
-      const end = restTimerEndAtRef.current;
-      if (end == null) {
-        stopRestTimer();
-        return;
-      }
-      const remaining = Math.max(0, Math.ceil((end - Date.now()) / 1000));
-      setTimerState(prev => {
+      setTimerState((prev) => {
         if (!prev.isResting) return prev;
-        if (remaining <= 0) {
+        const end = restTimerEndAtRef.current;
+        if (end == null) {
+          stopRestTimer();
+          return prev;
+        }
+        const wallRemaining = Math.max(0, Math.ceil((end - Date.now()) / 1000));
+        if (wallRemaining <= 0) {
           stopRestTimer();
           restTimerEndAtRef.current = null;
           const wasExerciseRest = prev.isExerciseRest;
@@ -969,10 +1050,14 @@ export default function StartedWorkoutInterface() {
           return updateTimerState(prev, {
             restRemaining: null,
             isResting: false,
-            isExerciseRest: false
+            isExerciseRest: false,
           });
         }
-        return updateTimerState(prev, { restRemaining: remaining });
+        const prevRem = prev.restRemaining ?? 0;
+        const stepped = Math.max(0, prevRem - 1);
+        let nextRem = Math.min(stepped, wallRemaining);
+        if (nextRem === 0 && wallRemaining > 0) nextRem = wallRemaining;
+        return updateTimerState(prev, { restRemaining: nextRem });
       });
     }, 1000);
   };
@@ -1259,7 +1344,10 @@ export default function StartedWorkoutInterface() {
       } else {
         const anyUnlogged = updatedSets.some((s) => !s.set_logged);
         if (anyUnlogged) {
-          Alert.alert(t('unsavedSetsTitle'), t('unsavedSetsMessage'), [
+          Alert.alert(
+            'Unsaved Sets',
+            "You have sets that haven't been logged. Are you sure you want to skip this exercise?",
+            [
             {
               text: t('Yes'),
               style: 'destructive',
@@ -1458,39 +1546,64 @@ export default function StartedWorkoutInterface() {
               keyExtractor={(item) => item.logged_exercise_id.toString()}
               renderItem={({ item }) => {
                 const muscleGroupInfo = muscleGroupData.find(mg => mg.value === item.muscle_group);
+                let overviewSwipeRef: Swipeable | null = null;
                 return (
-                  <View style={[styles.exerciseItem, { backgroundColor: theme.card, borderColor: theme.border }]}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1,}}>
-                        <Text style={[styles.exerciseName, { color: theme.text, marginRight: 8 }]}>{item.exercise_name}</Text>
-                        {muscleGroupInfo && muscleGroupInfo.value && (
-                          <View style={[styles.muscleGroupBadgeOverview, { backgroundColor: theme.card, borderColor: theme.border }]}>
-                            <Text style={[styles.muscleGroupBadgeText, { color: theme.text }]}>
-                              {t(muscleGroupInfo.label)}
-                            </Text>
-                          </View>
-                        )}
+                  <Swipeable
+                    ref={(r) => {
+                      overviewSwipeRef = r;
+                    }}
+                    friction={1}
+                    overshootLeft={false}
+                    overshootRight={false}
+                    containerStyle={styles.swipeableContainer}
+                    renderRightActions={() => (
+                      <View style={styles.swipeDeleteActionHost}>
+                        <RectButton
+                          style={styles.swipeDeleteAction}
+                          onPress={() => {
+                            overviewSwipeRef?.close();
+                            void removeLoggedExerciseFromSession(item.logged_exercise_id);
+                          }}
+                        >
+                          <Ionicons name="trash-outline" size={20} color="#fff" />
+                          <Text style={styles.swipeDeleteActionText}>{t('Delete')}</Text>
+                        </RectButton>
                       </View>
-                      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                        {item.exercise_notes && (
-                          <TouchableOpacity onPress={() => showNotes(item.exercise_notes!, item.exercise_name)} style={{ marginLeft: 10 }}>
-                            <Ionicons name="bookmark-outline" size={22} color={theme.text} />
-                          </TouchableOpacity>
-                        )}
-                        {item.web_link && (
-                          <TouchableOpacity onPress={() => handleLinkPress(item.web_link)} style={{ marginLeft: 10 }}>
-                            <Ionicons name="link-outline" size={22} color={theme.text} />
-                          </TouchableOpacity>
-                        )}
+                    )}
+                  >
+                    <View style={[styles.exerciseItem, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1,}}>
+                          <Text style={[styles.exerciseName, { color: theme.text, marginRight: 8 }]}>{item.exercise_name}</Text>
+                          {muscleGroupInfo && muscleGroupInfo.value && (
+                            <View style={[styles.muscleGroupBadgeOverview, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                              <Text style={[styles.muscleGroupBadgeText, { color: theme.text }]}>
+                                {t(muscleGroupInfo.label)}
+                              </Text>
+                            </View>
+                          )}
+                        </View>
+                        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                          {item.exercise_notes && (
+                            <TouchableOpacity onPress={() => showNotes(item.exercise_notes!, item.exercise_name)} style={{ marginLeft: 10 }}>
+                              <Ionicons name="bookmark-outline" size={22} color={theme.text} />
+                            </TouchableOpacity>
+                          )}
+                          {item.web_link && (
+                            <TouchableOpacity onPress={() => handleLinkPress(item.web_link)} style={{ marginLeft: 10 }}>
+                              <Ionicons name="link-outline" size={22} color={theme.text} />
+                            </TouchableOpacity>
+                          )}
+                        </View>
                       </View>
+                      <Text style={[styles.exerciseDetails, { color: theme.text, marginTop: 4 }]}>
+                        {isCardioSetUI(item.exercise_name, workoutLogType)
+                          ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
+                          : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
+                      </Text>
                     </View>
-                    <Text style={[styles.exerciseDetails, { color: theme.text, marginTop: 4 }]}>
-                      {isCardioSetUI(item.exercise_name, workoutLogType)
-                        ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
-                        : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
-                    </Text>
-                  </View>
-                )
+                  </Swipeable>
+                );
               }}
               scrollEnabled={false}
               style={styles.exercisesList}
@@ -1681,6 +1794,23 @@ export default function StartedWorkoutInterface() {
     const isLastSetOfExercise = currentSet.set_number === currentSet.total_sets;
     const isLastStructuralSet = isLastExercise && isLastSetOfExercise;
     const isCardio = isCardioSetUI(currentSet.exercise_name, workoutLogType);
+    const currentIdx = timerState.currentSetIndex;
+    let prevSameExerciseSetIndex = -1;
+    let nextSameExerciseSetIndex = -1;
+    if (currentSet.total_sets > 1) {
+      for (let i = currentIdx - 1; i >= 0; i--) {
+        if (allSets[i].exercise_id === currentSet.exercise_id) {
+          prevSameExerciseSetIndex = i;
+          break;
+        }
+      }
+      for (let i = currentIdx + 1; i < allSets.length; i++) {
+        if (allSets[i].exercise_id === currentSet.exercise_id) {
+          nextSameExerciseSetIndex = i;
+          break;
+        }
+      }
+    }
     const canCompleteStrength =
       !!allSets[timerState.currentSetIndex] &&
       isValidRepsAndWeight(
@@ -1838,7 +1968,7 @@ export default function StartedWorkoutInterface() {
             }}
             keyboardType="number-pad"
             maxLength={4}
-            placeholder={"> 0"}
+            placeholder="0+"
             placeholderTextColor={theme.type === 'dark' ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)'}
           />
             </View>
@@ -1866,6 +1996,73 @@ export default function StartedWorkoutInterface() {
               />
             </View>
           </View>
+          ) : null}
+
+          {currentSet.total_sets > 1 ? (
+            <View
+              style={{
+                flexDirection: 'row',
+                justifyContent: 'center',
+                alignItems: 'center',
+                gap: 28,
+                marginTop: 12,
+              }}
+            >
+              <TouchableOpacity
+                disabled={prevSameExerciseSetIndex < 0}
+                onPress={() => {
+                  if (prevSameExerciseSetIndex < 0) return;
+                  clearRestTimerState();
+                  setTimerState((prev) =>
+                    updateTimerState(prev, {
+                      currentSetIndex: prevSameExerciseSetIndex,
+                      workoutStage: 'exercise',
+                    }),
+                  );
+                }}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Text
+                  style={{
+                    fontWeight: '600',
+                    fontSize: 15,
+                    color:
+                      prevSameExerciseSetIndex < 0
+                        ? theme.inactivetint
+                        : theme.buttonBackground,
+                  }}
+                >
+                  {t('previousSet')}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                disabled={nextSameExerciseSetIndex < 0}
+                onPress={() => {
+                  if (nextSameExerciseSetIndex < 0) return;
+                  clearRestTimerState();
+                  setTimerState((prev) =>
+                    updateTimerState(prev, {
+                      currentSetIndex: nextSameExerciseSetIndex,
+                      workoutStage: 'exercise',
+                    }),
+                  );
+                }}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Text
+                  style={{
+                    fontWeight: '600',
+                    fontSize: 15,
+                    color:
+                      nextSameExerciseSetIndex < 0
+                        ? theme.inactivetint
+                        : theme.buttonBackground,
+                  }}
+                >
+                  {t('nextSet')}
+                </Text>
+              </TouchableOpacity>
+            </View>
           ) : null}
         </View>
         
@@ -2032,10 +2229,6 @@ export default function StartedWorkoutInterface() {
           >
             <Text style={[styles.addTimeButtonText, { color: theme.type === 'dark' ? 'white' : 'rgba(255, 255, 255, 0.8)' }]}>{t('addTime')}</Text>
           </TouchableOpacity>
-          
-          <Text style={[styles.restMessage, { color: theme.text }]}>
-            {t('takeBreath')}
-          </Text>
         </View>
         
         {nextSet && (
@@ -2177,7 +2370,13 @@ export default function StartedWorkoutInterface() {
         Alert.alert(
           t('workoutSaved'),
           t('workoutSavedMessage'),
-          [{ text: t('OK'), onPress: () => navigation.goBack() }]
+          [
+            {
+              text: t('OK'),
+              onPress: () =>
+                navigation.navigate('MyCalendar', { refresh: true }),
+            },
+          ],
         );
       } catch (error) {
         await db.runAsync('ROLLBACK;');
@@ -2228,6 +2427,138 @@ export default function StartedWorkoutInterface() {
       </View>
     );
   };
+
+  const applyExerciseOrder = useCallback(
+    (data: Exercise[]) => {
+      const prevSets = allSetsRef.current;
+      const prevTs = timerStateRef.current;
+      const rebuilt = reorderAllSetsByExerciseOrder(prevSets, data);
+      if (rebuilt.length === 0) return;
+
+      const cur = prevSets[prevTs.currentSetIndex];
+      let newIdx = prevTs.currentSetIndex;
+      if (cur) {
+        const found = rebuilt.findIndex(
+          (s) => s.exercise_id === cur.exercise_id && s.set_number === cur.set_number,
+        );
+        if (found >= 0) newIdx = found;
+      } else {
+        newIdx = Math.min(prevTs.currentSetIndex, Math.max(0, rebuilt.length - 1));
+      }
+
+      allSetsRef.current = rebuilt;
+      const nextTs = updateTimerState(prevTs, { currentSetIndex: newIdx });
+      timerStateRef.current = nextTs;
+
+      setAllSets(rebuilt);
+      setExercises(mapExercisesWithLoggedFlag(data, rebuilt));
+      setTimerState(nextTs);
+
+      if (!nextTs.workoutStarted || nextTs.workoutStage === 'completed') return;
+      const setsSnapshot = rebuilt.map((s) => ({
+        exercise_name: s.exercise_name,
+        set_number: s.set_number,
+        weight: s.weight,
+        reps_done: s.reps_done,
+        set_logged: s.set_logged,
+        ...(s.cardio_duration_saved_from_timer != null
+          ? { cardio_duration_saved_from_timer: s.cardio_duration_saved_from_timer }
+          : {}),
+      }));
+      const cardioPaused =
+        workoutLogTypeRef.current === 'cardio' && isCardioTimerPausedRef.current;
+      void timerStateUtils.saveTimerState(nextTs, {
+        workoutLogId: workout_log_id,
+        setsSnapshot: setsSnapshot.length > 0 ? setsSnapshot : undefined,
+        ...(cardioPaused ? { cardioTimerPaused: true } : {}),
+      });
+    },
+    [workout_log_id],
+  );
+
+  const handleExerciseListDragEnd = useCallback(
+    ({ data }: DragEndParams<Exercise>) => {
+      applyExerciseOrder(data);
+    },
+    [applyExerciseOrder],
+  );
+
+  const removeLoggedExerciseFromSession = useCallback(
+    async (loggedExerciseId: number) => {
+      const ids = new Set(allSetsRef.current.map((s) => s.exercise_id));
+      if (ids.size <= 1 && ids.has(loggedExerciseId)) {
+        Alert.alert(t('errorTitle'), t('cannotDeleteLastExercise'));
+        return;
+      }
+      try {
+        await db.runAsync(
+          'DELETE FROM Weight_Log WHERE workout_log_id = ? AND logged_exercise_id = ?;',
+          [workout_log_id, loggedExerciseId],
+        );
+        await db.runAsync(
+          'DELETE FROM Logged_Exercises WHERE logged_exercise_id = ? AND workout_log_id = ?;',
+          [loggedExerciseId, workout_log_id],
+        );
+
+        const prevSets = allSetsRef.current;
+        const prevTs = timerStateRef.current;
+        const rebuilt = prevSets.filter((s) => s.exercise_id !== loggedExerciseId);
+        if (rebuilt.length === 0) return;
+
+        const cur = prevSets[prevTs.currentSetIndex];
+        let newIdx = prevTs.currentSetIndex;
+        if (cur) {
+          const found = rebuilt.findIndex(
+            (s) => s.exercise_id === cur.exercise_id && s.set_number === cur.set_number,
+          );
+          if (found >= 0) newIdx = found;
+          else newIdx = Math.min(prevTs.currentSetIndex, Math.max(0, rebuilt.length - 1));
+        } else {
+          newIdx = Math.min(prevTs.currentSetIndex, Math.max(0, rebuilt.length - 1));
+        }
+
+        allSetsRef.current = rebuilt;
+        const nextTs = updateTimerState(prevTs, { currentSetIndex: newIdx });
+        timerStateRef.current = nextTs;
+
+        setAllSets(rebuilt);
+        setExercises((prevEx) =>
+          orderLoggedExercisesLikeSets(
+            rebuilt,
+            prevEx.filter((e) => e.logged_exercise_id !== loggedExerciseId),
+          ),
+        );
+        setTimerState(nextTs);
+
+        if (nextTs.workoutStarted && nextTs.workoutStage !== 'completed') {
+          const setsSnapshot = rebuilt.map((s) => ({
+            exercise_name: s.exercise_name,
+            set_number: s.set_number,
+            weight: s.weight,
+            reps_done: s.reps_done,
+            set_logged: s.set_logged,
+            ...(s.cardio_duration_saved_from_timer != null
+              ? { cardio_duration_saved_from_timer: s.cardio_duration_saved_from_timer }
+              : {}),
+          }));
+          const cardioPaused =
+            workoutLogTypeRef.current === 'cardio' && isCardioTimerPausedRef.current;
+          void timerStateUtils.saveTimerState(nextTs, {
+            workoutLogId: workout_log_id,
+            setsSnapshot: setsSnapshot.length > 0 ? setsSnapshot : undefined,
+            ...(cardioPaused ? { cardioTimerPaused: true } : {}),
+          });
+        }
+      } catch (e) {
+        console.error('Failed to remove exercise from active workout:', e);
+        Alert.alert(
+          t('errorTitle'),
+          e instanceof Error ? e.message : 'Could not remove exercise.',
+        );
+      }
+    },
+    [db, t, workout_log_id],
+  );
   
   const renderExerciseListModal = () => {
     const currentExerciseNameFromSet = allSets[timerState.currentSetIndex]?.exercise_name;
@@ -2235,44 +2566,59 @@ export default function StartedWorkoutInterface() {
     return (
       <Modal
         visible={isExerciseListModalVisible}
-        transparent={true}
-        animationType="fade"
+        transparent={false}
+        animationType="slide"
+        presentationStyle="fullScreen"
         onRequestClose={() => {
           setIsExerciseListModalVisible(false);
         }}
       >
-
-
-
-
-    {isExerciseListModalVisible && (
+        <>
+        {isExerciseListModalVisible ? (
           <StatusBar
-            backgroundColor={theme.type === 'light' ? "rgba(0, 0, 0, 0.5)" : "black"}
-            barStyle={'light-content'}          />
-        )}
+            backgroundColor={theme.background}
+            barStyle={theme.type === 'dark' ? 'light-content' : 'dark-content'}
+          />
+        ) : null}
 
-        <TouchableOpacity
-          style={styles.modalOverlay}
-          activeOpacity={1}
-          onPressOut={() => setIsExerciseListModalVisible(false)}
+        <SafeAreaView
+          style={[styles.exerciseListModalRoot, { backgroundColor: theme.background }]}
+          edges={['top', 'bottom']}
         >
-          <View 
-            style={[styles.modalContainer, { backgroundColor: theme.card, borderColor: theme.border }]}
-            onStartShouldSetResponder={() => true}
-          >
-            <View style={[styles.modalHeader, { borderBottomColor: theme.border }]}>
+          <View style={[styles.exerciseListModalHeader, { borderBottomColor: theme.border }]}>
+            <View
+              style={[
+                styles.modalWorkoutTitleCard,
+                {
+                  borderColor: theme.border,
+                  backgroundColor: theme.card,
+                },
+              ]}
+            >
               <Text style={[styles.modalTitle, { color: theme.text }]}>
                 {formatWorkoutHeaderTitle(workout?.workout_name, workout?.day_name)}
               </Text>
-              <TouchableOpacity onPress={() => setIsExerciseListModalVisible(false)} style={styles.modalCloseButton}>
-                <Ionicons name="close-outline" size={28} color={theme.text} />
-              </TouchableOpacity>
             </View>
-            <FlatList
+            <TouchableOpacity
+              onPress={() => setIsExerciseListModalVisible(false)}
+              style={styles.modalCloseButton}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityRole="button"
+              accessibilityLabel="Close"
+            >
+              <Ionicons name="close-outline" size={28} color={theme.text} />
+            </TouchableOpacity>
+          </View>
+          <GestureHandlerRootView style={styles.modalExerciseListGestureRoot}>
+            <DraggableFlatList
               showsVerticalScrollIndicator={false}
               data={exercises}
               keyExtractor={(item) => item.logged_exercise_id.toString()}
-              renderItem={({ item }) => {
+              onDragEnd={handleExerciseListDragEnd}
+              activationDistance={12}
+              containerStyle={styles.modalDraggableListContainer}
+              contentContainerStyle={styles.exerciseListModalListContent}
+              renderItem={({ item, drag, isActive }) => {
                 const isCurrent = item.exercise_name === currentExerciseNameFromSet;
                 const muscleGroupInfo = muscleGroupData.find(mg => mg.value === item.muscle_group);
                 const itemStyle = [
@@ -2298,83 +2644,112 @@ export default function StartedWorkoutInterface() {
                 ];
 
                 const handlePress = () => {
-                  if (item.exercise_fully_logged) {
-                    return; // Do nothing if exercise is fully logged
-                  }
-                  
-                  const firstUnloggedSetIndex = allSets.findIndex(
-                    s => s.exercise_id === item.logged_exercise_id && !s.set_logged
-                  );
+                  const targetIndex = item.exercise_fully_logged
+                    ? allSets.findIndex((s) => s.exercise_id === item.logged_exercise_id)
+                    : allSets.findIndex(
+                        (s) =>
+                          s.exercise_id === item.logged_exercise_id && !s.set_logged,
+                      );
 
-                  if (firstUnloggedSetIndex !== -1) {
+                  if (targetIndex !== -1) {
                     clearRestTimerState();
-                    setTimerState(prev =>
+                    setTimerState((prev) =>
                       updateTimerState(prev, {
-                        currentSetIndex: firstUnloggedSetIndex,
+                        currentSetIndex: targetIndex,
                         workoutStage: 'exercise',
-                      })
+                      }),
                     );
                     setIsExerciseListModalVisible(false);
                   }
                 };
 
-                // Use TouchableWithoutFeedback for completed exercises to maintain scrollability
-                const TouchableComponent = item.exercise_fully_logged ? TouchableWithoutFeedback : TouchableOpacity;
-                const touchableProps = item.exercise_fully_logged 
-                  ? {} 
-                  : { onPress: handlePress, disabled: item.exercise_fully_logged };
+                let modalExerciseSwipeRef: Swipeable | null = null;
 
                 return (
-                  <TouchableComponent {...touchableProps}>
-                    <View style={itemStyle}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                        <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
-                          {item.exercise_fully_logged && (
-                            <Ionicons name="checkmark-circle" size={20} color={isCurrent ? theme.buttonText : theme.buttonBackground} style={{ marginRight: 8 }} />
-                          )}
-                          <Text style={[nameStyle, { marginRight: 8 }]}>{item.exercise_name}</Text>
-                          {muscleGroupInfo && muscleGroupInfo.value && (
-                            <View style={[
-                              styles.muscleGroupBadgeModal,
-                              { 
-                                backgroundColor: isCurrent ? theme.text : theme.card,
-                                borderColor: isCurrent ? theme.buttonText : theme.border,
-                              }
-                            ]}>
-                              <Text style={[
-                                styles.muscleGroupBadgeText,
-                                { color: isCurrent ? (theme.type === 'dark' ? '#000' : '#fff') : theme.text }
-                              ]}>
-                                {t(muscleGroupInfo.label)}
-                              </Text>
+                  <ScaleDecorator>
+                    <Swipeable
+                      ref={(r) => {
+                        modalExerciseSwipeRef = r;
+                      }}
+                      enabled={!isActive}
+                      friction={1}
+                      overshootLeft={false}
+                      overshootRight={false}
+                      containerStyle={styles.swipeableContainer}
+                      renderRightActions={() => (
+                        <View style={styles.swipeDeleteActionHost}>
+                          <RectButton
+                            style={styles.swipeDeleteAction}
+                            onPress={() => {
+                              modalExerciseSwipeRef?.close();
+                              void removeLoggedExerciseFromSession(item.logged_exercise_id);
+                            }}
+                          >
+                            <Ionicons name="trash-outline" size={20} color="#fff" />
+                            <Text style={styles.swipeDeleteActionText}>{t('Delete')}</Text>
+                          </RectButton>
+                        </View>
+                      )}
+                    >
+                      <TouchableOpacity
+                        onLongPress={drag}
+                        delayLongPress={400}
+                        disabled={isActive}
+                        onPress={handlePress}
+                        activeOpacity={0.7}
+                        style={styles.modalExerciseRowMainTouchable}
+                        accessibilityRole="button"
+                        accessibilityLabel={
+                          `${item.exercise_name}. ${t('reorderExerciseA11y', { defaultValue: 'Long press and drag to reorder' })}`
+                        }
+                      >
+                        <View style={itemStyle}>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                            <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
+                              {item.exercise_fully_logged && (
+                                <Ionicons name="checkmark-circle" size={20} color={isCurrent ? theme.buttonText : theme.buttonBackground} style={{ marginRight: 8 }} />
+                              )}
+                              <Text style={[nameStyle, { marginRight: 8 }]}>{item.exercise_name}</Text>
+                              {muscleGroupInfo && muscleGroupInfo.value && (
+                                <View style={[
+                                  styles.muscleGroupBadgeModal,
+                                  { 
+                                    backgroundColor: isCurrent ? theme.text : theme.card,
+                                    borderColor: isCurrent ? theme.buttonText : theme.border,
+                                  }
+                                ]}>
+                                  <Text style={[
+                                    styles.muscleGroupBadgeText,
+                                    { color: isCurrent ? (theme.type === 'dark' ? '#000' : '#fff') : theme.text }
+                                  ]}>
+                                    {t(muscleGroupInfo.label)}
+                                  </Text>
+                                </View>
+                              )}
                             </View>
-                          )}
+                            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                              {item.web_link && (
+                                <TouchableOpacity onPress={() => handleLinkPress(item.web_link)} style={{ marginLeft: 10 }}>
+                                  <Ionicons name="link-outline" size={22} color={isCurrent ? theme.buttonText : theme.text} />
+                                </TouchableOpacity>
+                              )}
+                            </View>
+                          </View>
+                          <Text style={[detailStyle, { marginTop: 4 }]}>
+                            {isCardioSetUI(item.exercise_name, workoutLogType)
+                              ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
+                              : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
+                          </Text>
                         </View>
-                        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                          {item.exercise_notes && (
-                            <TouchableOpacity onPress={() => showNotes(item.exercise_notes!, item.exercise_name)} style={{ marginLeft: 10 }}>
-                              <Ionicons name="bookmark-outline" size={22} color={isCurrent ? theme.buttonText : theme.text} />
-                            </TouchableOpacity>
-                          )}
-                          {item.web_link && (
-                            <TouchableOpacity onPress={() => handleLinkPress(item.web_link)} style={{ marginLeft: 10 }}>
-                              <Ionicons name="link-outline" size={22} color={isCurrent ? theme.buttonText : theme.text} />
-                            </TouchableOpacity>
-                          )}
-                        </View>
-                      </View>
-                      <Text style={[detailStyle, { marginTop: 4 }]}>
-                        {isCardioSetUI(item.exercise_name, workoutLogType)
-                          ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
-                          : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
-                      </Text>
-                    </View>
-                  </TouchableComponent>
+                      </TouchableOpacity>
+                    </Swipeable>
+                  </ScaleDecorator>
                 );
               }}
             />
-          </View>
-        </TouchableOpacity>
+          </GestureHandlerRootView>
+        </SafeAreaView>
+        </>
       </Modal>
     );
   };
@@ -2809,6 +3184,33 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 8,
   },
+  /** RNGH Swipeable defaults to overflow: 'hidden'; use visible so the 80pt delete column is not clipped. */
+  swipeableContainer: {
+    overflow: 'visible',
+  },
+  /** Fixed width so Swipeable measures right actions as exactly 80pt (see RNGH rightOffset layout). */
+  swipeDeleteActionHost: {
+    width: 80,
+    alignSelf: 'stretch',
+  },
+  swipeDeleteAction: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: 80,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#c62828',
+    borderTopLeftRadius: 10,
+    borderBottomLeftRadius: 10,
+  },
+  swipeDeleteActionText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 13,
+    marginTop: 4,
+  },
   exerciseName: {
     fontSize: 16,
     fontWeight: 'bold',
@@ -3024,12 +3426,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: 'bold',
   },
-  restMessage: {
-    fontSize: 16,
-    textAlign: 'center',
-    fontStyle: 'italic',
-    maxWidth: '90%',
-  },
   upNextCard: {
     borderRadius: 12,
     borderWidth: 1,
@@ -3157,6 +3553,7 @@ const styles = StyleSheet.create({
   modalContainer: {
     width: '90%',
     maxHeight: '70%',
+    flexDirection: 'column',
     borderRadius: 15,
     borderWidth: 1,
     padding: 20,
@@ -3169,8 +3566,18 @@ const styles = StyleSheet.create({
   modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     paddingBottom: 15,
+    width: '100%',
+  },
+  modalWorkoutTitleCard: {
+    flex: 1,
+    minWidth: 0,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginRight: 8,
   },
   modalTitle: {
     fontSize: 20,
@@ -3178,6 +3585,36 @@ const styles = StyleSheet.create({
   },
   modalCloseButton: {
     padding: 5,
+    alignSelf: 'flex-start',
+  },
+  exerciseListModalRoot: {
+    flex: 1,
+  },
+  exerciseListModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 12,
+    width: '100%',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  exerciseListModalListContent: {
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 24,
+    flexGrow: 1,
+  },
+  modalExerciseListGestureRoot: {
+    flex: 1,
+  },
+  modalDraggableListContainer: {
+    flexGrow: 1,
+  },
+  modalExerciseRowMainTouchable: {
+    flex: 1,
+    minWidth: 0,
   },
   modalExerciseItem: {
     paddingVertical: 12,
