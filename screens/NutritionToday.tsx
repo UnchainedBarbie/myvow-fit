@@ -1,6 +1,6 @@
 /**
  * Today tab: active plan, macro rings, meal sections (Breakfast, Snack, Lunch, Dinner),
- * swipe Edit/Delete per food, quantity modal, recalc totals.
+ * tap row to edit; swipe for Edit/Delete actions; edit modal, recalc totals.
  */
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
@@ -331,7 +331,6 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
   const [unitDropdownOpen, setUnitDropdownOpen] = useState(false);
   const [planDebug, setPlanDebug] = useState<{ scheduleRows: number; dayOfWeek: string; source: string; planName: string } | null>(null);
   const [favoritedSignatures, setFavoritedSignatures] = useState<Set<string>>(new Set());
-  const [foodForActions, setFoodForActions] = useState<LoggedFood | null>(null);
 
   const loadFavoritedSignatures = useCallback(async () => {
     try {
@@ -809,30 +808,29 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
           text: 'Remove',
           style: 'destructive',
           onPress: async () => {
-            await db.runAsync('DELETE FROM LoggedFoods WHERE logged_food_id = ?', [food.logged_food_id]);
-            loadLoggedFoods();
+            const deletedId = food.logged_food_id;
+            if (deletedId < 1) {
+              Alert.alert(
+                'Planned foods',
+                'For this date, items are shown from your meal plan only and are not saved as separate rows in your food log. Deleting one item here is not available until those foods are stored in your log.',
+              );
+              return;
+            }
+            try {
+              await initNutritionDb(db);
+              await db.runAsync('DELETE FROM LoggedFoods WHERE logged_food_id = ?', [deletedId]);
+              setFoods((prev) => {
+                const next = prev.filter((f) => f.logged_food_id !== deletedId);
+                setTotals(sumMealNutrition(next));
+                return next;
+              });
+            } catch (e) {
+              console.error('Error deleting logged food:', e);
+            }
           },
         },
       ]
     );
-  };
-
-  const closeFoodActionsModal = useCallback(() => {
-    setFoodForActions(null);
-  }, []);
-
-  const runFoodActionEdit = () => {
-    if (!foodForActions) return;
-    const f = foodForActions;
-    setFoodForActions(null);
-    openEdit(f);
-  };
-
-  const runFoodActionDelete = () => {
-    if (!foodForActions) return;
-    const f = foodForActions;
-    setFoodForActions(null);
-    confirmDelete(f);
   };
 
   const { foodsByMealType, mealSubtotals } = useMemo(() => {
@@ -912,7 +910,6 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
                 onToggleFavorite={() => toggleFavoriteForFood(food)}
                 onEdit={() => openEdit(food)}
                 onDelete={() => confirmDelete(food)}
-                onOpenActionsMenu={() => setFoodForActions(food)}
               />
             ))
           ) : (
@@ -952,45 +949,6 @@ export default function NutritionToday({ selectedDate, onLoadPlan, reload }: Nut
         }}
         onFoodAdded={loadLoggedFoods}
       />
-      <Modal
-        visible={foodForActions != null}
-        transparent
-        animationType="fade"
-        onRequestClose={closeFoodActionsModal}
-      >
-        <View style={styles.foodActionsModalOverlay}>
-          <TouchableWithoutFeedback onPress={closeFoodActionsModal}>
-            <View style={StyleSheet.absoluteFillObject} />
-          </TouchableWithoutFeedback>
-          <View style={[styles.foodActionsModalCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
-            <Text style={[styles.foodActionsModalTitle, { color: theme.text }]} numberOfLines={2}>
-              {foodForActions?.food_name}
-            </Text>
-            {!!foodForActions?.brand && (
-              <Text style={[styles.foodActionsModalSubtitle, { color: theme.textSecondary ?? '#888' }]} numberOfLines={1}>
-                {foodForActions.brand}
-              </Text>
-            )}
-            <TouchableOpacity
-              style={[styles.foodActionsModalRow, { borderColor: theme.border }]}
-              onPress={runFoodActionEdit}
-              activeOpacity={0.7}
-            >
-              <Ionicons name="create-outline" size={22} color={SAGE} style={styles.foodActionsModalIcon} />
-              <Text style={[styles.foodActionsModalRowText, { color: theme.text }]}>Edit</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.foodActionsModalRow, styles.foodActionsModalRowLast, { borderColor: theme.border }]}
-              onPress={runFoodActionDelete}
-              activeOpacity={0.7}
-            >
-              <Ionicons name="trash-outline" size={22} color="#C0392B" style={styles.foodActionsModalIcon} />
-              <Text style={[styles.foodActionsModalRowText, { color: '#C0392B' }]}>Delete</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-
       <Modal
         visible={editModalVisible}
         transparent
@@ -1116,7 +1074,6 @@ function FoodRow({
   onToggleFavorite,
   onEdit,
   onDelete,
-  onOpenActionsMenu,
 }: {
   food: LoggedFood;
   theme: any;
@@ -1124,7 +1081,6 @@ function FoodRow({
   onToggleFavorite: () => void;
   onEdit: () => void;
   onDelete: () => void;
-  onOpenActionsMenu: () => void;
 }) {
   let swipeRef: Swipeable | null = null;
   const renderLeftActions = () => (
@@ -1147,8 +1103,7 @@ function FoodRow({
       <View style={[styles.foodRow, styles.foodRowWithHeart, { backgroundColor: theme.background, borderColor: theme.border }]}>
         <Pressable
           style={({ pressed }) => [styles.foodRowContent, pressed && { opacity: 0.85 }]}
-          onLongPress={onOpenActionsMenu}
-          delayLongPress={400}
+          onPress={onEdit}
         >
           <Text style={[styles.foodRowName, { color: theme.text }]} numberOfLines={1}>{food.food_name}{food.brand ? ` · ${food.brand}` : ''}</Text>
           <Text style={[styles.foodRowPortion, { color: theme.textSecondary ?? '#888' }]} numberOfLines={2}>
@@ -1210,33 +1165,6 @@ const styles = StyleSheet.create({
   editBtn: { backgroundColor: '#E67E22', justifyContent: 'center', alignItems: 'center', width: 72 },
   deleteBtn: { backgroundColor: '#C0392B', justifyContent: 'center', alignItems: 'center', width: 72 },
   swipeBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
-  foodActionsModalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 28,
-  },
-  foodActionsModalCard: {
-    borderRadius: 14,
-    borderWidth: 1,
-    overflow: 'hidden',
-    maxWidth: 400,
-    width: '100%',
-    alignSelf: 'center',
-  },
-  foodActionsModalTitle: { fontSize: 17, fontWeight: '700', paddingHorizontal: 16, paddingTop: 16, paddingBottom: 4 },
-  foodActionsModalSubtitle: { fontSize: 14, paddingHorizontal: 16, paddingBottom: 8 },
-  foodActionsModalRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    borderTopWidth: 1,
-  },
-  foodActionsModalRowLast: { marginBottom: 4 },
-  foodActionsModalIcon: { marginRight: 12 },
-  foodActionsModalRowText: { fontSize: 16, fontWeight: '600' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' },
   modalBackdropTap: { flex: 1 },
   editFoodModalRoot: {

@@ -160,7 +160,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
         ['@sage_diet', diet],
         ['@sage_allergies', allergies.trim()],
         ['@sage_brands', brands.trim()],
-        ['@onboarding_complete', 'true'],
+        ['@onboarding_profile_saved', 'true'],
       ]);
       onComplete();
     } catch (e) {

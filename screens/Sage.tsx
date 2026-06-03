@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useLayoutEffect, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useLayoutEffect, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -28,15 +28,86 @@ import { DEFAULT_REST_SECONDS_BETWEEN_SETS } from '../utils/startedWorkoutPrefer
 import { insertAIWorkout, AIWorkout, isAiExerciseCardio } from '../utils/generateWorkoutWithAI';
 import { initMealPlansDb } from '../utils/initMealPlansDb';
 import { initNutritionDb } from '../utils/nutritionDb';
+import { initVowsDb } from '../utils/initVowsDb';
+import { CreateOwnVowModal, type CreateOwnVowSubmitPayload, CATEGORY_DISPLAY_LABELS } from '../components/CreateOwnVowModal';
 import {
   SageMessage,
   saveConversation,
   loadConversation,
   clearConversation as clearSageStorage,
 } from '../utils/sageStorage';
+import { stripMarkdownFromVowText } from '../utils/sageMarkdownStrip';
+import {
+  initPurchasedProductsDb,
+  upsertProduct,
+  getTopProducts,
+  parseProductsTagNamesFromContent,
+  stripProductsTagsFromMessage,
+  areAllProductsInPurchasedTable,
+} from '../utils/purchasedProducts';
 
 /** Max recent messages sent to the API before prepending preserved meal-plan context. */
 const SAGE_API_CONTEXT_TAIL_COUNT = 20;
+
+const SAGE_WORKER_URL = 'https://myvow-fit-api.allison-spink.workers.dev';
+const SAGE_MODEL = 'claude-sonnet-4-5';
+/** Default cap for normal Sage chat (non–meal-plan-heavy turns). */
+const SAGE_DEFAULT_MAX_TOKENS = 4096;
+/** Output cap when the user is clearly asking for a full meal plan (multi-day JSON can be large). */
+const MEAL_PLAN_MAX_TOKENS = 8192;
+/** Receipt / image path: higher than legacy 1024; meal-plan–style receipt updates use {@link MEAL_PLAN_MAX_TOKENS}. */
+const SAGE_RECEIPT_DEFAULT_MAX_TOKENS = 4096;
+
+const SAGE_TRUNCATION_UI_COPY =
+  "Response was cut off. Tap 'Continue' to finish.";
+const SAGE_CONTINUATION_USER_MESSAGE =
+  'Continue the previous response from where it left off. Do not repeat content already shown.';
+const SAGE_MEALPLAN_INCOMPLETE_HINT =
+  'Response incomplete — tap Continue above';
+
+/** Sage assistant avatar (leaf); column width = diameter + gap to bubble. */
+const SAGE_LEAF_AVATAR_DIAMETER = 34;
+const SAGE_LEAF_AVATAR_GAP = 8;
+const SAGE_LEAF_ICON_SIZE = 18;
+const SAGE_LEAF_FILL = '#A8BEA8';
+
+/** User text suggests a large meal-plan style reply (raise max_tokens only for that request). */
+const MEAL_PLAN_INTENT_USER_RE =
+  /\bmeal\s*plan\b|\b\d+\s*[- ]?\s*days?\b|\bweekly\s+(meal|meals|nutrition|food)s?\b|\b(day\s+by\s+day|each\s+day)\b.*\b(breakfast|lunch|dinner|snack|meal|macro)/i;
+
+function looksLikeMealPlanGenerationRequest(userText: string): boolean {
+  const t = userText.trim();
+  if (!t) return false;
+  return MEAL_PLAN_INTENT_USER_RE.test(t);
+}
+
+function chooseMaxTokensForSageUserText(userMessage: string): number {
+  return looksLikeMealPlanGenerationRequest(userMessage)
+    ? MEAL_PLAN_MAX_TOKENS
+    : SAGE_DEFAULT_MAX_TOKENS;
+}
+
+function chooseMaxTokensForTruncationContinuation(msgs: SageMessage[]): number {
+  const lastAssistant = [...msgs]
+    .reverse()
+    .find((m) => m.role === 'assistant' && !m.truncationUi);
+  const c = lastAssistant?.content ?? '';
+  if (/<mealplan\b/i.test(c)) return MEAL_PLAN_MAX_TOKENS;
+  const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
+  return lastUser ? chooseMaxTokensForSageUserText(lastUser.content) : SAGE_DEFAULT_MAX_TOKENS;
+}
+
+function filterSageMessagesForApi(messages: SageMessage[]): SageMessage[] {
+  return messages.filter((m) => !m.truncationUi);
+}
+
+/** True when `<mealplan>` has opened but no matching `</mealplan>` appears after it. */
+function mealPlanBlockStartedNotClosed(content: string): boolean {
+  const idx = content.search(/<mealplan\b/i);
+  if (idx === -1) return false;
+  const tail = content.slice(idx);
+  return !/<\/mealplan>/i.test(tail);
+}
 
 function sageAssistantMessage(content: string): SageMessage {
   return { role: 'assistant', content };
@@ -50,7 +121,78 @@ import {
   useSpeechRecognitionEvent,
 } from 'expo-speech-recognition';
 
+/** Renders `**bold**` in chat bubbles as nested `Text` (RN has no built-in markdown). */
+function sageMessageBoldSegments(text: string): React.ReactNode {
+  if (!text || !text.includes('**')) {
+    return text;
+  }
+  const re = /\*\*([\s\S]+?)\*\*/g;
+  const nodes: React.ReactNode[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let k = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) {
+      nodes.push(text.slice(last, m.index));
+    }
+    nodes.push(
+      <Text key={`sage-b-${k++}`} style={{ fontWeight: '700' }}>
+        {m[1]}
+      </Text>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) {
+    nodes.push(text.slice(last));
+  }
+  return nodes.length > 0 ? nodes : text;
+}
+
 const SYSTEM_PROMPT = `You are Sage, a witty and direct fitness and nutrition coach — like a smart friend who happens to know a lot. You help users design workout plans and meal plans through conversation. You're encouraging but not cheesy, honest but not harsh.
+
+CONVERSATION TURN CONSTRAINTS:
+
+You can only respond when the user sends you a message. You cannot send messages on your own, follow up later, or push content asynchronously.
+
+When the user is mid-flow on any multi-step task (multi-day meal plans, multi-day workout plans, vow sequences, weekly prep walkthroughs, or any other task that requires multiple back-and-forth messages), you MUST end each message with an explicit prompt for the user to message you again to continue.
+
+NEVER say things like:
+- "I'll send the next one after you save"
+- "I'll follow up with..."
+- "Stand by, I'll continue once..."
+- "After you do X, I'll send Y"
+
+ALWAYS say things like:
+- "Save this, then message me 'next' or 'continue' and I'll send the next part."
+- "Once you've done that, just say 'ready' and I'll generate the next piece."
+- "Let me know when you're ready for the next step."
+
+This applies to ANY multi-step interaction, not just meal plans.
+
+VOW TAG RULES — STRICT:
+
+When suggesting vows, wrap ONLY completed first-person commitments in <vow>...</vow> tags. A valid vow:
+- Starts with 'I will...' or similar first-person commitment language
+- Is a complete actionable statement
+- Has no markdown formatting (no **, no *, no _, no backticks)
+
+NEVER wrap these in <vow> tags:
+- Questions ('Want to keep those?')
+- Decision options ('Replace them with new ones?')
+- Section headers ('Workout vows:', 'Nutrition vows:')
+- Framing or commentary ('Nice, let's make these stick')
+
+If the user has specified a category for this vow conversation, ONLY suggest vows in that category. Do not cross categories unless the user explicitly asks.
+
+Example of correct output for a user who picked the 'Movement' category:
+
+Nice — here are three Movement vows that could work for your week:
+
+<vow>I will walk 20 minutes after lunch on weekdays</vow>
+<vow>I will do 3 strength sessions this week</vow>
+<vow>I will stretch for 5 minutes before bed each night</vow>
+
+Which one feels right? Tap to save it, or let me know if you want different options.
 
 When the user is happy with a workout plan, output it as a JSON block wrapped in <workout> tags with this exact structure:
 <workout>
@@ -155,6 +297,24 @@ If the user asks for a meal prep guide (batch cooking, prep sessions, storage ti
 When the user asks for a grocery list based on a meal plan (for example "make me a grocery list" or "what do I need to buy"), respond with a plain text list grouped by category headings "Produce:", "Meat & Fish:", "Dairy:", "Pantry:", "Other:", and under each heading list the specific branded items and sizes (e.g. "Fage 0% Greek Yogurt — 32oz"). Do NOT wrap grocery lists in JSON or tags.
 
 When updating an existing meal plan based on a receipt or user request, when the user confirms they are ready to save, you MUST output the complete updated meal plan in <mealplan> tags immediately. Do not just say it is saved in text — the app requires the <mealplan> block to actually save it. Always output the full <mealplan> JSON even if only one field changed.
+
+RECEIPT PRODUCT TAGS (grocery receipts):
+
+When you read a grocery receipt photo, identify each branded food product and wrap them in <products>...</products> tags. Format: comma-separated product names, each as 'Brand + descriptive product name'.
+
+Example:
+I see your receipt from King Soopers. <products>Krusteaz Buttermilk Pancake Mix, Daisy Sour Cream, Fage 0% Greek Yogurt, Rao's Marinara, Sargento Sharp Cheddar</products>
+Want me to remember these for future meal plans?
+
+Rules for product names:
+- Format: 'Brand + product description' (e.g., 'Krusteaz Buttermilk Pancake Mix' not just 'Krusteaz')
+- Use proper capitalization and full words, not receipt abbreviations ('Buttermilk' not 'BTTRMLK')
+- Skip size, weight, count, and price (no '32oz', no '$4.99')
+- Skip generic non-branded items (produce, bulk, deli, eggs without a brand)
+- Skip non-food items (cleaning supplies, paper goods)
+- Deduplicate within a single receipt
+- Max 20 products per receipt
+- No markdown formatting inside tags
 
 When the user wants to save multiple meal plans, you MUST output each plan in a separate message with its own <mealplan> tags. Never say a plan is saved without outputting the <mealplan> block. Output Plan 1 first, wait for the save button to appear, then output Plan 2 in a follow-up message. Never confirm a save in plain text alone — the <mealplan> block is required for the app to render the save button.
 
@@ -548,6 +708,7 @@ function assistantMessageHasMealPlanSectionHeaders(content: string): boolean {
 
 /** True for assistant messages that carry meal plan JSON, sectioned plan text, or post–Save Meal Plan confirmations. */
 function messageCarriesMealPlanContext(m: SageMessage): boolean {
+  if (m.truncationUi) return false;
   if (m.role !== 'assistant') return false;
   const c = m.content;
   if (/<mealplan\b[\s\S]*?<\/mealplan>/i.test(c)) return true;
@@ -574,7 +735,52 @@ function buildSageMessagesForApiContext(
       preserved.push(allMessages[i]);
     }
   }
-  return [...preserved, ...allMessages.slice(-tailCount)];
+  return filterSageMessagesForApi([...preserved, ...allMessages.slice(-tailCount)]);
+}
+
+type SageAnthropicTextResult =
+  | { ok: true; text: string; stopReason: string | null }
+  | { ok: false; rawErrorText: string };
+
+async function fetchSageAnthropicTextReply(params: {
+  messages: SageMessage[];
+  systemPrompt: string;
+  maxTokens: number;
+  signal: AbortSignal;
+}): Promise<SageAnthropicTextResult> {
+  const { messages, systemPrompt, maxTokens, signal } = params;
+  const apiMessages = filterSageMessagesForApi(buildSageMessagesForApiContext(messages)).map(
+    (m): { role: 'user' | 'assistant'; content: string } => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.content,
+    }),
+  );
+  const response = await fetch(SAGE_WORKER_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    signal,
+    body: JSON.stringify({
+      model: SAGE_MODEL,
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: apiMessages,
+    }),
+  });
+  if (!response.ok) {
+    const rawErrorText = await response.text();
+    return { ok: false, rawErrorText };
+  }
+  const data = await response.json();
+  const contentBlocks = Array.isArray(data.content) ? data.content : [];
+  const text = contentBlocks
+    .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b: any) => b.text)
+    .join('\n')
+    .trim();
+  const stopReason = typeof data.stop_reason === 'string' ? data.stop_reason : null;
+  return { ok: true, text: text || '[No response]', stopReason };
 }
 
 function isGroceryListContent(content: string): boolean {
@@ -586,13 +792,287 @@ function isGroceryListContent(content: string): boolean {
   );
 }
 
+/** Sage green accent for vow selection (matches leaf / paywall sage). */
+const SAGE_VOW_ACCENT = '#A8BEA8';
+
+/** When Sage omits `<vow>` tags, treat numbered or bullet lines as vow candidates. */
+const VOW_FALLBACK_LINE_RE = /^\s*(?:[-*•]\s+|\d+[.)]\s+)(.+)$/;
+
+export type ParsedVowsFromMessage = {
+  /** Prose outside <vow> tags (tags stripped); may be empty if the message is only vows. */
+  framing: string;
+  /** One entry per <vow> tag, or fallback bullet/numbered lines. */
+  vows: string[];
+};
+
+/** Heuristic: Sage mistakenly wrapped prompts, questions, or headers in <vow>. */
+function isProbablyNonVowWrappedContent(t: string): boolean {
+  const s = t.trim();
+  if (s.length < 6) return true;
+  if (
+    /^(want to|which|replace them|keep those|should i|could we|tap to|pick one|choose one|add nutrition|workout vows|nutrition vows)\b/i.test(
+      s,
+    )
+  ) {
+    return true;
+  }
+  if (/\?\s*$/.test(s) && s.length < 180 && !/^I\s+(will|'ll|am|want|commit|pledge)\b/i.test(s)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Extracts framing text and vow strings from a Sage assistant message (after workout/meal
+ * blocks are stripped). Prefers <vow>...</vow>; if none, uses numbered or bullet lines.
+ */
+export function parseVowsFromSageMessage(raw: string): ParsedVowsFromMessage {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { framing: '', vows: [] };
+  }
+
+  const vowsFromTags: string[] = [];
+  let m: RegExpExecArray | null;
+  const tagRe = /<vow>([\s\S]*?)<\/vow>/gi;
+  while ((m = tagRe.exec(trimmed)) !== null) {
+    const inner = stripMarkdownFromVowText(m[1].replace(/\s+/g, ' '));
+    if (inner.length > 0 && !isProbablyNonVowWrappedContent(inner)) vowsFromTags.push(inner);
+  }
+
+  if (vowsFromTags.length > 0) {
+    const framing = trimmed
+      .replace(/<vow>[\s\S]*?<\/vow>/gi, '\n\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return { framing, vows: vowsFromTags };
+  }
+
+  const lines = trimmed.split(/\r?\n/);
+  const vowsFb: string[] = [];
+  const framingLines: string[] = [];
+  for (const line of lines) {
+    const match = line.match(VOW_FALLBACK_LINE_RE);
+    if (match?.[1]) {
+      const body = stripMarkdownFromVowText(match[1]);
+      if (body && !isProbablyNonVowWrappedContent(body)) vowsFb.push(body);
+    } else {
+      framingLines.push(line);
+    }
+  }
+  if (vowsFb.length === 0) {
+    return { framing: trimmed, vows: [] };
+  }
+  const framing = framingLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { framing, vows: vowsFb };
+}
+
+/** First user line when opening Sage from My Vow with a category (or none for "Help me decide"). */
+function buildVowBootstrapUserLine(categories: string[]): string {
+  if (categories.length === 0) {
+    return "I'd like to create a vow. Suggest 3 options that fit my week.";
+  }
+  const labels = categories.map((id) => CATEGORY_DISPLAY_LABELS[id] ?? id).join(', ');
+  if (categories.length === 1) {
+    return `I'd like to create a ${labels} vow. Suggest 3 options that fit my week.`;
+  }
+  return `I'd like to create a vow focused on ${labels}. Suggest 3 options that fit my week.`;
+}
+
+type SageReceiptProductsPanelProps = {
+  products: string[];
+  theme: {
+    text: string;
+    textSecondary?: string;
+    card: string;
+    border?: string;
+    background?: string;
+  };
+  savedFromDb: boolean;
+  savedThisSession: boolean;
+  onSkip: () => void;
+  onConfirm: (selectedNames: string[]) => Promise<void>;
+};
+
+function SageReceiptProductsPanel({
+  products,
+  theme,
+  savedFromDb,
+  savedThisSession,
+  onSkip,
+  onConfirm,
+}: SageReceiptProductsPanelProps) {
+  const [selected, setSelected] = useState<Record<string, boolean>>(() => {
+    const o: Record<string, boolean> = {};
+    products.forEach((b) => {
+      o[b] = true;
+    });
+    return o;
+  });
+  const [busy, setBusy] = useState(false);
+  const saved = savedFromDb || savedThisSession;
+
+  const selectedCount = useMemo(
+    () => products.reduce((n, b) => (selected[b] ? n + 1 : n), 0),
+    [products, selected],
+  );
+
+  const toggle = useCallback(
+    (name: string) => {
+      if (saved || busy) return;
+      setSelected((prev) => ({ ...prev, [name]: !prev[name] }));
+    },
+    [saved, busy],
+  );
+
+  const handleAdd = useCallback(async () => {
+    const names = products.filter((b) => selected[b]);
+    if (names.length === 0) return;
+    setBusy(true);
+    try {
+      await onConfirm(names);
+    } finally {
+      setBusy(false);
+    }
+  }, [products, selected, onConfirm]);
+
+  return (
+    <View
+      style={{
+        marginTop: 10,
+        borderRadius: 12,
+        borderWidth: 1,
+        borderColor: theme.border ?? '#e0e0e0',
+        padding: 12,
+        backgroundColor: theme.card,
+        opacity: saved ? 0.72 : 1,
+      }}
+    >
+      {saved ? (
+        <Text style={{ fontFamily: 'Jost_600SemiBold', color: '#7C9A7E', fontSize: 15 }}>
+          Saved ✓
+        </Text>
+      ) : (
+        <>
+          <Text
+            style={{
+              fontFamily: 'CormorantGaramond-SemiBold',
+              fontSize: 18,
+              color: theme.text,
+              marginBottom: 4,
+            }}
+          >
+            Add these products to your purchase history?
+          </Text>
+          <Text
+            style={{
+              fontFamily: 'Jost_400Regular',
+              fontSize: 13,
+              color: theme.textSecondary ?? '#666',
+              marginBottom: 12,
+              lineHeight: 18,
+            }}
+          >
+            Sage will use what you buy often when planning meals and groceries.
+          </Text>
+          {products.map((b) => (
+            <TouchableOpacity
+              key={b}
+              style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}
+              onPress={() => toggle(b)}
+              disabled={busy}
+            >
+              <Ionicons
+                name={selected[b] ? 'checkbox-outline' : 'square-outline'}
+                size={22}
+                color={selected[b] ? '#7C9A7E' : theme.textSecondary ?? '#888'}
+                style={{ marginRight: 10 }}
+              />
+              <Text
+                style={{
+                  flex: 1,
+                  fontFamily: 'Jost_400Regular',
+                  fontSize: 15,
+                  color: theme.text,
+                }}
+              >
+                {b}
+              </Text>
+            </TouchableOpacity>
+          ))}
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 8 }}>
+            <TouchableOpacity
+              style={{
+                backgroundColor: '#7C9A7E',
+                paddingVertical: 12,
+                paddingHorizontal: 16,
+                borderRadius: 10,
+                opacity: selectedCount === 0 || busy ? 0.45 : 1,
+              }}
+              disabled={selectedCount === 0 || busy}
+              onPress={() => void handleAdd()}
+            >
+              <Text style={{ fontFamily: 'Jost_600SemiBold', color: '#fff', fontSize: 15 }}>
+                {`Add ${selectedCount} product${selectedCount === 1 ? '' : 's'}`}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={{
+                borderWidth: 1,
+                borderColor: theme.border ?? '#ccc',
+                paddingVertical: 12,
+                paddingHorizontal: 16,
+                borderRadius: 10,
+              }}
+              onPress={onSkip}
+              disabled={busy}
+            >
+              <Text style={{ fontFamily: 'Jost_500Medium', fontSize: 15, color: theme.text }}>
+                Skip
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </>
+      )}
+    </View>
+  );
+}
+
 export default function Sage() {
   const { theme } = useTheme();
   const db = useSQLiteContext();
   const navigation = useNavigation();
   const route = useRoute();
   const [messages, setMessages] = useState<SageMessage[]>([]);
-  const [savedVowMessageIndexes, setSavedVowMessageIndexes] = useState<number[]>([]);
+  /** Per-message:vowIndex keys for vows saved from Sage after the create-vow modal (session). */
+  const [savedVowSessionKeys, setSavedVowSessionKeys] = useState<Record<string, true>>({});
+  /** Active vow titles from DB — detect already-saved when returning to Sage. */
+  const [dbVowTitles, setDbVowTitles] = useState<Set<string>>(() => new Set());
+  const [sageCreateOwnModalVisible, setSageCreateOwnModalVisible] = useState(false);
+  const [sageCreateOwnPrefill, setSageCreateOwnPrefill] = useState('');
+  /** From My Vow category picker: pre-fill create modal. `[]` = Help me decide (no chip). `undefined` = default Movement. */
+  const [sageCreateOwnInitialCategories, setSageCreateOwnInitialCategories] = useState<
+    string[] | undefined
+  >(undefined);
+  const [conversationReady, setConversationReady] = useState(false);
+  /** Receipt <products> panel: user skipped confirming this message index. */
+  const [receiptProductsPanelSkipped, setReceiptProductsPanelSkipped] = useState<
+    Record<number, true>
+  >({});
+  /** Receipt <products> panel: user confirmed add this session (optimistic saved UI). */
+  const [receiptProductsPanelSavedSession, setReceiptProductsPanelSavedSession] = useState<
+    Record<number, true>
+  >({});
+  /** Assistant message index → all parsed receipt products already exist in PurchasedProducts. */
+  const [receiptProductsAllInDbByIndex, setReceiptProductsAllInDbByIndex] = useState<
+    Record<number, boolean>
+  >({});
+  /** Bumps when PurchasedProducts changes so FlatList + DB presence recompute. */
+  const [receiptProductsPanelTick, setReceiptProductsPanelTick] = useState(0);
+  /** Which Sage vow row opened the create modal (for marking saved after successful insert). */
+  const sageVowSaveTargetRef = useRef<{ messageIndex: number; vowIndex: number } | null>(null);
+  /** Prevents duplicate auto-bootstrap for the same My Vow → Sage session key. */
+  const lastVowSageBootstrapSessionKeyRef = useRef<number | null>(null);
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(false);
   const [sendingReceipt, setSendingReceipt] = useState(false);
@@ -716,17 +1196,21 @@ export default function Sage() {
 
   useEffect(() => {
     (async () => {
-      const stored = await loadConversation();
-      if (stored && stored.length) {
-        setMessages(stored);
-      } else {
-        const welcome: SageMessage = {
-          role: 'assistant',
-          content:
-            "Hey, I'm Sage. Tell me what kind of workouts or meal plans you're after and we'll design something that actually fits your life.",
-        };
-        setMessages([welcome]);
-        await saveConversation([welcome]);
+      try {
+        const stored = await loadConversation();
+        if (stored && stored.length) {
+          setMessages(stored);
+        } else {
+          const welcome: SageMessage = {
+            role: 'assistant',
+            content:
+              "Hey, I'm Sage. Tell me what kind of workouts or meal plans you're after and we'll design something that actually fits your life.",
+          };
+          setMessages([welcome]);
+          await saveConversation([welcome]);
+        }
+      } finally {
+        setConversationReady(true);
       }
     })();
   }, []);
@@ -749,7 +1233,13 @@ export default function Sage() {
     });
   }, [navigation, theme.text]);
 
-  const routeParams = (route.params || {}) as { initialPrompt?: string; fromMyVow?: boolean };
+  const routeParams = (route.params || {}) as {
+    initialPrompt?: string;
+    fromMyVow?: boolean;
+    vowSageCategories?: string[];
+    vowSageAutoSend?: boolean;
+    vowSageSessionKey?: number;
+  };
   const fromMyVow = routeParams.fromMyVow === true;
 
   useEffect(() => {
@@ -763,6 +1253,29 @@ export default function Sage() {
   }, [inputText]);
 
   messagesRef.current = messages;
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        await initPurchasedProductsDb(db);
+        const next: Record<number, boolean> = {};
+        for (let i = 0; i < messages.length; i++) {
+          const msg = messages[i];
+          if (msg.role !== 'assistant' || msg.truncationUi) continue;
+          const names = parseProductsTagNamesFromContent(msg.content);
+          if (names.length === 0) continue;
+          next[i] = await areAllProductsInPurchasedTable(db, names);
+        }
+        if (!cancelled) setReceiptProductsAllInDbByIndex(next);
+      } catch (e) {
+        console.warn('Sage: PurchasedProducts presence check failed', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [messages, db, receiptProductsPanelTick]);
 
   useEffect(() => {
     if (!messages.length) {
@@ -780,8 +1293,94 @@ export default function Sage() {
     });
   }, [messages]);
 
+  const reloadVowTitlesFromDb = useCallback(async () => {
+    try {
+      await initVowsDb(db);
+      const rows = await db.getAllAsync<{ title: string }>(
+        "SELECT title FROM Vows WHERE status = 'active';",
+      );
+      const next = new Set<string>();
+      for (const r of rows) {
+        if (r.title && typeof r.title === 'string') next.add(r.title.trim());
+      }
+      setDbVowTitles(next);
+    } catch (e) {
+      console.warn('Sage: could not refresh vow titles from DB', e);
+    }
+  }, [db]);
+
+  const handleSageCreateOwnSubmit = useCallback(
+    async (p: CreateOwnVowSubmitPayload) => {
+      const now = new Date().toISOString();
+      await initVowsDb(db);
+      await db.runAsync(
+        'INSERT INTO Vows (title, category, frequency_per_week, why_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [p.title.trim(), p.categoryCsv, p.frequencyPerWeek, p.whyText, 'active', now],
+      );
+      const target = sageVowSaveTargetRef.current;
+      if (target) {
+        const key = `${target.messageIndex}:${target.vowIndex}`;
+        setSavedVowSessionKeys((prev) => ({ ...prev, [key]: true }));
+        sageVowSaveTargetRef.current = null;
+      }
+      setDbVowTitles((prev) => {
+        const n = new Set(prev);
+        n.add(p.title.trim());
+        return n;
+      });
+    },
+    [db],
+  );
+
+  const openSageCreateOwnFromSuggestedVow = useCallback(
+    (vowText: string, messageIndex: number, vowIndex: number) => {
+      sageVowSaveTargetRef.current = { messageIndex, vowIndex };
+      const p = (route.params || {}) as {
+        fromMyVow?: boolean;
+        vowSageCategories?: string[];
+      };
+      if (p.fromMyVow && p.vowSageCategories !== undefined) {
+        setSageCreateOwnInitialCategories([...p.vowSageCategories]);
+      } else {
+        setSageCreateOwnInitialCategories(undefined);
+      }
+      setSageCreateOwnPrefill(vowText);
+      setSageCreateOwnModalVisible(true);
+    },
+    [route.params],
+  );
+
+  const vowFlatListExtra = useMemo(
+    () => ({
+      savedVowSessionKeys,
+      sageCreateOwnModalVisible,
+      dbVowTitles: [...dbVowTitles].join('\x00'),
+      vowSageCategoriesSig:
+        ((route.params || {}) as { vowSageCategories?: string[] }).vowSageCategories?.join('\x1e') ??
+        '',
+      fromMyVowSig: (route.params as { fromMyVow?: boolean } | undefined)?.fromMyVow ? '1' : '0',
+      receiptProductsPanelTick,
+      receiptProductsSkipSig: Object.keys(receiptProductsPanelSkipped).join(','),
+      receiptProductsSavedSig: Object.keys(receiptProductsPanelSavedSession).join(','),
+      receiptProductsDbSig: Object.entries(receiptProductsAllInDbByIndex)
+        .map(([k, v]) => `${k}:${v ? 1 : 0}`)
+        .join('|'),
+    }),
+    [
+      savedVowSessionKeys,
+      sageCreateOwnModalVisible,
+      dbVowTitles,
+      route.params,
+      receiptProductsPanelTick,
+      receiptProductsPanelSkipped,
+      receiptProductsPanelSavedSession,
+      receiptProductsAllInDbByIndex,
+    ],
+  );
+
   useFocusEffect(
     useCallback(() => {
+      void reloadVowTitlesFromDb();
       snapToBottomAfterFocusRef.current = true;
 
       const scrollToBottom = () => {
@@ -810,7 +1409,7 @@ export default function Sage() {
         clearTimeout(clearSnapTimer);
         interactionTask.cancel();
       };
-    }, []),
+    }, [reloadVowTitlesFromDb]),
   );
 
   const handleClear = async () => {
@@ -822,9 +1421,19 @@ export default function Sage() {
     };
     setMessages([fresh]);
     await saveConversation([fresh]);
+    setSavedVowSessionKeys({});
+    setReceiptProductsPanelSkipped({});
+    setReceiptProductsPanelSavedSession({});
+    setReceiptProductsAllInDbByIndex({});
+    setReceiptProductsPanelTick(0);
+    setSageCreateOwnModalVisible(false);
+    setSageCreateOwnPrefill('');
+    setSageCreateOwnInitialCategories(undefined);
+    sageVowSaveTargetRef.current = null;
+    lastVowSageBootstrapSessionKeyRef.current = null;
   };
 
-  const buildUserContext = async (): Promise<string | null> => {
+  const buildUserContext = useCallback(async (): Promise<string | null> => {
     try {
       const [goals, diet, allergies, brands] =
         await Promise.all([
@@ -839,8 +1448,28 @@ export default function Sage() {
       if (diet && diet.trim()) lines.push(`- Diet: ${diet.trim()}`);
       if (allergies && allergies.trim())
         lines.push(`- Restrictions: ${allergies.trim()}`);
-      if (brands && brands.trim())
-        lines.push(`- Preferred brands: ${brands.trim()}`);
+      if (brands && brands.trim()) {
+        lines.push(
+          `User's brand preferences (manually set in profile): ${brands.trim()}`,
+        );
+      }
+      let learnedProducts: string[] = [];
+      try {
+        await initPurchasedProductsDb(db);
+        learnedProducts = await getTopProducts(db, 20);
+        if (learnedProducts.length > 0) {
+          lines.push(
+            `Frequently purchased products (from receipts): ${learnedProducts.join(', ')}`,
+          );
+        }
+        if ((brands && brands.trim()) || learnedProducts.length > 0) {
+          lines.push(
+            'When suggesting groceries or meal plans, prefer these items when relevant (manual brand preferences and receipt-learned products).',
+          );
+        }
+      } catch (e) {
+        console.warn('Sage: PurchasedProducts context skipped', e);
+      }
 
       const [favFoodsRows, workoutNamesRows] = await Promise.all([
         db.getAllAsync<{ food_name: string; brand: string | null }>(
@@ -862,7 +1491,6 @@ export default function Sage() {
       }
 
       try {
-        const { initVowsDb } = await import('../utils/initVowsDb');
         await initVowsDb(db);
         const vowRows = await db.getAllAsync<{ title: string }>(
           "SELECT title FROM Vows WHERE status = 'active' ORDER BY created_at DESC;"
@@ -907,13 +1535,149 @@ export default function Sage() {
         }
       }
 
+      const routeVow = (route.params || {}) as {
+        fromMyVow?: boolean;
+        vowSageCategories?: string[];
+      };
+      if (routeVow.fromMyVow && routeVow.vowSageCategories !== undefined) {
+        if (routeVow.vowSageCategories.length === 0) {
+          lines.push(
+            '- Vow session: user chose "Help me decide" — you may suggest across categories unless they narrow it.',
+          );
+        } else {
+          lines.push(
+            `- Current vow category: ${routeVow.vowSageCategories.join(', ')}. Only suggest vows in this category unless the user explicitly asks otherwise.`,
+          );
+        }
+      }
+
       if (!lines.length) return null;
       return ['User context:', ...lines].join('\n');
     } catch (e) {
       console.error('Error building Sage user context:', e);
       return null;
     }
-  };
+  }, [db, route]);
+
+  const runSageReplyForMessages = useCallback(
+    async (
+      nextMessages: SageMessage[],
+      opts?: { userTextForMaxTokens?: string },
+    ): Promise<void> => {
+      const userText =
+        opts?.userTextForMaxTokens?.trim() ||
+        [...nextMessages].reverse().find((m) => m.role === 'user')?.content?.trim() ||
+        '';
+
+      try {
+        console.log('Sage: calling AI API with conversation', nextMessages);
+
+        const userContext = await buildUserContext();
+        const systemPrompt = userContext
+          ? `${SYSTEM_PROMPT}\n\n${userContext}`
+          : SYSTEM_PROMPT;
+
+        abortInFlightRequest();
+        const controller = new AbortController();
+        requestAbortRef.current = controller;
+
+        const maxTokens = chooseMaxTokensForSageUserText(userText);
+        console.log('Sage: calling AI API with conversation', nextMessages, { maxTokens });
+
+        const result = await fetchSageAnthropicTextReply({
+          messages: nextMessages,
+          systemPrompt,
+          maxTokens,
+          signal: controller.signal,
+        });
+
+        if (!result.ok) {
+          console.error('Sage API error raw:', result.rawErrorText);
+          const withError: SageMessage[] = [
+            ...nextMessages,
+            sageAssistantMessage(SAGE_API_USER_FRIENDLY_ERROR),
+          ];
+          if (isMountedRef.current) {
+            setMessages(withError);
+            await saveConversation(withError);
+          }
+          return;
+        }
+
+        console.log('Sage API response:', { stopReason: result.stopReason });
+
+        const reply: SageMessage = {
+          role: 'assistant',
+          content: result.text,
+        };
+        let updated: SageMessage[] = [...nextMessages, reply];
+        if (result.stopReason === 'max_tokens') {
+          updated = [
+            ...updated,
+            { role: 'assistant', content: SAGE_TRUNCATION_UI_COPY, truncationUi: true },
+          ];
+        }
+        if (isMountedRef.current) {
+          setMessages(updated);
+          await saveConversation(updated);
+        }
+      } catch (e) {
+        const isAbort =
+          (e instanceof Error && (e.name === 'AbortError' || e.message.includes('aborted'))) ||
+          String(e).toLowerCase().includes('abort');
+        if (isAbort) {
+          return;
+        }
+        console.error('Sage chat error:', e);
+        const withError: SageMessage[] = [
+          ...nextMessages,
+          sageAssistantMessage(SAGE_API_USER_FRIENDLY_ERROR),
+        ];
+        if (isMountedRef.current) {
+          setMessages(withError);
+          await saveConversation(withError);
+        }
+      } finally {
+        if (requestAbortRef.current) requestAbortRef.current = null;
+        if (isMountedRef.current) setLoading(false);
+      }
+    },
+    [buildUserContext, abortInFlightRequest],
+  );
+
+  useEffect(() => {
+    if (!conversationReady) return;
+    const p = (route.params || {}) as {
+      fromMyVow?: boolean;
+      vowSageAutoSend?: boolean;
+      vowSageSessionKey?: number;
+      vowSageCategories?: string[];
+    };
+    if (!p.fromMyVow || !p.vowSageAutoSend) return;
+
+    const sessionKey = p.vowSageSessionKey ?? 0;
+    if (lastVowSageBootstrapSessionKeyRef.current === sessionKey) return;
+    lastVowSageBootstrapSessionKeyRef.current = sessionKey;
+
+    navigation.setParams({
+      vowSageAutoSend: false,
+    } as never);
+
+    const cats = p.vowSageCategories ?? [];
+    const bootstrap = buildVowBootstrapUserLine(cats);
+
+    setMessages((prev) => {
+      const next: SageMessage[] = [...prev, { role: 'user', content: bootstrap }];
+      queueMicrotask(() => {
+        void (async () => {
+          if (!isMountedRef.current) return;
+          setLoading(true);
+          await runSageReplyForMessages(next, { userTextForMaxTokens: bootstrap });
+        })();
+      });
+      return next;
+    });
+  }, [conversationReady, route.params, navigation, runSageReplyForMessages]);
 
   const sendMessage = async () => {
     if (isRecording) {
@@ -951,65 +1715,54 @@ export default function Sage() {
     setMessages(nextMessages);
     setLoading(true);
 
-    try {
-      console.log('Sage: calling AI API with conversation', nextMessages);
+    await runSageReplyForMessages(nextMessages, { userTextForMaxTokens: trimmed });
+  };
 
+  const handleTruncationContinue = useCallback(async () => {
+    if (loading || sendingReceipt) return;
+    const stripped = messagesRef.current.filter((m) => !m.truncationUi);
+    const continuation: SageMessage = {
+      role: 'user',
+      content: SAGE_CONTINUATION_USER_MESSAGE,
+    };
+    const nextMessages = [...stripped, continuation];
+    setMessages(nextMessages);
+    setLoading(true);
+    try {
       const userContext = await buildUserContext();
       const systemPrompt = userContext
         ? `${SYSTEM_PROMPT}\n\n${userContext}`
         : SYSTEM_PROMPT;
-
-      const messagesForApi = buildSageMessagesForApiContext(nextMessages);
+      const maxTokens = chooseMaxTokensForTruncationContinuation(nextMessages);
       abortInFlightRequest();
       const controller = new AbortController();
       requestAbortRef.current = controller;
-
-      const response = await fetch('https://myvow-fit-api.allison-spink.workers.dev', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      const result = await fetchSageAnthropicTextReply({
+        messages: nextMessages,
+        systemPrompt,
+        maxTokens,
         signal: controller.signal,
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-5',
-          max_tokens: 4096,
-          system: systemPrompt,
-          messages: messagesForApi.map(
-            (m): { role: 'user' | 'assistant'; content: string } => ({
-              role: m.role === 'user' ? 'user' : 'assistant',
-              content: m.content,
-            })
-          ),
-        }),
       });
-
-      if (!response.ok) {
-        const txt = await response.text();
-        console.error('Sage API error raw:', txt);
+      if (!result.ok) {
+        console.error('Sage continue API error raw:', result.rawErrorText);
         const withError: SageMessage[] = [
           ...nextMessages,
           sageAssistantMessage(SAGE_API_USER_FRIENDLY_ERROR),
         ];
-        setMessages(withError);
-        await saveConversation(withError);
-        setLoading(false);
+        if (isMountedRef.current) {
+          setMessages(withError);
+          await saveConversation(withError);
+        }
         return;
       }
-
-      const data = await response.json();
-      console.log('Sage API response:', data);
-      const contentBlocks = Array.isArray(data.content) ? data.content : [];
-      const text = contentBlocks
-        .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
-        .map((b: any) => b.text)
-        .join('\n')
-        .trim();
-
-      const reply: SageMessage = {
-        role: 'assistant',
-        content: text || '[No response]',
-      };
-      const updated: SageMessage[] = [...nextMessages, reply];
+      const reply: SageMessage = { role: 'assistant', content: result.text };
+      let updated: SageMessage[] = [...nextMessages, reply];
+      if (result.stopReason === 'max_tokens') {
+        updated = [
+          ...updated,
+          { role: 'assistant', content: SAGE_TRUNCATION_UI_COPY, truncationUi: true },
+        ];
+      }
       if (isMountedRef.current) {
         setMessages(updated);
         await saveConversation(updated);
@@ -1019,12 +1772,12 @@ export default function Sage() {
         (e instanceof Error && (e.name === 'AbortError' || e.message.includes('aborted'))) ||
         String(e).toLowerCase().includes('abort');
       if (isAbort) {
-        // If user left the screen / app backgrounded, skip noisy error + UI updates.
         return;
       }
-      console.error('Sage chat error:', e);
+      console.error('Sage continue error:', e);
       const withError: SageMessage[] = [
-        ...nextMessages,
+        ...stripped,
+        continuation,
         sageAssistantMessage(SAGE_API_USER_FRIENDLY_ERROR),
       ];
       if (isMountedRef.current) {
@@ -1035,7 +1788,7 @@ export default function Sage() {
       if (requestAbortRef.current) requestAbortRef.current = null;
       if (isMountedRef.current) setLoading(false);
     }
-  };
+  }, [loading, sendingReceipt, buildUserContext]);
 
 
   const handleSaveWorkout = async (workout: AIWorkout) => {
@@ -1378,15 +2131,19 @@ export default function Sage() {
         });
       }
 
-      const response = await fetch('https://myvow-fit-api.allison-spink.workers.dev', {
+      const receiptMaxTokens = looksLikeMealPlanGenerationRequest(userContent)
+        ? MEAL_PLAN_MAX_TOKENS
+        : SAGE_RECEIPT_DEFAULT_MAX_TOKENS;
+
+      const response = await fetch(SAGE_WORKER_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         signal: controller.signal,
         body: JSON.stringify({
-          model: 'claude-sonnet-4-5',
-          max_tokens: 1024,
+          model: SAGE_MODEL,
+          max_tokens: receiptMaxTokens,
           system: systemPrompt,
           messages: anthropicMessages,
         }),
@@ -1407,7 +2164,7 @@ export default function Sage() {
       }
 
       const data = await response.json();
-      console.log('Sage receipt API response:', data);
+      console.log('Sage receipt API response:', { stopReason: data.stop_reason });
       const contentBlocks = Array.isArray(data.content) ? data.content : [];
       const text = contentBlocks
         .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
@@ -1419,7 +2176,13 @@ export default function Sage() {
         role: 'assistant',
         content: text || '[No response]',
       };
-      const updated: SageMessage[] = [...nextMessages, reply];
+      let updated: SageMessage[] = [...nextMessages, reply];
+      if (data.stop_reason === 'max_tokens') {
+        updated = [
+          ...updated,
+          { role: 'assistant', content: SAGE_TRUNCATION_UI_COPY, truncationUi: true },
+        ];
+      }
       if (isMountedRef.current) {
         setMessages(updated);
         await saveConversation(updated);
@@ -1549,6 +2312,48 @@ export default function Sage() {
   };
 
   const renderItem = ({ item, index }: { item: SageMessage; index: number }) => {
+    if (item.truncationUi) {
+      return (
+        <View style={[styles.messageRow, { justifyContent: 'flex-start' }]}>
+          <View
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: 10,
+              paddingHorizontal: 4,
+            }}
+          >
+            <Text
+              style={{
+                color: theme.textSecondary ?? '#666',
+                fontSize: 14,
+                flexShrink: 1,
+              }}
+            >
+              {item.content}
+            </Text>
+            <TouchableOpacity
+              onPress={handleTruncationContinue}
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Continue truncated response"
+            >
+              <Text
+                style={{
+                  color: theme.text,
+                  fontWeight: '700',
+                  fontSize: 15,
+                  textDecorationLine: 'underline',
+                }}
+              >
+                Continue
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      );
+    }
     const isUser = item.role === 'user';
     const workout = item.role === 'assistant'
       ? extractWorkoutFromContent(item.content)
@@ -1564,29 +2369,30 @@ export default function Sage() {
     const mealPrep = item.role === 'assistant'
       ? extractMealPrepFromContent(item.content)
       : null;
+    const receiptProducts =
+      item.role === 'assistant' ? parseProductsTagNamesFromContent(item.content) : [];
     let displayText = isUser ? item.content : mealPlanParse.displayText;
     if (!isUser) {
       displayText = stripWorkoutBlock(displayText);
       displayText = stripMealPlanBlock(displayText);
       displayText = stripMealPrepBlock(displayText);
+      displayText = stripProductsTagsFromMessage(displayText);
     }
     const isGroceryList = !isUser && isGroceryListContent(item.content);
-    const alreadySavedAsVow = savedVowMessageIndexes.includes(index);
-    const canSaveAsVow =
+    const vowParse =
+      !isUser && fromMyVow && !workout && !mealPlan && !mealPrep && !isGroceryList
+        ? parseVowsFromSageMessage(displayText)
+        : { framing: '', vows: [] as string[] };
+    const hasVowCandidates = vowParse.vows.length > 0;
+    const prev = index > 0 ? messages[index - 1] : null;
+    const showSageLeaf =
       !isUser &&
-      fromMyVow &&
-      !workout &&
-      !mealPlan &&
-      !mealPrep &&
-      !isGroceryList &&
-      !alreadySavedAsVow;
-    return (
-      <View
-        style={[
-          styles.messageRow,
-          { justifyContent: isUser ? 'flex-end' : 'flex-start' },
-        ]}
-      >
+      (prev == null ||
+        prev.role !== 'assistant' ||
+        prev.truncationUi === true);
+
+    const bubbleAndSummaries = () => (
+      <>
         <View
           style={[
             styles.bubble,
@@ -1601,14 +2407,107 @@ export default function Sage() {
                 },
           ]}
         >
-          <Text
-            style={{
-              color: isUser ? theme.buttonText : theme.text,
-            }}
-          >
-            {displayText}
-          </Text>
+          {isUser ? (
+            <Text
+              style={{
+                color: theme.buttonText,
+              }}
+            >
+              {sageMessageBoldSegments(displayText)}
+            </Text>
+          ) : hasVowCandidates ? (
+            <View>
+              {vowParse.framing ? (
+                <Text style={{ color: theme.text }}>
+                  {sageMessageBoldSegments(vowParse.framing)}
+                </Text>
+              ) : null}
+              {vowParse.vows.map((vowText, vi) => {
+                const rowKey = `${index}:${vi}`;
+                const savedRow =
+                  !!savedVowSessionKeys[rowKey] || dbVowTitles.has(vowText.trim());
+                return (
+                  <TouchableOpacity
+                    key={`vow-candidate-${index}-${vi}`}
+                    activeOpacity={savedRow ? 1 : 0.72}
+                    disabled={savedRow}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Vow: ${vowText}`}
+                    accessibilityState={{ disabled: savedRow }}
+                    onPress={() => {
+                      if (savedRow) return;
+                      openSageCreateOwnFromSuggestedVow(vowText, index, vi);
+                    }}
+                    style={[
+                      {
+                        marginTop: vi === 0 ? (vowParse.framing ? 10 : 0) : 10,
+                        flexDirection: 'row',
+                        alignItems: 'flex-start',
+                        paddingVertical: 10,
+                        paddingHorizontal: 10,
+                        borderRadius: 10,
+                        borderWidth: 2,
+                        borderColor: 'transparent',
+                      },
+                      !savedRow && {
+                        marginLeft: 4,
+                        backgroundColor: 'rgba(168, 190, 168, 0.12)',
+                        borderColor: theme.border ?? '#e5e5e5',
+                      },
+                      savedRow && { opacity: 0.55 },
+                    ]}
+                  >
+                    <Ionicons
+                      name="leaf-outline"
+                      size={18}
+                      color={SAGE_VOW_ACCENT}
+                      style={{ marginRight: 8, marginTop: 2 }}
+                    />
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={{ color: theme.text }}>
+                        {sageMessageBoldSegments(vowText)}
+                      </Text>
+                      {savedRow ? (
+                        <Text
+                          style={{
+                            marginTop: 6,
+                            fontSize: 12,
+                            fontWeight: '700',
+                            color: SAGE_VOW_ACCENT,
+                          }}
+                        >
+                          Saved
+                        </Text>
+                      ) : null}
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          ) : (
+            <Text
+              style={{
+                color: theme.text,
+              }}
+            >
+              {sageMessageBoldSegments(displayText)}
+            </Text>
+          )}
         </View>
+        {!isUser &&
+          mealPlanBlockStartedNotClosed(item.content) &&
+          !mealPlan &&
+          !mealPrep && (
+            <Text
+              style={{
+                marginTop: 6,
+                fontSize: 13,
+                color: theme.textSecondary ?? '#888',
+              }}
+            >
+              {SAGE_MEALPLAN_INCOMPLETE_HINT}
+            </Text>
+          )}
         {workout && (
           <View style={styles.summaryContainer}>
             <View
@@ -1642,65 +2541,6 @@ export default function Sage() {
               </Text>
             </TouchableOpacity>
           </View>
-        )}
-        {canSaveAsVow && (
-          <TouchableOpacity
-            style={[
-              styles.summaryContainer,
-              { marginTop: 8 },
-            ]}
-            onPress={async () => {
-              try {
-                const now = new Date().toISOString();
-                await db.runAsync(
-                  'INSERT INTO Vows (title, category, status, created_at) VALUES (?, ?, ?, ?)',
-                  [displayText.slice(0, 300), 'Mindset', 'active', now],
-                );
-                setSavedVowMessageIndexes((prev) =>
-                  prev.includes(index) ? prev : [...prev, index],
-                );
-                const confirmation: SageMessage = {
-                  role: 'assistant',
-                  content: 'Saved this as a new vow. You can see it in MyVow.',
-                };
-                const updated = [...messages, confirmation];
-                setMessages(updated);
-                await saveConversation(updated);
-              } catch (e) {
-                console.error('Error saving vow from Sage:', e);
-                const confirmation: SageMessage = {
-                  role: 'assistant',
-                  content: 'I could not save this as a vow due to an error.',
-                };
-                const updated = [...messages, confirmation];
-                setMessages(updated);
-                await saveConversation(updated);
-              }
-            }}
-          >
-            <View
-              style={[
-                styles.summaryBox,
-                {
-                  backgroundColor: theme.card,
-                  borderColor: theme.border,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                },
-              ]}
-            >
-              <Ionicons
-                name="bookmark-outline"
-                size={18}
-                color={theme.text}
-                style={{ marginRight: 6 }}
-              />
-              <Text style={{ color: theme.text, fontWeight: '600' }}>
-                Save as Vow ✓
-              </Text>
-            </View>
-          </TouchableOpacity>
         )}
         {mealPlan && (
           <View style={styles.summaryContainer}>
@@ -1789,6 +2629,76 @@ export default function Sage() {
             </View>
           </View>
         )}
+        {!isUser && receiptProducts.length > 0 && !receiptProductsPanelSkipped[index] && (
+          <SageReceiptProductsPanel
+            key={`rp-${index}-${receiptProducts.join('\x1e')}`}
+            products={receiptProducts}
+            theme={theme}
+            savedFromDb={!!receiptProductsAllInDbByIndex[index]}
+            savedThisSession={!!receiptProductsPanelSavedSession[index]}
+            onSkip={() => setReceiptProductsPanelSkipped((p) => ({ ...p, [index]: true }))}
+            onConfirm={async (names) => {
+              for (const n of names) {
+                await upsertProduct(db, n);
+              }
+              setReceiptProductsPanelSavedSession((p) => ({ ...p, [index]: true }));
+              setReceiptProductsPanelTick((t) => t + 1);
+              Alert.alert(
+                'Products saved',
+                `Added ${names.length} ${names.length === 1 ? 'product' : 'products'} to your history.`,
+              );
+            }}
+          />
+        )}
+      </>
+    );
+
+    return (
+      <View
+        style={[
+          styles.messageRow,
+          { justifyContent: isUser ? 'flex-end' : 'flex-start' },
+        ]}
+      >
+        {isUser ? (
+          bubbleAndSummaries()
+        ) : (
+          <View
+            style={{
+              flexDirection: 'row',
+              alignItems: 'flex-start',
+              width: '100%',
+            }}
+          >
+            <View
+              style={{
+                width: SAGE_LEAF_AVATAR_DIAMETER + SAGE_LEAF_AVATAR_GAP,
+                alignItems: 'flex-start',
+              }}
+            >
+              {showSageLeaf ? (
+                <View
+                  style={{
+                    width: SAGE_LEAF_AVATAR_DIAMETER,
+                    height: SAGE_LEAF_AVATAR_DIAMETER,
+                    borderRadius: SAGE_LEAF_AVATAR_DIAMETER / 2,
+                    backgroundColor: SAGE_LEAF_FILL,
+                    marginRight: SAGE_LEAF_AVATAR_GAP,
+                    justifyContent: 'center',
+                    alignItems: 'center',
+                  }}
+                >
+                  <Ionicons
+                    name="leaf"
+                    size={SAGE_LEAF_ICON_SIZE}
+                    color="#FFFFFF"
+                  />
+                </View>
+              ) : null}
+            </View>
+            <View style={{ flex: 1, minWidth: 0 }}>{bubbleAndSummaries()}</View>
+          </View>
+        )}
       </View>
     );
   };
@@ -1808,6 +2718,7 @@ export default function Sage() {
             ref={listRef}
             data={messages}
             keyExtractor={(_, index) => String(index)}
+            extraData={vowFlatListExtra}
             renderItem={renderItem}
             contentContainerStyle={styles.listContent}
             onContentSizeChange={() => {
@@ -1967,6 +2878,18 @@ export default function Sage() {
           </TouchableOpacity>
         </View>
       )}
+      <CreateOwnVowModal
+        visible={sageCreateOwnModalVisible}
+        initialVowText={sageCreateOwnPrefill}
+        initialCategories={sageCreateOwnInitialCategories}
+        onClose={() => {
+          setSageCreateOwnModalVisible(false);
+          setSageCreateOwnPrefill('');
+          setSageCreateOwnInitialCategories(undefined);
+          sageVowSaveTargetRef.current = null;
+        }}
+        onSubmit={handleSageCreateOwnSubmit}
+      />
     </SafeAreaView>
   );
 }

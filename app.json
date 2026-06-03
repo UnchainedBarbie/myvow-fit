@@ -11,7 +11,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.anarcobarbie.myvowfit",
-        "infoPlist": {
+      "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSSpeechRecognitionUsageDescription": "MyVow Fit uses speech recognition so you can talk to Sage, your AI coach, hands-free."
       }
@@ -47,7 +47,8 @@
       "expo-sqlite",
       "expo-localization",
       "@react-native-community/datetimepicker",
-      "expo-font"
+      "expo-font",
+      "expo-iap"
     ],
     "experiments": {
       "typedRoutes": true,

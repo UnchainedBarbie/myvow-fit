@@ -21,6 +21,7 @@ import { useSQLiteContext } from 'expo-sqlite';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { initNutritionDb } from '../utils/nutritionDb';
+import { searchFatSecret } from '../services/fatsecret';
 import {
   getRelevantUnits,
   pickDefaultUnitForFood,
@@ -80,7 +81,7 @@ export type FoodResult = {
   carbs: number;
   fat: number;
   serving_size?: string | null;
-  source?: 'off' | 'usda';
+  source?: 'off' | 'usda' | 'curated' | 'fatsecret';
   /** Barcode + OFF: calories/macros are for one API serving (not per 100g). */
   macrosArePerServing?: boolean;
   /** Per-100g nutriments when present (barcode: used if user switches unit off “serving”). */
@@ -329,6 +330,49 @@ function inferDefaultMassUnitForBarcode(p: {
     return 'ml';
   }
   return 'g';
+}
+
+type CommonFoodRow = {
+  id: number;
+  name: string;
+  search_terms: string;
+  serving_size: number;
+  serving_unit: string;
+  calories: number;
+  protein_g: number;
+  carbs_g: number;
+  fat_g: number;
+};
+
+/**
+ * Curated CommonFoods row → FoodResult.
+ * Per-serving macros are stored on the row; per100g is derived so unit switches (g/ml) still scale correctly.
+ */
+function normalizeCommonFood(row: CommonFoodRow): FoodResult {
+  const servingSize = row.serving_size > 0 ? row.serving_size : 1;
+  const factor = 100 / servingSize;
+  const per100g = {
+    calories: Math.round(row.calories * factor),
+    protein: Math.round(row.protein_g * factor * 10) / 10,
+    carbs: Math.round(row.carbs_g * factor * 10) / 10,
+    fat: Math.round(row.fat_g * factor * 10) / 10,
+  };
+  const massUnit: 'g' | 'ml' =
+    String(row.serving_unit).trim().toLowerCase() === 'ml' ? 'ml' : 'g';
+  return {
+    code: `curated_${row.id}`,
+    food_name: row.name,
+    brand: null,
+    calories: Math.round(row.calories),
+    protein: Math.round(row.protein_g * 10) / 10,
+    carbs: Math.round(row.carbs_g * 10) / 10,
+    fat: Math.round(row.fat_g * 10) / 10,
+    serving_size: `${row.serving_size} ${row.serving_unit}`,
+    source: 'curated',
+    macrosArePerServing: true,
+    per100g,
+    defaultBarcodeMassUnit: massUnit,
+  };
 }
 
 /** USDA FoodData Central nutrient ids (search response). */
@@ -836,6 +880,57 @@ export default function AddFoodModal({
     setBarcodeScannerVisible(true);
   };
 
+  /**
+   * Fetch a barcode lookup with a 5s timeout per attempt and a single 500ms retry.
+   * Throws an Error tagged with the final failure reason (HTTP status or thrown message)
+   * only after BOTH attempts fail. "Product not in response" is NOT a fetch failure — the
+   * resolved JSON is returned and the caller decides whether `data.product` is missing.
+   */
+  const fetchBarcodeProductWithRetry = async (code: string): Promise<any> => {
+    const url = `https://world.openfoodfacts.org/api/v0/product/${code}.json`;
+    const attempt = async (): Promise<any> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) {
+          const err: any = new Error(`HTTP ${res.status}`);
+          err.status = res.status;
+          throw err;
+        }
+        return await res.json();
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const describeFailure = (e: any): string => {
+      if (e && typeof e === 'object') {
+        if (typeof e.status === 'number') return `HTTP ${e.status}`;
+        if (e.name === 'AbortError') return 'timeout after 5000ms';
+        if (typeof e.message === 'string' && e.message.length > 0) return e.message;
+      }
+      return 'unknown error';
+    };
+
+    try {
+      return await attempt();
+    } catch (firstErr) {
+      console.warn(
+        `[Barcode Lookup] Failed for UPC ${code}: ${describeFailure(firstErr)} (attempt 1, retrying)`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      try {
+        return await attempt();
+      } catch (secondErr) {
+        console.warn(
+          `[Barcode Lookup] Failed for UPC ${code}: ${describeFailure(secondErr)} (attempt 2, giving up)`,
+        );
+        throw secondErr;
+      }
+    }
+  };
+
   const onBarcodeScanned = async (event: { data?: string; nativeEvent?: { data?: string } }) => {
     const code = event.data ?? event.nativeEvent?.data ?? '';
     if (!code || lastScannedCode.current === code) return;
@@ -843,9 +938,8 @@ export default function AddFoodModal({
     setBarcodeScannerVisible(false);
     setBarcodeLoading(true);
     try {
-      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${code}.json`);
-      const data = await res.json();
-      const product = data.product;
+      const data = await fetchBarcodeProductWithRetry(code);
+      const product = data?.product;
       if (!product) {
         Alert.alert('Not found', `No product found for barcode ${code}.`);
         setBarcodeLoading(false);
@@ -862,86 +956,49 @@ export default function AddFoodModal({
     setBarcodeLoading(false);
   };
 
-  const runSearch = async () => {
-    const trimmedQuery = searchQuery.trim();
-    if (!trimmedQuery) return;
-    setSearching(true);
-    setSearchResults([]);
-    setSearchError(null);
+  const queryCommonFoods = async (rawQuery: string): Promise<FoodResult[]> => {
+    const lower = rawQuery.trim().toLowerCase();
+    if (!lower) return [];
+    try {
+      await initNutritionDb(db);
+      const wildcard = `%${lower}%`;
+      const prefix = `${lower}%`;
+      const rows = await db.getAllAsync<CommonFoodRow>(
+        `SELECT id, name, search_terms, serving_size, serving_unit, calories, protein_g, carbs_g, fat_g
+         FROM CommonFoods
+         WHERE LOWER(name) LIKE ? OR search_terms LIKE ?
+         ORDER BY
+           CASE
+             WHEN LOWER(name) = ? THEN 0
+             WHEN LOWER(name) LIKE ? THEN 1
+             ELSE 2
+           END,
+           name ASC
+         LIMIT 10;`,
+        [wildcard, wildcard, lower, prefix],
+      );
+      return rows.map(normalizeCommonFood);
+    } catch (e) {
+      console.log('CommonFoods query error:', e);
+      return [];
+    }
+  };
+
+  const runUsdaSearch = async (
+    trimmedQuery: string,
+    signal: AbortSignal,
+  ): Promise<
+    | { ok: true; results: FoodResult[] }
+    | { ok: false; errorMessage: string }
+  > => {
     const q = encodeURIComponent(trimmedQuery);
     const usdaUrl = `https://api.nal.usda.gov/fdc/v1/foods/search?query=${q}&api_key=${process.env.EXPO_PUBLIC_USDA_API_KEY}&pageSize=20&dataType=Branded,SR%20Legacy`;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), FOOD_SEARCH_TIMEOUT_MS);
-    const signal = controller.signal;
-
-    const parseAndHandleResponse = (
-      res: Response,
-      responseText: string,
-      url: string,
-    ): { ok: true; data: any } | { ok: false } => {
-      if (res.status === 503) {
-        setSearchError(SEARCH_SLOW_OR_UNAVAILABLE_MESSAGE);
-        setSearchResults([]);
-        return { ok: false };
-      }
-
-      let data: any;
-      try {
-        data = responseText ? JSON.parse(responseText) : null;
-      } catch (parseErr) {
-        console.error('[AddFoodModal] USDA search: invalid JSON', {
-          url,
-          status: res.status,
-          statusText: res.statusText,
-          responseText,
-          parseErr,
-        });
-        setSearchError(
-          `Search returned an invalid response (HTTP ${res.status}).`,
-        );
-        setSearchResults([]);
-        return { ok: false };
-      }
-
-      if (!res.ok) {
-        console.error('[AddFoodModal] USDA search: HTTP error', {
-          url,
-          status: res.status,
-          statusText: res.statusText,
-          response: data,
-          responseText,
-        });
-        setSearchError(`Search failed (HTTP ${res.status}).`);
-        setSearchResults([]);
-        return { ok: false };
-      }
-
-      return { ok: true, data };
-    };
-
+    let res: Response;
+    let responseText: string;
     try {
-      const res = await fetch(usdaUrl, { signal });
-      const responseText = await res.text();
-      const parsed = parseAndHandleResponse(res, responseText, usdaUrl);
-      if (!parsed.ok) {
-        return;
-      }
-
-      const rawFoods = Array.isArray(parsed.data?.foods) ? parsed.data.foods : [];
-      const normalized = rawFoods
-        .map((row: Record<string, unknown>) => normalizeUsdaSearchFood(row))
-        .filter((f): f is FoodResult => f != null);
-
-      if (normalized.length > 0) {
-        setSearchResults(normalized);
-      } else {
-        console.error('[AddFoodModal] USDA search: no foods in response', {
-          url: usdaUrl,
-          response: parsed.data,
-        });
-        setSearchResults([]);
-      }
+      res = await fetch(usdaUrl, { signal });
+      responseText = await res.text();
     } catch (e) {
       const isAbort =
         (e instanceof Error && e.name === 'AbortError') ||
@@ -953,18 +1010,126 @@ export default function AddFoodModal({
         error: e,
         aborted: isAbort,
       });
-      if (isAbort) {
-        setSearchError(SEARCH_SLOW_OR_UNAVAILABLE_MESSAGE);
-      } else {
-        setSearchError(
-          'Search request failed. Check your connection and try again.',
-        );
-      }
-      setSearchResults([]);
+      return {
+        ok: false,
+        errorMessage: isAbort
+          ? SEARCH_SLOW_OR_UNAVAILABLE_MESSAGE
+          : 'Search request failed. Check your connection and try again.',
+      };
+    }
+
+    if (res.status === 503) {
+      return { ok: false, errorMessage: SEARCH_SLOW_OR_UNAVAILABLE_MESSAGE };
+    }
+
+    let data: any;
+    try {
+      data = responseText ? JSON.parse(responseText) : null;
+    } catch (parseErr) {
+      console.error('[AddFoodModal] USDA search: invalid JSON', {
+        url: usdaUrl,
+        status: res.status,
+        statusText: res.statusText,
+        responseText,
+        parseErr,
+      });
+      return {
+        ok: false,
+        errorMessage: `Search returned an invalid response (HTTP ${res.status}).`,
+      };
+    }
+
+    if (!res.ok) {
+      console.error('[AddFoodModal] USDA search: HTTP error', {
+        url: usdaUrl,
+        status: res.status,
+        statusText: res.statusText,
+        response: data,
+        responseText,
+      });
+      return {
+        ok: false,
+        errorMessage: `Search failed (HTTP ${res.status}).`,
+      };
+    }
+
+    const rawFoods = Array.isArray(data?.foods) ? data.foods : [];
+    const normalized = rawFoods
+      .map((row: Record<string, unknown>) => normalizeUsdaSearchFood(row))
+      .filter((f: FoodResult | null): f is FoodResult => f != null);
+    if (normalized.length === 0) {
+      console.error('[AddFoodModal] USDA search: no foods in response', {
+        url: usdaUrl,
+        response: data,
+      });
+    }
+    return { ok: true, results: normalized };
+  };
+
+  const runSearch = async () => {
+    const trimmedQuery = searchQuery.trim();
+    if (!trimmedQuery) return;
+    setSearching(true);
+    setSearchError(null);
+
+    // Tier 1: curated CommonFoods — show immediately while remote sources load.
+    const curatedAll = await queryCommonFoods(trimmedQuery);
+    const curatedResults = curatedAll.slice(0, 10);
+    setSearchResults(curatedResults);
+    const curatedNameSet = new Set(
+      curatedResults.map((r) => r.food_name.trim().toLowerCase()),
+    );
+
+    // Tiers 2 & 3: FatSecret + USDA in parallel under one timeout/abort.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FOOD_SEARCH_TIMEOUT_MS);
+    const signal = controller.signal;
+
+    const fatsecretPromise = searchFatSecret(trimmedQuery, signal).catch(
+      (e) => {
+        console.error('[AddFoodModal] FatSecret search failed:', e);
+        return [] as FoodResult[];
+      },
+    );
+    const usdaPromise = runUsdaSearch(trimmedQuery, signal);
+
+    let fatsecretRaw: FoodResult[] = [];
+    let usdaOutcome:
+      | { ok: true; results: FoodResult[] }
+      | { ok: false; errorMessage: string } = { ok: true, results: [] };
+    try {
+      [fatsecretRaw, usdaOutcome] = await Promise.all([
+        fatsecretPromise,
+        usdaPromise,
+      ]);
     } finally {
       clearTimeout(timeoutId);
-      setSearching(false);
     }
+
+    const fatsecretResults = fatsecretRaw
+      .filter(
+        (r) => !curatedNameSet.has(r.food_name.trim().toLowerCase()),
+      )
+      .slice(0, 15);
+
+    const usdaResults = usdaOutcome.ok
+      ? usdaOutcome.results
+          .filter(
+            (r) => !curatedNameSet.has(r.food_name.trim().toLowerCase()),
+          )
+          .slice(0, 15)
+      : [];
+
+    setSearchResults([...curatedResults, ...fatsecretResults, ...usdaResults]);
+
+    if (
+      curatedResults.length === 0 &&
+      fatsecretResults.length === 0 &&
+      !usdaOutcome.ok
+    ) {
+      setSearchError(usdaOutcome.errorMessage);
+    }
+    setSearching(false);
   };
 
   const clearSearch = useCallback(() => {
@@ -1165,9 +1330,7 @@ export default function AddFoodModal({
                         setShowQuantityModal(true);
                       }}
                     >
-                      <View style={styles.foodNameRow}>
-                        <Text style={[styles.foodName, { color: theme.text }]}>{item.food_name}</Text>
-                      </View>
+                      <Text style={[styles.foodName, { color: theme.text }]}>{item.food_name}</Text>
                       <Text style={[styles.foodBrand, { color: theme.textSecondary }]}>{item.brand}</Text>
                       <Text style={[styles.foodMacros, { color: theme.textSecondary }]}>
                         {item.calories} cal · P {item.protein}g · C {item.carbs}g · F {item.fat}g
@@ -1505,7 +1668,6 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   foodName: { fontSize: 16, fontWeight: '600' },
-  foodNameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   foodBrand: { fontSize: 13, marginTop: 4 },
   foodMacros: { fontSize: 12, marginTop: 2 },
   emptyText: { textAlign: 'center', paddingVertical: 24, fontSize: 14 },

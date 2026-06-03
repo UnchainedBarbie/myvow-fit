@@ -55,6 +55,7 @@ export interface LoggedExercise {
   web_link: string | null; // Web link (copied at the time of logging)
   exercise_notes: string | null; // Exercise notes (copied at the time of logging)
   rest_seconds: number | null; // Rest time between sets in seconds
+  sort_order?: number | null; // Display order for this workout_log instance only
 }
 
 // Interface for the Weight_Log table

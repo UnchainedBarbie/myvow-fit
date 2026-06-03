@@ -14,15 +14,10 @@ import {
   ActivityIndicator,
   Alert,
   Dimensions,
-  Keyboard,
-  KeyboardAvoidingView,
   Modal,
-  Platform,
   ScrollView,
-  Share,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -30,6 +25,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Circle } from 'react-native-svg';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { useTheme } from '../context/ThemeContext';
+import {
+  CreateOwnVowModal,
+  CATEGORY_DISPLAY_LABELS,
+  WRITE_CATEGORY_OPTIONS,
+} from '../components/CreateOwnVowModal';
 import { initVowsDb, type VowCheckInRow, type VowRow } from '../utils/initVowsDb';
 import { getLocalWeekMondaySundayYmd, localTodayYmd } from '../utils/localDateYmd';
 
@@ -113,30 +113,6 @@ const SUGGESTED_VOW_GROUPS = [
   },
 ] as const;
 
-/** User-selectable categories when creating a vow (stored comma-separated in DB). */
-const WRITE_CATEGORY_OPTIONS = [
-  'NervousSystem',
-  'Nutrition',
-  'BodyCare',
-  'Mindset',
-  'Sleep',
-  'Movement',
-  'Recovery',
-  'Fitness',
-] as const;
-
-/** Friendly labels for chips and vow subtitles. */
-const CATEGORY_DISPLAY_LABELS: Record<string, string> = {
-  NervousSystem: 'Nervous system & stress',
-  Nutrition: 'Nutrition & gut',
-  BodyCare: 'Body care',
-  Mindset: 'Mindset',
-  Sleep: 'Sleep',
-  Movement: 'Movement',
-  Recovery: 'Recovery',
-  Fitness: 'Fitness',
-};
-
 /** Order for picking which section list a vow appears under (first match wins). */
 const VOW_SECTION_ORDER = [
   'Fitness',
@@ -167,15 +143,6 @@ function formatVowCategoriesSubtitle(raw: string): string {
   const tokens = parseVowCategoryTokens(raw);
   if (tokens.length === 0) return 'Custom';
   return tokens.map((t) => CATEGORY_DISPLAY_LABELS[t] ?? t).join(' · ');
-}
-
-function sortWriteCategories(cats: string[]): string[] {
-  const uniq = [...new Set(cats)];
-  return uniq.sort(
-    (a, b) =>
-      WRITE_CATEGORY_OPTIONS.indexOf(a as (typeof WRITE_CATEGORY_OPTIONS)[number]) -
-      WRITE_CATEGORY_OPTIONS.indexOf(b as (typeof WRITE_CATEGORY_OPTIONS)[number]),
-  );
 }
 
 // Circular progress ring (0–100). Always visible. Uses SVG for a proper arc.
@@ -228,51 +195,54 @@ export default function MyVow() {
   const [suggestedModalVisible, setSuggestedModalVisible] = useState(false);
   /** Which suggested-vow accordion sections are expanded (by group id). */
   const [suggestedExpandedIds, setSuggestedExpandedIds] = useState<Set<string>>(new Set());
-  const [writeModalVisible, setWriteModalVisible] = useState(false);
+  const [createOwnVowModalVisible, setCreateOwnVowModalVisible] = useState(false);
+  const [createOwnVowInitialText, setCreateOwnVowInitialText] = useState<string | undefined>(
+    undefined,
+  );
+  const [createOwnVowInitialCategories, setCreateOwnVowInitialCategories] = useState<
+    string[] | undefined
+  >(undefined);
+  const [vowSageCategoryPickerVisible, setVowSageCategoryPickerVisible] = useState(false);
+  const [vowSagePickerSelection, setVowSagePickerSelection] = useState<string | 'help' | null>(null);
   const [detailModalVisible, setDetailModalVisible] = useState(false);
   const [selectedVow, setSelectedVow] = useState<VowRow | null>(null);
   const [checkIns, setCheckIns] = useState<VowCheckInRow[]>([]);
-
-  const [writeText, setWriteText] = useState('');
-  const [writeWhy, setWriteWhy] = useState('');
-  const [writeCategories, setWriteCategories] = useState<string[]>(['Movement']);
-  const [writeFrequency, setWriteFrequency] = useState<string>('3');
-  const [writeKeyboardHeight, setWriteKeyboardHeight] = useState(0);
 
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
   const [weeklyReport, setWeeklyReport] = useState<
     { vow_id: number; title: string; frequency: number; actual: number; met: boolean }[]
   >([]);
 
-  const loadWeeklyReport = useCallback(
-    async (allVows: VowRow[]) => {
-      // Counts are read from persisted VowCheckIns only (not reset on launch); recomputed when screen loads.
-      const { weekStartYmd: weekStart, weekEndYmd: weekEnd } = getLocalWeekMondaySundayYmd();
+  const loadWeeklyReport = useCallback(async () => {
+    await initVowsDb(db);
+    const { weekStartYmd: weekStart, weekEndYmd: weekEnd } = getLocalWeekMondaySundayYmd();
 
-      const rows = await db.getAllAsync<{ vow_id: number; count: number }>(
+    const [vowRows, countRows] = await Promise.all([
+      db.getAllAsync<{ vow_id: number; title: string; frequency_per_week: number }>(
+        'SELECT vow_id, title, frequency_per_week FROM Vows WHERE COALESCE(frequency_per_week, 0) > 0 ORDER BY created_at DESC',
+      ),
+      db.getAllAsync<{ vow_id: number; count: number }>(
         'SELECT vow_id, COUNT(*) as count FROM VowCheckIns WHERE check_in_date BETWEEN ? AND ? GROUP BY vow_id',
-        [weekStart, weekEnd]
-      );
-      const map = new Map<number, number>();
-      rows.forEach((r) => map.set(r.vow_id, r.count));
+        [weekStart, weekEnd],
+      ),
+    ]);
 
-      const report = allVows
-        .filter((v) => (v.frequency_per_week ?? 0) > 0)
-        .map((v) => {
-          const freq = v.frequency_per_week ?? 0;
-          const actual = map.get(v.vow_id) ?? 0;
-          return {
-            vow_id: v.vow_id,
-            title: v.title,
-            frequency: freq,
-            actual,
-            met: actual >= freq,
-          };
-        });
-      setWeeklyReport(report);
-    },
-    [db],
-  );
+    const map = new Map<number, number>();
+    countRows.forEach((r) => map.set(r.vow_id, r.count));
+
+    const report = vowRows.map((v) => {
+      const freq = v.frequency_per_week ?? 0;
+      const actual = map.get(v.vow_id) ?? 0;
+      return {
+        vow_id: v.vow_id,
+        title: v.title,
+        frequency: freq,
+        actual,
+        met: actual >= freq,
+      };
+    });
+    setWeeklyReport(report);
+  }, [db]);
 
   const loadVows = useCallback(async () => {
     await initVowsDb(db);
@@ -283,7 +253,7 @@ export default function MyVow() {
     setActiveVows(all.filter((v) => v.status === 'active'));
     setCompletedVows(all.filter((v) => v.status === 'completed'));
     setBrokenVows(all.filter((v) => v.status === 'broken'));
-    await loadWeeklyReport(all);
+    await loadWeeklyReport();
     setLoading(false);
   }, [db, loadWeeklyReport]);
 
@@ -340,26 +310,16 @@ export default function MyVow() {
     Alert.alert('Vow paused', 'This vow has been moved to your history.');
   };
 
-  const checkInToday = async (vow: VowRow) => {
-    const date = localTodayYmd();
-    const now = new Date().toISOString();
-    const existing = await db.getAllAsync<{ check_in_id: number }>(
-      'SELECT check_in_id FROM VowCheckIns WHERE vow_id = ? AND check_in_date = ?',
-      [vow.vow_id, date]
-    );
-    if (existing.length > 0) {
-      Alert.alert('Already checked in', "You've already logged a check-in for today.");
-      return;
-    }
-    await db.runAsync(
-      'INSERT INTO VowCheckIns (vow_id, check_in_date, kept, created_at) VALUES (?, ?, 1, ?)',
-      [vow.vow_id, date, now]
-    );
-    loadCheckIns(vow.vow_id);
-    Alert.alert('Check-in logged', 'Your check-in for this vow has been recorded.');
-  };
+  const deleteCheckInImmediate = useCallback(
+    async (checkInId: number, vowId: number) => {
+      await db.runAsync('DELETE FROM VowCheckIns WHERE check_in_id = ?', [checkInId]);
+      await loadCheckIns(vowId);
+      await loadWeeklyReport();
+    },
+    [db, loadCheckIns, loadWeeklyReport],
+  );
 
-  const deleteCheckIn = async (checkInId: number, vowId: number) => {
+  const deleteCheckIn = (checkInId: number, vowId: number) => {
     Alert.alert(
       'Delete check-in?',
       'This will remove this check-in from your history.',
@@ -368,20 +328,92 @@ export default function MyVow() {
         {
           text: 'Delete',
           style: 'destructive',
-          onPress: async () => {
-            await db.runAsync('DELETE FROM VowCheckIns WHERE check_in_id = ?', [checkInId]);
-            await loadCheckIns(vowId);
+          onPress: () => {
+            void deleteCheckInImmediate(checkInId, vowId);
           },
         },
       ],
     );
   };
 
-  const shareVow = async (vow: VowRow) => {
+  const toggleCheckInKept = useCallback(
+    (row: VowCheckInRow, vowId: number) => {
+      const nextKept = row.kept ? 0 : 1;
+      const nextLabel = nextKept ? 'Kept' : 'Missed';
+      Alert.alert(
+        `Mark as ${nextLabel}?`,
+        `Update this check-in (${row.check_in_date}) to ${nextLabel}?`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Update',
+            onPress: () => {
+              void (async () => {
+                try {
+                  await db.runAsync('UPDATE VowCheckIns SET kept = ? WHERE check_in_id = ?', [
+                    nextKept,
+                    row.check_in_id,
+                  ]);
+                  await loadCheckIns(vowId);
+                  await loadWeeklyReport();
+                } catch (err) {
+                  console.error('toggleCheckInKept failed', err);
+                  Alert.alert('Could not update', 'Please try again.');
+                }
+              })();
+            },
+          },
+        ],
+      );
+    },
+    [db, loadCheckIns, loadWeeklyReport],
+  );
+
+  const checkInToday = async (vow: VowRow) => {
+    const date = localTodayYmd();
+    const now = new Date().toISOString();
+    await initVowsDb(db);
     try {
-      await Share.share({ message: `My vow: ${vow.title}`, title: 'MyVow Fit' });
+      await db.execAsync('BEGIN TRANSACTION');
+      const existing = await db.getAllAsync<{ check_in_id: number }>(
+        'SELECT check_in_id FROM VowCheckIns WHERE vow_id = ? AND check_in_date = ?',
+        [vow.vow_id, date],
+      );
+      if (existing.length > 0) {
+        await db.execAsync('ROLLBACK');
+        Alert.alert('Already checked in', "You've already logged a check-in for today.");
+        return;
+      }
+      const result = await db.runAsync(
+        'INSERT INTO VowCheckIns (vow_id, check_in_date, kept, created_at) VALUES (?, ?, 1, ?)',
+        [vow.vow_id, date, now],
+      );
+      await db.execAsync('COMMIT');
+      const checkInId = Number(result.lastInsertRowId);
+      await loadCheckIns(vow.vow_id);
+      await loadWeeklyReport();
+      Alert.alert('Checked in for today ✓', undefined, [
+        {
+          text: 'Undo',
+          onPress: () => {
+            void deleteCheckInImmediate(checkInId, vow.vow_id);
+          },
+        },
+        { text: 'OK', style: 'cancel' },
+      ]);
     } catch (e) {
-      if ((e as any)?.message !== 'User did not share') Alert.alert('Error', 'Could not open share.');
+      try {
+        await db.execAsync('ROLLBACK');
+      } catch {
+        // ignore rollback errors
+      }
+      const msg = String(e ?? '');
+      if (/UNIQUE constraint failed/i.test(msg) || /SQLITE_CONSTRAINT_UNIQUE/i.test(msg)) {
+        Alert.alert('Already checked in', "You've already logged a check-in for today.");
+        return;
+      }
+      console.error('checkInToday failed', e);
+      Alert.alert('Could not log check-in', 'Please try again.');
     }
   };
 
@@ -418,69 +450,37 @@ export default function MyVow() {
 
   // Open write modal with suggestion pre-filled so user can edit before saving
   const openAddSuggestedVow = (title: string, category: string) => {
-    setWriteText(title);
-    setWriteWhy('');
-    setWriteCategories([category]);
-    setWriteFrequency('3');
+    setCreateOwnVowInitialText(title);
+    setCreateOwnVowInitialCategories([category]);
     setSuggestedModalVisible(false);
-    setWriteModalVisible(true);
+    setCreateOwnVowModalVisible(true);
   };
 
   const openWriteOwnModal = () => {
-    setWriteText('');
-    setWriteWhy('');
-    setWriteCategories(['Movement']);
-    setWriteFrequency('3');
-    setWriteModalVisible(true);
+    setCreateOwnVowInitialText(undefined);
+    setCreateOwnVowInitialCategories(undefined);
+    setCreateOwnVowModalVisible(true);
   };
 
-  useEffect(() => {
-    if (!writeModalVisible) {
-      setWriteKeyboardHeight(0);
-      return;
-    }
-    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
-    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
-    const onShow = Keyboard.addListener(showEvent, (e) => {
-      setWriteKeyboardHeight(e.endCoordinates?.height ?? 0);
-    });
-    const onHide = Keyboard.addListener(hideEvent, () => setWriteKeyboardHeight(0));
-    return () => {
-      onShow.remove();
-      onHide.remove();
-    };
-  }, [writeModalVisible]);
-
-  const toggleWriteCategory = (c: string) => {
-    setWriteCategories((prev) => {
-      if (prev.includes(c)) {
-        if (prev.length <= 1) return prev;
-        return sortWriteCategories(prev.filter((x) => x !== c));
-      }
-      return sortWriteCategories([...prev, c]);
-    });
+  const openVowSageCategoryPicker = () => {
+    setVowSagePickerSelection(null);
+    setVowSageCategoryPickerVisible(true);
   };
 
-  const saveWriteOwn = () => {
-    if (!writeText.trim()) return;
-    if (writeCategories.length === 0) {
-      Alert.alert('Category', 'Select at least one category.');
-      return;
-    }
-    const freq = Math.max(0, parseInt(writeFrequency, 10) || 0);
-    const categoryCsv = sortWriteCategories(writeCategories).join(',');
-    addVow(writeText.trim(), categoryCsv, freq, writeWhy.trim() || null);
-    setWriteText('');
-    setWriteWhy('');
-    setWriteCategories(['Movement']);
-    setWriteFrequency('3');
-    setWriteModalVisible(false);
+  const closeVowSageCategoryPicker = () => {
+    setVowSageCategoryPickerVisible(false);
+    setVowSagePickerSelection(null);
   };
 
-  const openSageForVows = () => {
+  const confirmVowSageCategoryAndNavigate = () => {
+    if (vowSagePickerSelection === null) return;
+    const categories = vowSagePickerSelection === 'help' ? [] : [vowSagePickerSelection];
+    closeVowSageCategoryPicker();
     navigation.navigate('Sage', {
-      initialPrompt: "I'd like to create this week's vows. Help me with a workout focus and nutrition focus for this week—keep it simple and doable.",
       fromMyVow: true,
+      vowSageCategories: categories,
+      vowSageAutoSend: true,
+      vowSageSessionKey: Date.now(),
     });
   };
 
@@ -518,7 +518,7 @@ export default function MyVow() {
             Ready to create this week's vows? I can suggest a workout and nutrition focus—or you can write your own promise.
           </Text>
           <View style={styles.ctaRow}>
-            <TouchableOpacity style={[styles.ctaPrimary, { backgroundColor: SAGE }]} onPress={openSageForVows}>
+            <TouchableOpacity style={[styles.ctaPrimary, { backgroundColor: SAGE }]} onPress={openVowSageCategoryPicker}>
               <Ionicons name="sparkles" size={18} color="#fff" />
               <Text style={styles.ctaPrimaryText}>Generate with Sage</Text>
             </TouchableOpacity>
@@ -727,6 +727,83 @@ export default function MyVow() {
         )}
       </ScrollView>
 
+      <Modal visible={vowSageCategoryPickerVisible} transparent animationType="slide">
+        <View style={[styles.suggestedModalRoot, { paddingTop: headerHeight }]}>
+          <View style={[styles.suggestedModalSheet, { backgroundColor: theme.background }]}>
+            <View style={styles.modalHeader}>
+              <Text style={[styles.modalTitle, { color: theme.text }]}>What kind of vow?</Text>
+              <TouchableOpacity onPress={closeVowSageCategoryPicker} accessibilityLabel="Close">
+                <Ionicons name="close" size={24} color={theme.text} />
+              </TouchableOpacity>
+            </View>
+            <Text style={[styles.suggestedIntro, { color: theme.text }]}>
+              Pick a category and Sage will suggest options.
+            </Text>
+            <ScrollView
+              style={styles.suggestedModalScroll}
+              contentContainerStyle={{ paddingBottom: 12 }}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              <View style={styles.categoryRow}>
+                {WRITE_CATEGORY_OPTIONS.map((c) => {
+                  const selected = vowSagePickerSelection === c;
+                  return (
+                    <TouchableOpacity
+                      key={c}
+                      style={[
+                        styles.categoryChip,
+                        selected && { backgroundColor: SAGE, borderColor: SAGE },
+                        { borderColor: theme.border },
+                      ]}
+                      onPress={() => setVowSagePickerSelection(c)}
+                      activeOpacity={0.85}
+                    >
+                      <Text style={[styles.categoryChipText, { color: selected ? '#fff' : theme.text }]}>
+                        {CATEGORY_DISPLAY_LABELS[c] ?? c}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+                <TouchableOpacity
+                  style={[
+                    styles.categoryChip,
+                    vowSagePickerSelection === 'help' && { backgroundColor: SAGE, borderColor: SAGE },
+                    { borderColor: theme.border },
+                  ]}
+                  onPress={() => setVowSagePickerSelection('help')}
+                  activeOpacity={0.85}
+                >
+                  <Text
+                    style={[
+                      styles.categoryChipText,
+                      { color: vowSagePickerSelection === 'help' ? '#fff' : theme.text },
+                    ]}
+                  >
+                    Help me decide
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
+            <View style={{ paddingBottom: Math.max(insets.bottom, 16), paddingTop: 8 }}>
+              <TouchableOpacity
+                style={[
+                  styles.ctaPrimary,
+                  {
+                    backgroundColor: SAGE,
+                    opacity: vowSagePickerSelection === null ? 0.45 : 1,
+                  },
+                ]}
+                disabled={vowSagePickerSelection === null}
+                onPress={confirmVowSageCategoryAndNavigate}
+              >
+                <Text style={styles.ctaPrimaryText}>Continue with Sage</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       {/* Suggested vows: full area below stack header (MyVow Fit) */}
       <Modal visible={suggestedModalVisible} transparent animationType="slide">
         <View style={[styles.suggestedModalRoot, { paddingTop: headerHeight }]}>
@@ -777,111 +854,19 @@ export default function MyVow() {
         </View>
       </Modal>
 
-      <Modal
-        visible={writeModalVisible}
-        animationType="slide"
-        presentationStyle="fullScreen"
-        onRequestClose={() => setWriteModalVisible(false)}
-      >
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          style={[styles.writeModalRoot, { backgroundColor: theme.background }]}
-        >
-          <View
-            style={[
-              styles.writeModalInner,
-              { paddingTop: insets.top + 8, paddingBottom: 0 },
-            ]}
-          >
-            <View style={styles.modalHeader}>
-              <Text style={[styles.modalTitle, { color: theme.text }]}>Create your own vow</Text>
-              <TouchableOpacity onPress={() => setWriteModalVisible(false)} hitSlop={12}>
-                <Ionicons name="close" size={24} color={theme.text} />
-              </TouchableOpacity>
-            </View>
-            <ScrollView
-              style={styles.writeModalScroll}
-              contentContainerStyle={{
-                paddingHorizontal: 4,
-                paddingBottom: 24 + writeKeyboardHeight + Math.max(insets.bottom, 8),
-                flexGrow: 1,
-              }}
-              keyboardShouldPersistTaps="handled"
-              keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
-              showsVerticalScrollIndicator
-            >
-              <Text style={[styles.label, { color: theme.text }]}>Your vow</Text>
-              <TextInput
-                style={[styles.input, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]}
-                value={writeText}
-                onChangeText={setWriteText}
-                placeholder="e.g. Move for 30 minutes this week"
-                placeholderTextColor="#888"
-                multiline
-              />
-              <Text style={[styles.label, { color: theme.text }]}>Why</Text>
-              <Text style={[styles.labelHint, { color: theme.textSecondary }]}>
-                What matters about this promise? (Optional — helps you stay connected when it gets hard.)
-              </Text>
-              <TextInput
-                style={[styles.input, styles.whyInput, { backgroundColor: theme.card, color: theme.text, borderColor: theme.border }]}
-                value={writeWhy}
-                onChangeText={setWriteWhy}
-                placeholder="e.g. I feel calmer when I move, and I want to trust myself again."
-                placeholderTextColor="#888"
-                multiline
-                textAlignVertical="top"
-              />
-              <Text style={[styles.label, { color: theme.text }]}>Times per week (goal)</Text>
-              <TextInput
-                style={[
-                  styles.input,
-                  { backgroundColor: theme.card, color: theme.text, borderColor: theme.border, minHeight: 0 },
-                ]}
-                value={writeFrequency}
-                onChangeText={setWriteFrequency}
-                placeholder="e.g. 3"
-                placeholderTextColor="#888"
-                keyboardType="number-pad"
-              />
-              <Text style={[styles.label, { color: theme.text }]}>Categories</Text>
-              <Text style={[styles.labelHint, { color: theme.textSecondary }]}>
-                Select all that apply (e.g. Movement and Mindset).
-              </Text>
-                  <View style={styles.categoryRow}>
-                    {WRITE_CATEGORY_OPTIONS.map((c) => {
-                      const selected = writeCategories.includes(c);
-                      return (
-                      <TouchableOpacity
-                        key={c}
-                        style={[styles.categoryChip, selected && { backgroundColor: SAGE }, { borderColor: theme.border }]}
-                        onPress={() => toggleWriteCategory(c)}
-                      >
-                        <Text style={[styles.categoryChipText, { color: selected ? '#fff' : theme.text }]}>
-                          {CATEGORY_DISPLAY_LABELS[c] ?? c}
-                        </Text>
-                      </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-            </ScrollView>
-            <View
-              style={[
-                styles.writeModalFooter,
-                {
-                  borderTopColor: theme.border,
-                  backgroundColor: theme.background,
-                  paddingBottom: Math.max(16, insets.bottom),
-                },
-              ]}
-            >
-              <TouchableOpacity style={[styles.saveBtn, { backgroundColor: SAGE }]} onPress={saveWriteOwn}>
-                <Text style={styles.saveBtnText}>Save vow</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
+      <CreateOwnVowModal
+        visible={createOwnVowModalVisible}
+        initialVowText={createOwnVowInitialText}
+        initialCategories={createOwnVowInitialCategories}
+        onClose={() => {
+          setCreateOwnVowModalVisible(false);
+          setCreateOwnVowInitialText(undefined);
+          setCreateOwnVowInitialCategories(undefined);
+        }}
+        onSubmit={async (p) => {
+          await addVow(p.title, p.categoryCsv, p.frequencyPerWeek, p.whyText);
+        }}
+      />
 
       <Modal visible={detailModalVisible} transparent animationType="slide">
         <View style={styles.modalOverlay}>
@@ -894,6 +879,11 @@ export default function MyVow() {
             </View>
             {selectedVow && (
               <>
+                {selectedVow.why_text?.trim() ? (
+                  <Text style={[styles.detailWhyText, { color: theme.textSecondary }]}>
+                    {selectedVow.why_text.trim()}
+                  </Text>
+                ) : null}
                 <Text style={[styles.detailMeta, { color: theme.text }]}>
                   {formatVowCategoriesSubtitle(selectedVow.category)} · {selectedVow.status}
                 </Text>
@@ -905,10 +895,6 @@ export default function MyVow() {
                     <TouchableOpacity style={[styles.detailBtn, styles.detailBtnOutline, { borderColor: theme.border }]} onPress={() => confirmPause(selectedVow)}>
                       <Text style={[styles.detailBtnText, { color: theme.text }]}>Pause this vow</Text>
                     </TouchableOpacity>
-                    <TouchableOpacity style={[styles.detailBtn, styles.detailBtnOutline, { borderColor: theme.border }]} onPress={() => shareVow(selectedVow)}>
-                      <Ionicons name="share-outline" size={18} color={theme.text} />
-                      <Text style={[styles.detailBtnText, { color: theme.text }]}> Share</Text>
-                    </TouchableOpacity>
                   </View>
                 )}
                 <Text style={[styles.label, { color: theme.text }]}>Check-ins</Text>
@@ -919,7 +905,16 @@ export default function MyVow() {
                     <View key={c.check_in_id} style={[styles.checkInRow, { borderColor: theme.border }]}>
                       <View style={{ flex: 1 }}>
                         <Text style={[styles.checkInDate, { color: theme.text }]}>{c.check_in_date}</Text>
-                        <Text style={[styles.checkInKept, { color: c.kept ? SAGE : '#888' }]}>{c.kept ? 'Kept' : 'Missed'}</Text>
+                        <TouchableOpacity
+                          onPress={() => toggleCheckInKept(c, selectedVow.vow_id)}
+                          hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }}
+                          accessibilityRole="button"
+                          accessibilityLabel={`Toggle kept or missed for ${c.check_in_date}`}
+                        >
+                          <Text style={[styles.checkInKept, { color: c.kept ? SAGE : '#888' }]}>
+                            {c.kept ? 'Kept' : 'Missed'}
+                          </Text>
+                        </TouchableOpacity>
                       </View>
                       <TouchableOpacity
                         onPress={() => deleteCheckIn(c.check_in_id, selectedVow.vow_id)}
@@ -1048,16 +1043,7 @@ const styles = StyleSheet.create({
   hint: { fontSize: 14, opacity: 0.8, marginBottom: 8 },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' },
   modalBox: { borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, maxHeight: '85%' },
-  writeModalRoot: { flex: 1 },
-  writeModalInner: { flex: 1, paddingHorizontal: 20 },
-  writeModalScroll: { flex: 1 },
-  writeModalFooter: {
-    paddingHorizontal: 0,
-    paddingTop: 12,
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-  whyInput: { minHeight: 100, marginBottom: 16 },
-  detailWhyText: { fontSize: 15, lineHeight: 22, opacity: 0.95 },
+  detailWhyText: { fontSize: 15, lineHeight: 22, marginBottom: 8 },
   suggestedModalRoot: { flex: 1, backgroundColor: 'transparent' },
   suggestedModalSheet: {
     flex: 1,

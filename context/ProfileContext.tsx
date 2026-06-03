@@ -25,8 +25,12 @@ import * as ImagePicker from 'expo-image-picker';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from './ThemeContext';
 import { useTranslation } from 'react-i18next';
+import { rootNavigationRef } from '../utils/rootNavigationRef';
 
 const SAGE = '#7C9A7E';
+/** Sage discovery accent (Profile hints, Paywall-adjacent tone). */
+const SAGE_SOFT = '#A8BEA8';
+const PROFILE_CREAM = '#F5F0E8';
 const STORAGE_KEYS = {
   photo: '@user_profile_photo',
   name: '@user_name',
@@ -118,7 +122,13 @@ const SAGE_STORAGE_KEYS = {
   brands: '@sage_brands',
 } as const;
 
-function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }: ProfileModalProps) {
+function ProfileModal({
+  visible,
+  onClose,
+  onProfileSaved,
+  profilePhotoUri,
+  setProfilePhotoUri,
+}: ProfileModalProps) {
   const { theme } = useTheme();
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
@@ -133,8 +143,21 @@ function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }:
   const [sageDiet, setSageDiet] = useState('');
   const [sageAllergies, setSageAllergies] = useState('');
   const [sageBrands, setSageBrands] = useState('');
+  /** When brands list is empty, user must opt in to see the manual TextInput. */
+  const [brandsShowManual, setBrandsShowManual] = useState(false);
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  const brandsEmpty = !sageBrands.trim();
+
+  const openSageForBrands = useCallback(() => {
+    onClose();
+    requestAnimationFrame(() => {
+      if (rootNavigationRef.isReady()) {
+        rootNavigationRef.navigate('Sage' as never);
+      }
+    });
+  }, [onClose]);
 
   const loadStored = useCallback(async () => {
     try {
@@ -187,6 +210,8 @@ function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }:
     if (visible) {
       loadStored();
       loadSageFromStorage();
+    } else {
+      setBrandsShowManual(false);
     }
   }, [visible, loadStored, loadSageFromStorage]);
 
@@ -418,16 +443,64 @@ function ProfileModal({ visible, onClose, profilePhotoUri, setProfilePhotoUri }:
                 AsyncStorage.setItem(SAGE_STORAGE_KEYS.allergies, text).catch(() => {});
               }}
             />
-            <TextInput
-              style={[styles.input, { borderColor: theme.border, color: theme.text }]}
-              placeholder="Preferred brands (e.g., Fage, Kerrygold)"
-              placeholderTextColor={theme.type === 'dark' ? 'rgba(255,255,255,0.5)' : '#888'}
-              value={sageBrands}
-              onChangeText={(text) => {
-                setSageBrands(text);
-                AsyncStorage.setItem(SAGE_STORAGE_KEYS.brands, text).catch(() => {});
-              }}
-            />
+            <Text style={[styles.label, { color: theme.text }]}>Preferred brands</Text>
+            {brandsEmpty && !brandsShowManual ? (
+              <View
+                style={[
+                  styles.brandsEmptyCard,
+                  {
+                    backgroundColor: theme.type === 'dark' ? 'rgba(168, 190, 168, 0.12)' : PROFILE_CREAM,
+                    borderColor: theme.type === 'dark' ? theme.border : SAGE_SOFT,
+                  },
+                ]}
+              >
+                <View style={styles.brandsEmptyIconWrap}>
+                  <Ionicons name="leaf-outline" size={36} color={SAGE_SOFT} />
+                </View>
+                <Text style={[styles.brandsEmptyHeading, { color: theme.text }]}>No brands yet</Text>
+                <Text style={[styles.brandsEmptyBody, { color: theme.textSecondary ?? '#666' }]}>
+                  Sage can learn your favorite brands automatically. Just send a photo of a grocery receipt in
+                  Sage chat.
+                </Text>
+                <TouchableOpacity
+                  style={[styles.brandsOpenSageBtn, { backgroundColor: SAGE }]}
+                  onPress={openSageForBrands}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.brandsOpenSageBtnText}>Open Sage Chat</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.brandsManualLink}
+                  onPress={() => setBrandsShowManual(true)}
+                  hitSlop={{ top: 8, bottom: 8, left: 12, right: 12 }}
+                >
+                  <Text style={[styles.brandsManualLinkText, { color: SAGE_SOFT }]}>Add manually</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <>
+                <TextInput
+                  style={[styles.input, { borderColor: theme.border, color: theme.text }]}
+                  placeholder="Preferred brands (e.g., Fage, Kerrygold)"
+                  placeholderTextColor={theme.type === 'dark' ? 'rgba(255,255,255,0.5)' : '#888'}
+                  value={sageBrands}
+                  onChangeText={(text) => {
+                    setSageBrands(text);
+                    AsyncStorage.setItem(SAGE_STORAGE_KEYS.brands, text).catch(() => {});
+                  }}
+                />
+                {!brandsEmpty ? (
+                  <Text
+                    style={[
+                      styles.brandsHelperTip,
+                      { color: theme.type === 'dark' ? 'rgba(168, 190, 168, 0.95)' : SAGE_SOFT },
+                    ]}
+                  >
+                    📸 Tip: Send a grocery receipt photo in Sage chat to add brands automatically.
+                  </Text>
+                ) : null}
+              </>
+            )}
             </ScrollView>
             <View
               style={[
@@ -559,4 +632,56 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   saveBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
+  brandsEmptyCard: {
+    borderRadius: 14,
+    borderWidth: 1,
+    padding: 20,
+    marginBottom: 14,
+    alignItems: 'center',
+  },
+  brandsEmptyIconWrap: {
+    marginBottom: 12,
+  },
+  brandsEmptyHeading: {
+    fontFamily: 'CormorantGaramond-SemiBold',
+    fontSize: 22,
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  brandsEmptyBody: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 15,
+    lineHeight: 22,
+    textAlign: 'center',
+    marginBottom: 18,
+  },
+  brandsOpenSageBtn: {
+    alignSelf: 'stretch',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    marginBottom: 14,
+    alignItems: 'center',
+  },
+  brandsOpenSageBtnText: {
+    fontFamily: 'Jost_600SemiBold',
+    color: '#fff',
+    fontSize: 16,
+  },
+  brandsManualLink: {
+    paddingVertical: 4,
+  },
+  brandsManualLinkText: {
+    fontFamily: 'Jost_500Medium',
+    fontSize: 15,
+    textDecorationLine: 'underline',
+  },
+  brandsHelperTip: {
+    fontFamily: 'Jost_400Regular',
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 6,
+    marginBottom: 14,
+    opacity: 0.92,
+  },
 });

@@ -3,6 +3,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 export type SageMessage = {
   role: 'user' | 'assistant';
   content: string;
+  /** When true, this row is UI-only (truncation recovery) and must not be sent to the API. */
+  truncationUi?: boolean;
 };
 
 const SAGE_STORAGE_KEY = '@simplefitness_sage_conversation';

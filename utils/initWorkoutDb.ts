@@ -74,4 +74,10 @@ export async function initWorkoutDb(db: {
   } catch {
     // Column already exists.
   }
+  // Per calendar-instance exercise order (Logged_Exercises); does not affect plan template.
+  try {
+    await db.runAsync('ALTER TABLE Logged_Exercises ADD COLUMN sort_order INTEGER;');
+  } catch {
+    // Column already exists.
+  }
 }

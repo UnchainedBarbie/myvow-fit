@@ -1,6 +1,6 @@
 /**
  * List of meal plans for a given week; tap to open detail. Swipe left to delete.
- * When empty: message only; Build with Sage / Build it myself / Copy from previous week (brings plan templates into this week; tracker activates only via Set as Active) sit below Weekly meal prep in the footer.
+ * When empty: message only; Build with Sage / Build My Own / Copy from previous week (brings plan templates into this week; tracker activates only via Set as Active) sit below Weekly meal prep in the footer.
  */
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import {
@@ -612,7 +612,7 @@ export default function MealPlanList({ weekStart, currentWeekStart }: MealPlanLi
         <Text style={styles.emptyBtnText}>Build with Sage</Text>
       </TouchableOpacity>
       <TouchableOpacity style={[styles.emptyBtn, { backgroundColor: theme.card, borderColor: theme.border }]} onPress={buildMyself}>
-        <Text style={[styles.emptyBtnText, { color: theme.text }]}>Build it myself</Text>
+        <Text style={[styles.emptyBtnText, { color: theme.text }]}>Build My Own</Text>
       </TouchableOpacity>
       <TouchableOpacity
         style={[styles.emptyBtn, { backgroundColor: theme.card, borderColor: theme.border }]}

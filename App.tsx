@@ -51,12 +51,19 @@ import * as Notifications from 'expo-notifications';
 import GraphsWorkoutDetails from './screens/GraphsWorkoutDetails';
 import { initNutritionDb, migrateLoggedFoodsAddLogIdColumnSafe } from './utils/nutritionDb';
 import { initMealPlansDb } from './utils/initMealPlansDb';
+import { initPurchasedProductsDb } from './utils/purchasedProducts';
 import { addRecurringTable, createUpdateTriggers } from './utils/addRecurringTable';
 import { initWorkoutDb } from './utils/initWorkoutDb';
 import * as SplashScreen from 'expo-splash-screen';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Onboarding from './screens/Onboarding';
+import Paywall from './screens/Paywall';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import {
+  getSubscriptionState,
+  setSubscriptionState,
+} from './utils/settingsStorage';
+import type { IapPurchase } from './services/iap';
 
 /** Bump to a new name (e.g. SimpleDB.v2.db) to force a fresh schema on next load; init runs on open. */
 const SQLITE_DATABASE_NAME = 'SimpleDB.db';
@@ -66,6 +73,7 @@ async function onSqliteInit(db: { runAsync: (sql: string) => Promise<void> }) {
   // Do NOT drop DayActivePlan here — that wiped every user's active plan/day assignments on each
   // app launch. Ensure tables via idempotent CREATE IF NOT EXISTS only.
   await initMealPlansDb(db as any);
+  await initPurchasedProductsDb(db as any);
   await migrateLoggedFoodsAddLogIdColumnSafe(db as any);
 
   // Allow INSERT OR REPLACE on Workout_Log for duplicate (workout_date, day_name, workout_name)
@@ -422,6 +430,17 @@ function NutritionDbInitializer() {
   return null;
 }
 
+/** In-app route to Paywall (e.g. future Settings entry); CTA returns to Home. */
+function PaywallScreen({ navigation }: { navigation: { navigate: (name: string) => void } }) {
+  return (
+    <Paywall
+      onContinue={async () => {
+        navigation.navigate('Home');
+      }}
+    />
+  );
+}
+
 // Define AppContent here
 const AppContent = ({ onOpenMainDrawer }: { onOpenMainDrawer: () => void }) => {
   const { theme } = useTheme();
@@ -497,6 +516,7 @@ const AppContent = ({ onOpenMainDrawer }: { onOpenMainDrawer: () => void }) => {
             />
             <Stack.Screen name="MyVow" component={MyVow} options={{ headerTitle: 'MyVow Fit' }} />
             <Stack.Screen name="Settings" component={Settings} options={{ headerTitle: 'Settings' }} />
+            <Stack.Screen name="Paywall" component={PaywallScreen} options={{ headerShown: false }} />
           </Stack.Navigator>
           </>
           </DrawerMenuProvider>
@@ -528,6 +548,8 @@ function NavigationWithDrawer() {
     const [dbLoaded, setDbLoaded] = useState(false);
     const [onboardingResolved, setOnboardingResolved] = useState(false);
     const [showOnboarding, setShowOnboarding] = useState(false);
+    const [showPaywall, setShowPaywall] = useState(false);
+    const [paywallError, setPaywallError] = useState<string | null>(null);
     const [fontsLoaded] = useFonts({
       'CormorantGaramond-Regular': require('./assets/fonts/CormorantGaramond-Regular.ttf'),
       'CormorantGaramond-Bold': require('./assets/fonts/CormorantGaramond-Bold.ttf'),
@@ -538,7 +560,98 @@ function NavigationWithDrawer() {
       Jost_500Medium,
       Jost_600SemiBold,
     });
-    
+
+    /**
+     * Initialize the IAP connection, wire success/error listeners (their delivery is
+     * the canonical source of purchase outcome in v15), and check whether a previously
+     * purchased subscription is still active for this Apple ID (e.g., reinstall case).
+     * Listener handlers persist to userSettings.json and dismiss the paywall.
+     */
+    useEffect(() => {
+      let cancelled = false;
+      let teardown: (() => void) | null = null;
+      (async () => {
+        try {
+          const iap = await import('./services/iap');
+          await iap.initializeIAP();
+          if (cancelled) return;
+
+          iap.setupPurchaseListeners(
+            (purchase: IapPurchase) => {
+              const productId = purchase?.productId ?? null;
+              const expirationMs =
+                purchase?.expirationDateIOS != null
+                  ? Number(purchase.expirationDateIOS)
+                  : null;
+              const expiresAtIso =
+                expirationMs && Number.isFinite(expirationMs)
+                  ? new Date(expirationMs).toISOString()
+                  : null;
+              setSubscriptionState({
+                subscription_status: 'active',
+                subscription_product_id: productId,
+                subscription_expires_at: expiresAtIso,
+              }).catch((e) =>
+                console.warn('[IAP] persisting active subscription failed:', e),
+              );
+              AsyncStorage.setItem('@onboarding_complete', 'true').catch((e) =>
+                console.warn('[IAP] marking onboarding complete failed:', e),
+              );
+              setPaywallError(null);
+              setShowPaywall(false);
+            },
+            (error) => {
+              const code = String(error?.code ?? '').toLowerCase();
+              if (code.includes('cancel')) {
+                // User backed out of the StoreKit sheet — quiet path.
+                return;
+              }
+              const message =
+                typeof error?.message === 'string' && error.message.length > 0
+                  ? error.message
+                  : 'Something went wrong with the purchase. Please try again.';
+              setPaywallError(message);
+            },
+          );
+          teardown = iap.teardownPurchaseListeners;
+
+          const active = await iap.getActiveSubscription();
+          if (cancelled) return;
+          if (active.isActive && active.productId) {
+            await setSubscriptionState({
+              subscription_status: 'active',
+              subscription_product_id: active.productId,
+              subscription_expires_at: active.expiresAt
+                ? active.expiresAt.toISOString()
+                : null,
+            });
+          } else if (active.productId) {
+            // Known product but expired — keep the productId for context.
+            await setSubscriptionState({
+              subscription_status: 'expired',
+              subscription_product_id: active.productId,
+              subscription_expires_at: active.expiresAt
+                ? active.expiresAt.toISOString()
+                : null,
+            });
+          }
+        } catch (e) {
+          console.error('[IAP] Launch initialization error:', e);
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+        if (teardown) {
+          try {
+            teardown();
+          } catch (e) {
+            console.warn('[IAP] teardownPurchaseListeners threw:', e);
+          }
+        }
+      };
+    }, []);
+
     useEffect(() => {
       loadDatabase().then(() => setDbLoaded(true));
       
@@ -578,11 +691,31 @@ function NavigationWithDrawer() {
       if (!fontsLoaded) return;
       (async () => {
         try {
+          // Active subscribers skip the paywall regardless of onboarding flags so a
+          // reinstalled user with an existing entitlement lands in the app immediately.
+          const sub = await getSubscriptionState();
+          if (sub.subscription_status === 'active') {
+            setShowOnboarding(false);
+            setShowPaywall(false);
+            return;
+          }
           const done = await AsyncStorage.getItem('@onboarding_complete');
-          setShowOnboarding(done !== 'true');
+          const profileSaved = await AsyncStorage.getItem('@onboarding_profile_saved');
+          if (done === 'true') {
+            // Onboarded but not active → still gate behind the paywall.
+            setShowOnboarding(false);
+            setShowPaywall(true);
+          } else if (profileSaved === 'true') {
+            setShowOnboarding(false);
+            setShowPaywall(true);
+          } else {
+            setShowOnboarding(true);
+            setShowPaywall(false);
+          }
         } catch (e) {
           console.warn('Onboarding check:', e);
           setShowOnboarding(true);
+          setShowPaywall(false);
         } finally {
           setOnboardingResolved(true);
         }
@@ -609,7 +742,27 @@ function NavigationWithDrawer() {
       <SafeAreaProvider>
       <GestureHandlerRootView style={{ flex: 1 }}>
         {showOnboarding ? (
-          <Onboarding onComplete={() => setShowOnboarding(false)} />
+          <Onboarding
+            onComplete={() => {
+              setShowOnboarding(false);
+              setShowPaywall(true);
+            }}
+          />
+        ) : showPaywall ? (
+          <Paywall
+            errorMessage={paywallError}
+            onSubscriptionActivated={async () => {
+              // Fired from a successful Restore. A direct-purchase success is handled
+              // by the purchaseUpdatedListener; that path also dismisses the paywall.
+              try {
+                await AsyncStorage.setItem('@onboarding_complete', 'true');
+              } catch (e) {
+                console.warn('Paywall: could not persist onboarding complete:', e);
+              }
+              setPaywallError(null);
+              setShowPaywall(false);
+            }}
+          />
         ) : (
         <NavigationWithDrawer />
         )}

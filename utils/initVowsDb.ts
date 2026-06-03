@@ -1,6 +1,6 @@
 /**
  * Vows and VowCheckIns tables for MyVow feature.
- * Creates/migrates schema only — does not modify or clear existing vow or check-in rows.
+ * Creates/migrates schema — may dedupe legacy duplicate check-ins before adding a unique index.
  */
 export async function initVowsDb(db: {
   runAsync: (sql: string, params?: (string | number | null)[]) => Promise<void>;
@@ -40,6 +40,28 @@ export async function initVowsDb(db: {
       FOREIGN KEY (vow_id) REFERENCES Vows(vow_id) ON DELETE CASCADE
     );
   `);
+
+  // Remove duplicate (vow_id, check_in_date) rows before unique index — EXISTS avoids NOT IN (empty) pitfalls.
+  await db.runAsync(`
+    DELETE FROM VowCheckIns
+    WHERE check_in_id IN (
+      SELECT v1.check_in_id FROM VowCheckIns v1
+      WHERE EXISTS (
+        SELECT 1 FROM VowCheckIns v2
+        WHERE v2.vow_id = v1.vow_id
+          AND v2.check_in_date = v1.check_in_date
+          AND v2.check_in_id < v1.check_in_id
+      )
+    );
+  `);
+
+  try {
+    await db.runAsync(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_vow_checkins_unique ON VowCheckIns (vow_id, check_in_date);',
+    );
+  } catch (e) {
+    console.warn('initVowsDb: could not create VowCheckIns unique index', e);
+  }
 }
 
 export type VowRow = {

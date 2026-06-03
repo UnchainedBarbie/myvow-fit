@@ -72,6 +72,12 @@ type SettingsContextType = {
   notificationPermissionGranted: boolean;
   setNotificationPermissionGranted: (granted: boolean) => void;
   requestNotificationPermission: () => Promise<boolean>;
+  /**
+   * Receipt purchase memory toggle. Tri-state to distinguish "user hasn't been asked yet"
+   * from an explicit decline. null = unset (default), false = declined, true = accepted.
+   */
+  rememberPurchases: boolean | null;
+  setRememberPurchases: (value: boolean | null) => void;
 };
 
 // 2) Declare the actual context:
@@ -91,6 +97,9 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
   );
   const [notificationPermissionGranted, setNotificationPermissionGranted] =
     useState(false);
+  const [rememberPurchases, setRememberPurchases] = useState<boolean | null>(
+    null,
+  );
 
   // Function to request notification permission
   const requestNotificationPermission = async (): Promise<boolean> => {
@@ -131,6 +140,13 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
         setNotificationPermissionGranted(
           savedSettings.notificationPermissionGranted || false,
         );
+
+        // Only accept strict booleans; anything else (missing, null, legacy value) stays unset.
+        setRememberPurchases(
+          typeof savedSettings.rememberPurchases === 'boolean'
+            ? savedSettings.rememberPurchases
+            : null,
+        );
       } else {
         const fallbackLng = 'en';
         const defaultLocale =
@@ -163,6 +179,7 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
         weightFormat,
         firstWeekday,
         notificationPermissionGranted,
+        rememberPurchases,
       });
     };
     persistSettings();
@@ -173,6 +190,7 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     weightFormat,
     firstWeekday,
     notificationPermissionGranted,
+    rememberPurchases,
     isInitialized,
   ]);
 
@@ -192,6 +210,8 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
         notificationPermissionGranted,
         setNotificationPermissionGranted,
         requestNotificationPermission,
+        rememberPurchases,
+        setRememberPurchases,
       }}
     >
       {children}
