@@ -784,6 +784,34 @@ export default function AddFoodModal({
   const [barcodeLoading, setBarcodeLoading] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const lastScannedCode = React.useRef<string | null>(null);
+  /** Blocks parallel lookups while the camera may still be emitting scan events. */
+  const barcodeLookupInFlightRef = React.useRef(false);
+  /** Prevents stacking multiple Alert dialogs from one failed lookup. */
+  const barcodeErrorAlertOpenRef = React.useRef(false);
+
+  const releaseBarcodeLookup = useCallback(() => {
+    barcodeLookupInFlightRef.current = false;
+    barcodeErrorAlertOpenRef.current = false;
+  }, []);
+
+  const showBarcodeFetchErrorAlert = useCallback(() => {
+    if (barcodeErrorAlertOpenRef.current) return;
+    barcodeErrorAlertOpenRef.current = true;
+    Alert.alert(
+      'Product Not Found',
+      "We couldn't find this barcode in our database. You can search manually or add it as a custom food.",
+      [
+        {
+          text: 'OK',
+          onPress: () => {
+            releaseBarcodeLookup();
+            lastScannedCode.current = null;
+          },
+        },
+      ],
+      { cancelable: false },
+    );
+  }, [releaseBarcodeLookup]);
   const [showManualForm, setShowManualForm] = useState(false);
   const [manualFoodName, setManualFoodName] = useState('');
   const [manualBrand, setManualBrand] = useState('');
@@ -869,6 +897,7 @@ export default function AddFoodModal({
   };
 
   const openScanner = async () => {
+    if (barcodeLookupInFlightRef.current) return;
     if (!cameraPermission?.granted) {
       const result = await requestCameraPermission();
       if (!result.granted) {
@@ -876,6 +905,7 @@ export default function AddFoodModal({
         return;
       }
     }
+    releaseBarcodeLookup();
     lastScannedCode.current = null;
     setBarcodeScannerVisible(true);
   };
@@ -932,28 +962,52 @@ export default function AddFoodModal({
   };
 
   const onBarcodeScanned = async (event: { data?: string; nativeEvent?: { data?: string } }) => {
-    const code = event.data ?? event.nativeEvent?.data ?? '';
-    if (!code || lastScannedCode.current === code) return;
+    const code = (event.data ?? event.nativeEvent?.data ?? '').trim();
+    if (!code) return;
+    if (barcodeLookupInFlightRef.current) return;
+    if (lastScannedCode.current === code) return;
+
+    barcodeLookupInFlightRef.current = true;
     lastScannedCode.current = code;
     setBarcodeScannerVisible(false);
     setBarcodeLoading(true);
+
     try {
       const data = await fetchBarcodeProductWithRetry(code);
       const product = data?.product;
       if (!product) {
-        Alert.alert('Not found', `No product found for barcode ${code}.`);
-        setBarcodeLoading(false);
+        if (!barcodeErrorAlertOpenRef.current) {
+          barcodeErrorAlertOpenRef.current = true;
+          Alert.alert(
+            'Product Not Found',
+            "We couldn't find this barcode in our database. You can search manually or add it as a custom food.",
+            [
+              {
+                text: 'OK',
+                onPress: () => {
+                  releaseBarcodeLookup();
+                  lastScannedCode.current = null;
+                },
+              },
+            ],
+            { cancelable: false },
+          );
+        }
         return;
       }
+      releaseBarcodeLookup();
+      lastScannedCode.current = null;
       const food = normalizeOffProductFromBarcode(product);
       setSelectedFood(food);
       syncQuantityModalFromFood(food);
       setQtyMealType(mealType.charAt(0).toUpperCase() + mealType.slice(1));
       setShowQuantityModal(true);
     } catch (e) {
-      Alert.alert('Error', 'Could not fetch product. Try again.');
+      console.warn('[AddFoodModal] barcode lookup failed:', e);
+      showBarcodeFetchErrorAlert();
+    } finally {
+      setBarcodeLoading(false);
     }
-    setBarcodeLoading(false);
   };
 
   const queryCommonFoods = async (rawQuery: string): Promise<FoodResult[]> => {
@@ -1578,7 +1632,14 @@ export default function AddFoodModal({
       {/* Full-screen barcode scanner overlay */}
       <Modal visible={barcodeScannerVisible} animationType="slide" statusBarTranslucent>
         <View style={styles.scannerFullScreen}>
-          <CameraView style={StyleSheet.absoluteFill} onBarcodeScanned={onBarcodeScanned} />
+          <CameraView
+            style={StyleSheet.absoluteFill}
+            onBarcodeScanned={
+              barcodeScannerVisible && !barcodeLoading && !barcodeLookupInFlightRef.current
+                ? onBarcodeScanned
+                : undefined
+            }
+          />
           <SafeAreaView style={styles.scannerHeader} edges={['top']}>
             <TouchableOpacity onPress={() => setBarcodeScannerVisible(false)} style={styles.scannerCloseBtn}>
               <Ionicons name="close" size={28} color="#fff" />
