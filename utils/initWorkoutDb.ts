@@ -80,4 +80,20 @@ export async function initWorkoutDb(db: {
   } catch {
     // Column already exists.
   }
+  // Time-based strength exercises (e.g. planks): hold duration per set in seconds.
+  try {
+    await db.runAsync('ALTER TABLE Exercises ADD COLUMN duration_seconds INTEGER;');
+  } catch {
+    // Column already exists.
+  }
+  try {
+    await db.runAsync('ALTER TABLE Logged_Exercises ADD COLUMN duration_seconds INTEGER;');
+  } catch {
+    // Column already exists.
+  }
+  try {
+    await db.runAsync('ALTER TABLE Weight_Log ADD COLUMN duration_seconds INTEGER;');
+  } catch {
+    // Column already exists.
+  }
 }

@@ -74,6 +74,31 @@ export function sortWorkoutPlanExercisesForDisplay<
   });
 }
 
+export type ExerciseSetsVolumeLabels = {
+  sets: string;
+  reps: string;
+  sec?: string;
+};
+
+/**
+ * List/detail line for planned or logged exercises: "3 sets × 10 reps" or "3 sets × 45 sec".
+ * Time-based when duration_seconds > 0 and reps is 0/null.
+ */
+export function formatExerciseSetsVolumeLine(
+  sets: number,
+  reps: number | null | undefined,
+  duration_seconds: number | null | undefined,
+  labels: ExerciseSetsVolumeLabels,
+): string {
+  const d = duration_seconds ?? 0;
+  const r = reps ?? 0;
+  const secLbl = labels.sec ?? 'sec';
+  if (d > 0 && r === 0) {
+    return `${sets} ${labels.sets} × ${d} ${secLbl}`;
+  }
+  return `${sets} ${labels.sets} × ${r} ${labels.reps}`;
+}
+
 /** Single title when workout and day labels are identical (avoids "Push - Push"). */
 export function formatWorkoutHeaderTitle(
   workoutName: string | null | undefined,

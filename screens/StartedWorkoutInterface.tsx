@@ -41,6 +41,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import { WorkoutLogStackParamList } from '../App';
+import { AddExerciseModal, type AddExerciseFormValues } from '../components/AddExerciseModal';
 
 type StartedWorkoutNavigationProp = StackNavigationProp<
   WorkoutLogStackParamList,
@@ -65,7 +66,17 @@ import {
   updateTimerState,
   useTimerPersistence,
 } from '../utils/timerPersistenceUtils';
-import { formatWorkoutHeaderTitle, sortWorkoutPlanExercisesForDisplay } from '../utils/workoutDisplayUtils';
+import {
+  formatExerciseSetsVolumeLine,
+  formatWorkoutHeaderTitle,
+  sortWorkoutPlanExercisesForDisplay,
+} from '../utils/workoutDisplayUtils';
+import {
+  computeTimeBasedSetLoggedSeconds,
+  formatHoldCountdownDisplay,
+  isTimeBasedExercise,
+  validateRepsOrDurationInput,
+} from '../utils/exerciseTrackingUtils';
 
 type StartedWorkoutRouteProps = RouteProp<
   WorkoutLogStackParamList,
@@ -77,6 +88,7 @@ interface Exercise {
   exercise_name: string;
   sets: number;
   reps: number;
+  duration_seconds?: number | null;
   logged_exercise_id: number;
   exercise_fully_logged: boolean;
   web_link: string | null;
@@ -91,6 +103,8 @@ interface ExerciseSet {
   set_number: number;
   total_sets: number;
   reps_goal: number;
+  /** Target hold duration (seconds) for time-based sets. */
+  duration_goal_seconds?: number | null;
   reps_done: string;
   weight: string;
   set_logged: boolean;
@@ -289,9 +303,6 @@ export default function StartedWorkoutInterface() {
   const [isOverviewExerciseReorderMode, setIsOverviewExerciseReorderMode] =
     useState(false);
   const [isAddExerciseModalVisible, setIsAddExerciseModalVisible] = useState(false);
-  const [addExerciseName, setAddExerciseName] = useState('');
-  const [addExerciseSets, setAddExerciseSets] = useState('3');
-  const [addExerciseReps, setAddExerciseReps] = useState('10');
   const [isSavingAddExercise, setIsSavingAddExercise] = useState(false);
   
   // Workout flow states
@@ -334,6 +345,21 @@ export default function StartedWorkoutInterface() {
   const cardioInitialTotalSecRef = useRef(0);
   const cardioCountdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  /** Time-based set hold countdown (per active set; not persisted across navigation). */
+  const [holdRemainingSec, setHoldRemainingSec] = useState(0);
+  const [holdPhase, setHoldPhase] = useState<'idle' | 'running' | 'paused' | 'done'>('idle');
+  const holdIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const holdTargetSecRef = useRef(0);
+  const holdEverStartedRef = useRef(false);
+  const holdRemainingSecRef = useRef(0);
+  const holdPhaseRef = useRef(holdPhase);
+  useEffect(() => {
+    holdRemainingSecRef.current = holdRemainingSec;
+  }, [holdRemainingSec]);
+  useEffect(() => {
+    holdPhaseRef.current = holdPhase;
+  }, [holdPhase]);
+
   // Timer state using the new utility
   const [timerState, setTimerState] = useState<TimerState>(createTimerState());
   const [isCompletingSet, setIsCompletingSet] = useState(false);
@@ -343,9 +369,34 @@ export default function StartedWorkoutInterface() {
     timerStateRef.current = timerState;
   }, [timerState]);
 
+  const logResume = (
+    event: string,
+    extra?: Record<string, string | number | boolean | null | undefined>,
+  ) => {
+    const sets = allSetsRef.current;
+    const ts = timerStateRef.current;
+    console.log(`[RESUME] ${event}`, {
+      workout_log_id,
+      routeResume: isResumeParam === true,
+      isResume,
+      completedSets: sets.filter((s) => s.set_logged).length,
+      totalSets: sets.length,
+      currentSetIndex: ts.currentSetIndex,
+      workoutStarted: ts.workoutStarted,
+      workoutStage: ts.workoutStage,
+      ...extra,
+    });
+  };
+
   const persistWorkoutTimerBlob = useCallback(async () => {
     const ts = timerStateRef.current;
-    if (!ts.workoutStarted || ts.workoutStage === 'completed') return;
+    if (!ts.workoutStarted || ts.workoutStage === 'completed') {
+      logResume('persist:skip (workout not active)', {
+        workoutStarted: ts.workoutStarted,
+        workoutStage: ts.workoutStage,
+      });
+      return;
+    }
     const setsSnapshot = allSetsRef.current.map((s) => ({
       exercise_name: s.exercise_name,
       set_number: s.set_number,
@@ -359,21 +410,29 @@ export default function StartedWorkoutInterface() {
     try {
       const cardioPaused =
         workoutLogTypeRef.current === 'cardio' && isCardioTimerPausedRef.current;
+      logResume('persist:blur/unmount saving timer blob', {
+        snapshotSets: setsSnapshot.length,
+        snapshotLogged: setsSnapshot.filter((s) => s.set_logged).length,
+      });
       await timerStateUtils.saveTimerState(ts, {
         workoutLogId: workout_log_id,
         setsSnapshot: setsSnapshot.length > 0 ? setsSnapshot : undefined,
         ...(cardioPaused ? { cardioTimerPaused: true } : {}),
       });
+      logResume('persist:blur/unmount save done');
     } catch (e) {
-      console.error('Error persisting workout timer on blur/unmount:', e);
+      console.error('[RESUME] persist:blur/unmount error', e);
     }
   }, [workout_log_id]);
 
   useEffect(() => {
+    logResume('mount: navigation blur listener registered');
     const subBlur = navigation.addListener('blur', () => {
+      logResume('focus: navigation blur');
       void persistWorkoutTimerBlob();
     });
     return () => {
+      logResume('unmount: cleanup (persist then stop timers)');
       void persistWorkoutTimerBlob();
       subBlur();
     };
@@ -385,6 +444,10 @@ export default function StartedWorkoutInterface() {
   const restTimerEndAtRef = useRef<number | null>(null);
   const weightMapRef = useRef(new Map<string, string>());
   const repsMapRef = useRef(new Map<string, string>());
+  const exercisesRef = useRef<Exercise[]>([]);
+  useEffect(() => {
+    exercisesRef.current = exercises;
+  }, [exercises]);
   // Rest seconds at moment user tapped Start Workout (so rest timer uses their chosen value)
   const restSecondsForWorkoutRef = useRef<{ setRestSeconds: number; exerciseRestSeconds: number } | null>(null);
 
@@ -413,6 +476,15 @@ export default function StartedWorkoutInterface() {
     elapsedSeconds: number,
     rawPayload?: PersistedTimerPayload,
   ) => {
+    logResume('load:handleTimerRestore (AppState foreground)', {
+      elapsedSeconds,
+      payloadWorkoutLogId: rawPayload?.workoutLogId ?? null,
+      snapshotSets: rawPayload?.setsSnapshot?.length ?? 0,
+      snapshotLogged:
+        rawPayload?.setsSnapshot?.filter((s) => s.set_logged).length ?? 0,
+      savedCurrentSetIndex: savedState.currentSetIndex,
+      savedStage: savedState.workoutStage,
+    });
     console.log('=== RESTORING TIMER STATE ===');
     console.log('Saved state:', savedState);
     console.log('Elapsed seconds:', elapsedSeconds);
@@ -621,6 +693,7 @@ export default function StartedWorkoutInterface() {
   }, [notificationPermissionGranted]);
   
   useEffect(() => {
+    logResume('mount: loadInitialData effect running');
     const loadInitialData = async () => {
         try {
             const preferences = await loadRestTimerPreferences();
@@ -651,6 +724,7 @@ export default function StartedWorkoutInterface() {
     loadInitialData();
 
     return () => {
+        logResume('unmount: loadInitialData cleanup (stop timers)');
         stopWorkoutTimer();
         stopRestTimer();
         deactivateKeepAwake();
@@ -724,6 +798,7 @@ export default function StartedWorkoutInterface() {
     shouldUseLogsForReps: boolean
   ) => {
     let persistedPayload: Awaited<ReturnType<typeof timerStateUtils.loadTimerState>> = null;
+    logResume('load:fetchWorkoutDetails start');
     try {
       setLoading(true);
       setWorkoutLogType('strength');
@@ -778,7 +853,7 @@ export default function StartedWorkoutInterface() {
         let exercisesResultRaw = await db.getAllAsync<
           Omit<Exercise, 'exercise_fully_logged'> & { sort_order?: number | null }
         >(
-          `SELECT exercise_name, sets, reps, logged_exercise_id, web_link, muscle_group, exercise_notes, rest_seconds, sort_order
+          `SELECT exercise_name, sets, reps, duration_seconds, logged_exercise_id, web_link, muscle_group, exercise_notes, rest_seconds, sort_order
            FROM Logged_Exercises 
            WHERE workout_log_id = ?
            ORDER BY COALESCE(sort_order, 999999), logged_exercise_id ASC;`,
@@ -790,12 +865,13 @@ export default function StartedWorkoutInterface() {
             exercise_name: string;
             sets: number;
             reps: number;
+            duration_seconds: number | null;
             web_link: string | null;
             muscle_group: string | null;
             exercise_notes: string | null;
             rest_seconds: number | null;
           }>(
-            `SELECT e.exercise_name, e.sets, e.reps, e.web_link, e.muscle_group, e.exercise_notes, e.rest_seconds
+            `SELECT e.exercise_name, e.sets, e.reps, e.duration_seconds, e.web_link, e.muscle_group, e.exercise_notes, e.rest_seconds
              FROM Exercises e
              INNER JOIN Days d ON e.day_id = d.day_id
              INNER JOIN Workouts w ON d.workout_id = w.workout_id
@@ -808,7 +884,7 @@ export default function StartedWorkoutInterface() {
               for (let i = 0; i < sortedPlan.length; i++) {
                 const ex = sortedPlan[i];
                 await db.runAsync(
-                  `INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+                  `INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, duration_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
                   [
                     workout_log_id,
                     ex.exercise_name,
@@ -819,14 +895,30 @@ export default function StartedWorkoutInterface() {
                     ex.exercise_notes ?? null,
                     ex.rest_seconds ?? null,
                     i,
-                  ]
+                    ex.duration_seconds ?? null,
+                  ],
+                ).catch(() =>
+                  db.runAsync(
+                    `INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+                    [
+                      workout_log_id,
+                      ex.exercise_name,
+                      ex.sets,
+                      ex.reps,
+                      ex.web_link ?? null,
+                      ex.muscle_group ?? null,
+                      ex.exercise_notes ?? null,
+                      ex.rest_seconds ?? null,
+                      i,
+                    ],
+                  ),
                 );
               }
             });
             exercisesResultRaw = await db.getAllAsync<
               Omit<Exercise, 'exercise_fully_logged'> & { sort_order?: number | null }
             >(
-              `SELECT exercise_name, sets, reps, logged_exercise_id, web_link, muscle_group, exercise_notes, rest_seconds, sort_order
+              `SELECT exercise_name, sets, reps, duration_seconds, logged_exercise_id, web_link, muscle_group, exercise_notes, rest_seconds, sort_order
                FROM Logged_Exercises 
                WHERE workout_log_id = ?
                ORDER BY COALESCE(sort_order, 999999), logged_exercise_id ASC;`,
@@ -876,11 +968,15 @@ export default function StartedWorkoutInterface() {
         // Prepare all sets data structure
         const setsData: ExerciseSet[] = [];
         exercisesResult.forEach(exercise => {
+          const timeBased = isTimeBasedExercise(exercise.reps, exercise.duration_seconds);
           for (let i = 1; i <= exercise.sets; i++) {
-            const weight = shouldAutoFill ? (weightMapRef.current.get(`${exercise.exercise_name}-${i}`) || '') : '';
-            
+            const weight =
+              timeBased || !shouldAutoFill
+                ? ''
+                : weightMapRef.current.get(`${exercise.exercise_name}-${i}`) || '';
+
             let reps_done = '';
-            if (shouldAutoFillReps) {
+            if (shouldAutoFillReps && !timeBased) {
                 if (shouldUseLogsForReps) {
                     reps_done = repsMapRef.current.get(`${exercise.exercise_name}-${i}`) || '';
                 } else {
@@ -893,7 +989,8 @@ export default function StartedWorkoutInterface() {
               exercise_id: exercise.logged_exercise_id,
               set_number: i,
               total_sets: exercise.sets,
-              reps_goal: exercise.reps,
+              reps_goal: timeBased ? 0 : exercise.reps,
+              duration_goal_seconds: timeBased ? exercise.duration_seconds ?? null : null,
               reps_done: reps_done,
               weight: weight,
               set_logged: false,
@@ -905,24 +1002,50 @@ export default function StartedWorkoutInterface() {
         });
 
         let finalSets = setsData;
-        if (isResume) {
-          persistedPayload = await timerStateUtils.loadTimerState();
-          if (
-            persistedPayload?.workoutLogId === workout_log_id &&
-            persistedPayload.setsSnapshot &&
-            persistedPayload.setsSnapshot.length > 0
-          ) {
-            const merged = mergeExerciseSetsWithSnapshot(
-              setsData,
-              persistedPayload.setsSnapshot,
-            );
-            finalSets = orderMergedSetsLikeSnapshot(merged, persistedPayload.setsSnapshot);
-          }
+        logResume('load:fetchWorkoutDetails built setsData from DB', {
+          dbExerciseCount: exercisesResult.length,
+          freshSets: setsData.length,
+          freshLogged: 0,
+          workoutLogType: normalizedLogType,
+        });
+        persistedPayload = await timerStateUtils.loadTimerState();
+        logResume('load:fetchWorkoutDetails loaded timer blob', {
+          routeResume: isResume,
+          blobWorkoutLogId: persistedPayload?.workoutLogId ?? null,
+          blobSnapshotLen: persistedPayload?.setsSnapshot?.length ?? 0,
+          blobSnapshotLogged:
+            persistedPayload?.setsSnapshot?.filter((s) => s.set_logged).length ?? 0,
+          blobStage: persistedPayload?.workoutStage ?? null,
+        });
+        if (
+          persistedPayload?.workoutLogId === workout_log_id &&
+          persistedPayload.setsSnapshot &&
+          persistedPayload.setsSnapshot.length > 0
+        ) {
+          const merged = mergeExerciseSetsWithSnapshot(
+            setsData,
+            persistedPayload.setsSnapshot,
+          );
+          finalSets = orderMergedSetsLikeSnapshot(merged, persistedPayload.setsSnapshot);
+          logResume('load:fetchWorkoutDetails merged setsSnapshot into finalSets', {
+            mergedSets: finalSets.length,
+            mergedLogged: finalSets.filter((s) => s.set_logged).length,
+          });
+        } else {
+          logResume('load:fetchWorkoutDetails NO snapshot merge', {
+            blobMatchesWorkout:
+              persistedPayload?.workoutLogId === workout_log_id,
+            hasSnapshot: (persistedPayload?.setsSnapshot?.length ?? 0) > 0,
+          });
         }
 
         setExercises(orderLoggedExercisesLikeSets(finalSets, exercisesResult));
         setAllSets(finalSets);
         allSetsRef.current = finalSets;
+        logResume('load:fetchWorkoutDetails applied finalSets to state', {
+          finalSets: finalSets.length,
+          finalLogged: finalSets.filter((s) => s.set_logged).length,
+        });
 
         if (!isResume && finalSets.length === 0) {
           setIsCardioTimerPaused(false);
@@ -945,29 +1068,7 @@ export default function StartedWorkoutInterface() {
 
       setLoading(false);
 
-      if (isResume && workoutResult.length > 0) {
-        saveActiveWorkoutSession(workout_log_id).catch(() => {});
-        const prefs = await loadRestTimerPreferences();
-        const setRs = parseInt(prefs.restTimeBetweenSets, 10);
-        const exRs = parseInt(prefs.restTimeBetweenExercises, 10);
-        restSecondsForWorkoutRef.current = {
-          setRestSeconds: !Number.isNaN(setRs) && setRs >= 0 ? setRs : 60,
-          exerciseRestSeconds: !Number.isNaN(exRs) && exRs >= 0 ? exRs : 60,
-        };
-
-        const resumedFinalSets =
-          allSetsRef.current.length > 0 ? allSetsRef.current : [];
-
-        const clampResumeSetIndex = (sets: ExerciseSet[], persistedIndex: number): number => {
-          if (sets.length === 0) return 0;
-          let idx = Math.max(0, Math.min(persistedIndex, sets.length - 1));
-          if (sets[idx]?.set_logged) {
-            const next = sets.findIndex((s) => !s.set_logged);
-            idx = next >= 0 ? next : Math.max(0, sets.length - 1);
-          }
-          return idx;
-        };
-
+      if (workoutResult.length > 0) {
         let persisted = persistedPayload;
         if (!persisted) {
           persisted = await timerStateUtils.loadTimerState();
@@ -981,51 +1082,95 @@ export default function StartedWorkoutInterface() {
           persisted.workoutStage !== 'completed' &&
           persisted.workoutStage !== 'overview';
 
-        queueMicrotask(() => {
-          if (canRestoreTimer && persisted) {
-            const elapsed = timerStateUtils.calculateElapsedTime(persisted.timestamp);
-            const baseTimer = timerStateUtils.toTimerState(persisted);
-            const fixedIndex = clampResumeSetIndex(resumedFinalSets, baseTimer.currentSetIndex);
-            handleTimerRestore(
-              { ...baseTimer, currentSetIndex: fixedIndex },
-              elapsed,
-              persisted,
-            );
-          } else {
-            const firstUnlogged = resumedFinalSets.findIndex((s) => !s.set_logged);
-            const idx = firstUnlogged >= 0 ? firstUnlogged : 0;
-            setTimerState((prev) =>
-              updateTimerState(prev, {
-                workoutStarted: true,
-                workoutStage: 'exercise',
-                currentSetIndex: idx,
-                workoutStartTime: Date.now(),
-                workoutDuration: 0,
-                exerciseSegmentDuration: 0,
-                isResting: false,
-                restRemaining: null,
-                isExerciseRest: false,
-              }),
-            );
-            stopWorkoutTimer();
-            setIsCardioTimerPaused(false);
-            workoutTimerRef.current = setInterval(() => {
+        if (isResume) {
+          logResume('load:fetchWorkoutDetails resume branch (timer restore)', {
+            canRestoreTimer: !!canRestoreTimer,
+          });
+          saveActiveWorkoutSession(workout_log_id).catch(() => {});
+        } else if (canRestoreTimer) {
+          logResume('load:fetchWorkoutDetails restoring timer from blob (no route resume)', {
+            canRestoreTimer: true,
+          });
+        }
+
+        if (canRestoreTimer || isResume) {
+          const prefs = await loadRestTimerPreferences();
+          const setRs = parseInt(prefs.restTimeBetweenSets, 10);
+          const exRs = parseInt(prefs.restTimeBetweenExercises, 10);
+          restSecondsForWorkoutRef.current = {
+            setRestSeconds: !Number.isNaN(setRs) && setRs >= 0 ? setRs : 60,
+            exerciseRestSeconds: !Number.isNaN(exRs) && exRs >= 0 ? exRs : 60,
+          };
+
+          const resumedFinalSets =
+            allSetsRef.current.length > 0 ? allSetsRef.current : [];
+
+          const clampResumeSetIndex = (sets: ExerciseSet[], persistedIndex: number): number => {
+            if (sets.length === 0) return 0;
+            let idx = Math.max(0, Math.min(persistedIndex, sets.length - 1));
+            if (sets[idx]?.set_logged) {
+              const next = sets.findIndex((s) => !s.set_logged);
+              idx = next >= 0 ? next : Math.max(0, sets.length - 1);
+            }
+            return idx;
+          };
+
+          queueMicrotask(() => {
+            if (canRestoreTimer && persisted) {
+              logResume('load:resume branch restoring timer from blob', {
+                canRestoreTimer: true,
+                routeResume: isResume,
+              });
+              const elapsed = timerStateUtils.calculateElapsedTime(persisted.timestamp);
+              const baseTimer = timerStateUtils.toTimerState(persisted);
+              const fixedIndex = clampResumeSetIndex(resumedFinalSets, baseTimer.currentSetIndex);
+              handleTimerRestore(
+                { ...baseTimer, currentSetIndex: fixedIndex },
+                elapsed,
+                persisted,
+              );
+            } else if (isResume) {
+              logResume('load:resume branch NO timer restore (fallback fresh timer)', {
+                canRestoreTimer: false,
+                hasPersisted: !!persisted,
+              });
+              const firstUnlogged = resumedFinalSets.findIndex((s) => !s.set_logged);
+              const idx = firstUnlogged >= 0 ? firstUnlogged : 0;
               setTimerState((prev) =>
                 updateTimerState(prev, {
-                  workoutDuration: prev.workoutDuration + 1,
+                  workoutStarted: true,
+                  workoutStage: 'exercise',
+                  currentSetIndex: idx,
+                  workoutStartTime: Date.now(),
+                  workoutDuration: 0,
+                  exerciseSegmentDuration: 0,
+                  isResting: false,
+                  restRemaining: null,
+                  isExerciseRest: false,
                 }),
               );
-            }, 1000);
-          }
-        });
+              stopWorkoutTimer();
+              setIsCardioTimerPaused(false);
+              workoutTimerRef.current = setInterval(() => {
+                setTimerState((prev) =>
+                  updateTimerState(prev, {
+                    workoutDuration: prev.workoutDuration + 1,
+                  }),
+                );
+              }, 1000);
+            }
+          });
 
-        await timerStateUtils.clearTimerState();
-        return;
+          if (isResume) {
+            return;
+          }
+        }
       }
     } catch (error) {
-      console.error('Error fetching workout details:', error);
+      console.error('[RESUME] load:fetchWorkoutDetails error', error);
       setLoading(false);
     }
+    logResume('load:fetchWorkoutDetails end');
   };
   
   // Timer functions
@@ -1225,6 +1370,7 @@ export default function StartedWorkoutInterface() {
 
     restSecondsForWorkoutRef.current = { setRestSeconds, exerciseRestSeconds };
 
+    logResume('persist:startWorkout (active session only, sets still in memory)');
     saveActiveWorkoutSession(workout_log_id).catch(() => {});
 
     setIsCardioTimerPaused(false);
@@ -1340,6 +1486,111 @@ export default function StartedWorkoutInterface() {
         'Tap Log Set to save this interval.',
     );
   }, [enableVibration, t]);
+
+  const stopHoldTimer = useCallback(() => {
+    if (holdIntervalRef.current) {
+      clearInterval(holdIntervalRef.current);
+      holdIntervalRef.current = null;
+    }
+  }, []);
+
+  const triggerHoldTimerReachedZero = useCallback(() => {
+    if (enableVibration) {
+      Vibration.vibrate(500);
+    }
+    if (enableSetSwitchSound) {
+      void playSound();
+    }
+  }, [enableVibration, enableSetSwitchSound]);
+
+  const syncHoldTimerToCurrentSet = useCallback(() => {
+    stopHoldTimer();
+    const idx = timerStateRef.current.currentSetIndex;
+    const cs = allSetsRef.current[idx];
+    if (!cs) return;
+    const ex = exercisesRef.current.find((e) => e.logged_exercise_id === cs.exercise_id);
+    const target = Math.max(0, ex?.duration_seconds ?? cs.duration_goal_seconds ?? 0);
+    if (!ex || !isTimeBasedExercise(ex.reps, ex.duration_seconds) || target <= 0) {
+      holdTargetSecRef.current = 0;
+      setHoldRemainingSec(0);
+      setHoldPhase('idle');
+      holdEverStartedRef.current = false;
+      return;
+    }
+    holdTargetSecRef.current = target;
+    setHoldRemainingSec(target);
+    setHoldPhase('idle');
+    holdEverStartedRef.current = false;
+  }, [stopHoldTimer]);
+
+  const performHoldTimerReset = useCallback(() => {
+    stopHoldTimer();
+    setHoldRemainingSec(holdTargetSecRef.current);
+    setHoldPhase('idle');
+    holdEverStartedRef.current = false;
+  }, [stopHoldTimer]);
+
+  const startHoldTimerTicking = useCallback(() => {
+    stopHoldTimer();
+    holdEverStartedRef.current = true;
+    setHoldPhase('running');
+    holdIntervalRef.current = setInterval(() => {
+      setHoldRemainingSec((prev) => {
+        if (prev <= 1) {
+          stopHoldTimer();
+          setHoldPhase('done');
+          setTimeout(() => triggerHoldTimerReachedZero(), 0);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, [stopHoldTimer, triggerHoldTimerReachedZero]);
+
+  const pauseHoldTimer = useCallback(() => {
+    stopHoldTimer();
+    setHoldPhase('paused');
+  }, [stopHoldTimer]);
+
+  const requestHoldTimerReset = useCallback(() => {
+    const target = holdTargetSecRef.current;
+    const elapsed = Math.max(0, target - holdRemainingSecRef.current);
+    const needsConfirm =
+      holdEverStartedRef.current &&
+      (holdPhaseRef.current === 'running' || holdPhaseRef.current === 'paused') &&
+      elapsed > 5;
+    if (needsConfirm) {
+      Alert.alert(
+        'Reset timer',
+        `Reset timer to ${formatHoldCountdownDisplay(target)}?`,
+        [
+          { text: t('alertCancel') || 'Cancel', style: 'cancel' },
+          { text: 'Reset', onPress: performHoldTimerReset },
+        ],
+      );
+      return;
+    }
+    performHoldTimerReset();
+  }, [performHoldTimerReset, t]);
+
+  useEffect(() => {
+    return () => {
+      stopHoldTimer();
+    };
+  }, [stopHoldTimer]);
+
+  useEffect(() => {
+    if (timerState.workoutStage !== 'exercise') {
+      stopHoldTimer();
+      return;
+    }
+    syncHoldTimerToCurrentSet();
+  }, [
+    timerState.currentSetIndex,
+    timerState.workoutStage,
+    syncHoldTimerToCurrentSet,
+    stopHoldTimer,
+  ]);
 
   const proceedAfterSetLogged = useCallback(
     (updatedSets: ExerciseSet[], currentSetIndex: number) => {
@@ -1527,13 +1778,24 @@ export default function StartedWorkoutInterface() {
   const renderOverview = () => {
     return (
       <View style={styles.overviewContainer}>
-        <TouchableOpacity
-          style={[styles.startButton, styles.startButtonTop, { backgroundColor: theme.buttonBackground }]}
-          onPress={startWorkout}
-        >
-          <Ionicons name="stopwatch-outline" size={20} color={theme.buttonText} style={styles.buttonIcon} />
-          <Text style={[styles.buttonText, { color: theme.buttonText }]}>{t('startWorkout')}</Text>
-        </TouchableOpacity>
+        {!timerState.workoutStarted ? (
+          <TouchableOpacity
+            style={[styles.startButton, styles.startButtonTop, { backgroundColor: theme.buttonBackground }]}
+            onPress={startWorkout}
+          >
+            <Ionicons name="stopwatch-outline" size={20} color={theme.buttonText} style={styles.buttonIcon} />
+            <Text style={[styles.buttonText, { color: theme.buttonText }]}>{t('startWorkout')}</Text>
+          </TouchableOpacity>
+        ) : exercises.length === 0 ? (
+          <TouchableOpacity
+            style={[styles.startButton, styles.startButtonTop, { backgroundColor: theme.buttonBackground }]}
+            onPress={handleFinishWorkout}
+            activeOpacity={0.85}
+          >
+            <Ionicons name="checkmark-circle-outline" size={20} color={theme.buttonText} style={styles.buttonIcon} />
+            <Text style={[styles.buttonText, { color: theme.buttonText }]}>{t('finishWorkout')}</Text>
+          </TouchableOpacity>
+        ) : null}
         {workoutLogType === 'cardio' && (
           <TouchableOpacity
             style={[
@@ -1717,7 +1979,12 @@ export default function StartedWorkoutInterface() {
                           >
                             {isCardioSetUI(item.exercise_name, workoutLogType)
                               ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
-                              : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
+                              : formatExerciseSetsVolumeLine(
+                                  item.sets,
+                                  item.reps,
+                                  item.duration_seconds,
+                                  { sets: t('Sets'), reps: t('Reps') },
+                                )}
                           </Text>
                         </View>
                       </ScaleDecorator>
@@ -1831,7 +2098,12 @@ export default function StartedWorkoutInterface() {
                         >
                           {isCardioSetUI(item.exercise_name, workoutLogType)
                             ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
-                            : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
+                            : formatExerciseSetsVolumeLine(
+                                item.sets,
+                                item.reps,
+                                item.duration_seconds,
+                                { sets: t('Sets'), reps: t('Reps') },
+                              )}
                         </Text>
                       </View>
                     </Swipeable>
@@ -2049,6 +2321,18 @@ export default function StartedWorkoutInterface() {
     const isLastSetOfExercise = currentSet.set_number === currentSet.total_sets;
     const isLastStructuralSet = isLastExercise && isLastSetOfExercise;
     const isCardio = isCardioSetUI(currentSet.exercise_name, workoutLogType);
+    const currentExercise = exercises.find(
+      (ex) => ex.logged_exercise_id === currentSet.exercise_id,
+    );
+    const isTimeBased =
+      !!currentExercise &&
+      !isCardio &&
+      isTimeBasedExercise(currentExercise.reps, currentExercise.duration_seconds);
+    const holdTargetSec =
+      holdTargetSecRef.current ||
+      currentExercise?.duration_seconds ||
+      currentSet.duration_goal_seconds ||
+      0;
     const currentIdx = timerState.currentSetIndex;
     let prevSameExerciseSetIndex = -1;
     let nextSameExerciseSetIndex = -1;
@@ -2078,7 +2362,13 @@ export default function StartedWorkoutInterface() {
         allSets[timerState.currentSetIndex].reps_done,
         allSets[timerState.currentSetIndex].weight || '0',
       );
-    const canCompleteSet = isCardio ? canCompleteCardio : canCompleteStrength;
+    const canCompleteTimeBased =
+      isTimeBased && holdTargetSec > 0;
+    const canCompleteSet = isCardio
+      ? canCompleteCardio
+      : isTimeBased
+        ? canCompleteTimeBased
+        : canCompleteStrength;
     const showCardioWholeWorkoutControls =
       workoutLogType === 'cardio' && allSets.length > 0;
 
@@ -2197,12 +2487,82 @@ export default function StartedWorkoutInterface() {
                 {currentSet.set_number}/{currentSet.total_sets}
               </Text>
               <Text style={[styles.repInfo, { color: theme.text }]}>
-                {t('goal')}: {currentSet.reps_goal} {t('Reps')}
+                {t('goal')}:{' '}
+                {isTimeBased
+                  ? formatExerciseSetsVolumeLine(
+                      currentSet.total_sets,
+                      0,
+                      holdTargetSec,
+                      { sets: t('Sets'), reps: t('Reps'), sec: 'sec' },
+                    )
+                  : `${currentSet.reps_goal} ${t('Reps')}`}
               </Text>
             </>
           )}
           
-          {!isCardio ? (
+          {isTimeBased ? (
+            <View style={styles.holdTimerBlock}>
+              <Text style={[styles.holdCountdownText, { color: theme.text }]}>
+                {formatHoldCountdownDisplay(holdRemainingSec)}
+              </Text>
+              <View style={styles.holdTimerActionsRow}>
+                <TouchableOpacity
+                  style={[
+                    styles.holdTimerPrimaryBtn,
+                    {
+                      backgroundColor:
+                        holdPhase === 'running'
+                          ? theme.card
+                          : theme.buttonBackground,
+                      borderColor: theme.border,
+                      borderWidth: holdPhase === 'running' ? 1 : 0,
+                    },
+                  ]}
+                  onPress={() => {
+                    if (holdPhase === 'idle') {
+                      if (holdRemainingSec <= 0) {
+                        syncHoldTimerToCurrentSet();
+                      }
+                      startHoldTimerTicking();
+                    } else if (holdPhase === 'running') {
+                      pauseHoldTimer();
+                    } else if (holdPhase === 'paused') {
+                      startHoldTimerTicking();
+                    } else {
+                      requestHoldTimerReset();
+                    }
+                  }}
+                  activeOpacity={0.85}
+                >
+                  <Text
+                    style={[
+                      styles.holdTimerPrimaryBtnText,
+                      {
+                        color:
+                          holdPhase === 'running' ? theme.text : theme.buttonText,
+                      },
+                    ]}
+                  >
+                    {holdPhase === 'idle'
+                      ? 'Start'
+                      : holdPhase === 'running'
+                        ? 'Pause'
+                        : holdPhase === 'paused'
+                          ? 'Resume'
+                          : 'Reset'}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.holdTimerResetIconBtn, { borderColor: theme.border }]}
+                  onPress={requestHoldTimerReset}
+                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  accessibilityLabel="Reset timer"
+                >
+                  <Ionicons name="refresh-circle-outline" size={28} color={theme.textSecondary ?? theme.text} />
+                </TouchableOpacity>
+              </View>
+            </View>
+          ) : !isCardio ? (
           <View style={styles.inputContainer}>
             <View style={styles.inputGroup}>
               <Text style={[styles.inputLabel, { color: theme.text }]}>{t('repsDone')}</Text>
@@ -2334,15 +2694,27 @@ export default function StartedWorkoutInterface() {
                 const pressCurrentSet = allSets[timerState.currentSetIndex];
                 if (!pressCurrentSet) return;
                 const pressIsCardio = isCardioSetUI(pressCurrentSet.exercise_name, workoutLogType);
+                const pressExercise = exercises.find(
+                  (ex) => ex.logged_exercise_id === pressCurrentSet.exercise_id,
+                );
+                const pressIsTimeBased =
+                  !!pressExercise &&
+                  !pressIsCardio &&
+                  isTimeBasedExercise(
+                    pressExercise.reps,
+                    pressExercise.duration_seconds,
+                  );
                 const valid = pressIsCardio
                   ? isValidCardioSet(
                       pressCurrentSet.reps_done,
                       pressCurrentSet.weight || '0',
                     )
-                  : isValidRepsAndWeight(
-                      pressCurrentSet.reps_done,
-                      pressCurrentSet.weight,
-                    );
+                  : pressIsTimeBased
+                    ? (pressExercise?.duration_seconds ?? 0) > 0
+                    : isValidRepsAndWeight(
+                        pressCurrentSet.reps_done,
+                        pressCurrentSet.weight,
+                      );
                 if (!valid) {
                     Alert.alert(
                       t('missingInformation'),
@@ -2355,18 +2727,43 @@ export default function StartedWorkoutInterface() {
                 }
 
                 setIsCompletingSet(true);
+                if (pressIsTimeBased) {
+                  stopHoldTimer();
+                }
 
                 const currentSetIndex = timerState.currentSetIndex;
                 setAllSets((prev) => {
                   if (currentSetIndex < 0 || currentSetIndex >= prev.length) return prev;
                   const next = [...prev];
                   const base = next[currentSetIndex];
-                  const logged = {
+                  let logged: ExerciseSet = {
                     ...base,
                     set_logged: true,
                     ...(pressIsCardio ? { weight: base.weight?.trim() || '0' } : {}),
                   };
+                  if (pressIsTimeBased && pressExercise) {
+                    const target =
+                      pressExercise.duration_seconds ??
+                      base.duration_goal_seconds ??
+                      0;
+                    const elapsed = computeTimeBasedSetLoggedSeconds(
+                      target,
+                      holdRemainingSecRef.current,
+                      holdEverStartedRef.current,
+                    );
+                    logged = {
+                      ...logged,
+                      reps_done: String(elapsed),
+                      weight: '',
+                    };
+                  }
                   next[currentSetIndex] = logged;
+                  logResume('persist:completeSet (in-memory only, not Weight_Log)', {
+                    exerciseName: logged.exercise_name,
+                    setNumber: logged.set_number,
+                    repsDone: logged.reps_done,
+                    weight: logged.weight,
+                  });
                   queueMicrotask(() => {
                     updateExerciseLoggedStatus(logged.exercise_id, next);
                     proceedAfterSetLogged(next, currentSetIndex);
@@ -2571,6 +2968,9 @@ export default function StartedWorkoutInterface() {
     
     const saveWorkout = async () => {
       try {
+        logResume('persist:saveWorkout → Weight_Log + Workout_Log.completion_time', {
+          loggedSetsToDb: loggedSets.length,
+        });
         console.log('Starting workout save process...');
 
         const prevMaxRows = await db.getAllAsync<{ exercise_name: string; max_weight: number }>(
@@ -2594,6 +2994,68 @@ export default function StartedWorkoutInterface() {
         console.log('Saving completed sets:', loggedSets.length);
         for (let i = 0; i < loggedSets.length; i++) {
           const set = loggedSets[i];
+          const exRecord = exercises.find(
+            (ex) => ex.logged_exercise_id === set.exercise_id,
+          );
+          const timeBased = isTimeBasedExercise(
+            exRecord?.reps,
+            exRecord?.duration_seconds,
+          );
+
+          if (timeBased) {
+            const target = exRecord?.duration_seconds ?? set.duration_goal_seconds ?? 0;
+            const parsedDur = parseInt(set.reps_done.trim(), 10);
+            const durationLogged = Number.isFinite(parsedDur) && parsedDur > 0
+              ? parsedDur
+              : target;
+            try {
+              await db.runAsync(
+                `INSERT INTO Weight_Log (
+                  workout_log_id,
+                  logged_exercise_id,
+                  exercise_name,
+                  set_number,
+                  weight_logged,
+                  reps_logged,
+                  muscle_group,
+                  duration_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
+                [
+                  workout_log_id,
+                  set.exercise_id,
+                  set.exercise_name,
+                  set.set_number,
+                  null,
+                  0,
+                  set.muscle_group,
+                  durationLogged,
+                ],
+              );
+            } catch {
+              await db.runAsync(
+                `INSERT INTO Weight_Log (
+                  workout_log_id,
+                  logged_exercise_id,
+                  exercise_name,
+                  set_number,
+                  weight_logged,
+                  reps_logged,
+                  muscle_group
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);`,
+                [
+                  workout_log_id,
+                  set.exercise_id,
+                  set.exercise_name,
+                  set.set_number,
+                  0,
+                  durationLogged,
+                  set.muscle_group,
+                ],
+              );
+            }
+            continue;
+          }
+
           const wParsed = parseWeightForLog(set.weight);
           const w = wParsed ?? 0;
           const repsParsed = parseFloat(
@@ -2797,6 +3259,19 @@ export default function StartedWorkoutInterface() {
     }
   }, [applyExerciseOrder, exercises, persistLoggedExerciseSortOrder, t]);
 
+  const findFirstSetIndexForExercise = useCallback(
+    (sets: ExerciseSet[], exerciseId: number, preferUnlogged: boolean): number => {
+      if (preferUnlogged) {
+        const unlogged = sets.findIndex(
+          (s) => s.exercise_id === exerciseId && !s.set_logged,
+        );
+        if (unlogged >= 0) return unlogged;
+      }
+      return sets.findIndex((s) => s.exercise_id === exerciseId);
+    },
+    [],
+  );
+
   const removeLoggedExerciseFromSession = useCallback(
     async (loggedExerciseId: number) => {
       const ids = new Set(allSetsRef.current.map((s) => s.exercise_id));
@@ -2874,6 +3349,136 @@ export default function StartedWorkoutInterface() {
     [db, t, workout_log_id],
   );
 
+  const removeLoggedExerciseFromInWorkoutModal = useCallback(
+    async (loggedExerciseId: number) => {
+      try {
+        await db.runAsync(
+          'DELETE FROM Weight_Log WHERE workout_log_id = ? AND logged_exercise_id = ?;',
+          [workout_log_id, loggedExerciseId],
+        );
+        await db.runAsync(
+          'DELETE FROM Logged_Exercises WHERE logged_exercise_id = ? AND workout_log_id = ?;',
+          [loggedExerciseId, workout_log_id],
+        );
+
+        const prevSets = allSetsRef.current;
+        const prevTs = timerStateRef.current;
+        const prevExercises = exercises;
+        const deletedExIdx = prevExercises.findIndex(
+          (e) => e.logged_exercise_id === loggedExerciseId,
+        );
+        const cur = prevSets[prevTs.currentSetIndex];
+        const deletingCurrent = cur?.exercise_id === loggedExerciseId;
+
+        const rebuilt = prevSets.filter((s) => s.exercise_id !== loggedExerciseId);
+        const nextExercises = prevExercises.filter(
+          (e) => e.logged_exercise_id !== loggedExerciseId,
+        );
+
+        if (nextExercises.length === 0) {
+          allSetsRef.current = [];
+          setAllSets([]);
+          setExercises([]);
+          setIsExerciseListModalVisible(false);
+          stopRestTimer();
+          restTimerEndAtRef.current = null;
+          const nextTs = updateTimerState(prevTs, {
+            currentSetIndex: 0,
+            workoutStage: 'overview',
+            isResting: false,
+            restRemaining: null,
+            isExerciseRest: false,
+          });
+          timerStateRef.current = nextTs;
+          setTimerState(nextTs);
+          await persistWorkoutTimerBlob();
+          return;
+        }
+
+        let newIdx = 0;
+        if (deletingCurrent) {
+          const nextEx =
+            deletedExIdx >= 0 && deletedExIdx < nextExercises.length
+              ? nextExercises[deletedExIdx]
+              : nextExercises[Math.max(0, deletedExIdx - 1)];
+          newIdx = findFirstSetIndexForExercise(
+            rebuilt,
+            nextEx.logged_exercise_id,
+            true,
+          );
+          if (newIdx < 0) newIdx = 0;
+          stopRestTimer();
+          restTimerEndAtRef.current = null;
+        } else if (cur) {
+          const found = rebuilt.findIndex(
+            (s) =>
+              s.exercise_id === cur.exercise_id && s.set_number === cur.set_number,
+          );
+          if (found >= 0) newIdx = found;
+          else newIdx = Math.min(prevTs.currentSetIndex, Math.max(0, rebuilt.length - 1));
+        } else {
+          newIdx = Math.min(prevTs.currentSetIndex, Math.max(0, rebuilt.length - 1));
+        }
+
+        allSetsRef.current = rebuilt;
+        const nextTs = updateTimerState(prevTs, {
+          currentSetIndex: newIdx,
+          workoutStage: 'exercise',
+          isResting: false,
+          restRemaining: null,
+          isExerciseRest: false,
+        });
+        timerStateRef.current = nextTs;
+
+        setAllSets(rebuilt);
+        setExercises(orderLoggedExercisesLikeSets(rebuilt, nextExercises));
+        setTimerState(nextTs);
+        await persistWorkoutTimerBlob();
+      } catch (e) {
+        console.error('Failed to remove exercise from in-workout list:', e);
+        Alert.alert(
+          t('errorTitle'),
+          e instanceof Error ? e.message : 'Could not remove exercise.',
+        );
+      }
+    },
+    [db, exercises, findFirstSetIndexForExercise, persistWorkoutTimerBlob, t, workout_log_id],
+  );
+
+  const confirmRemoveExerciseFromInWorkoutModal = useCallback(
+    (exercise: Exercise) => {
+      const loggedCount = allSetsRef.current.filter(
+        (s) => s.exercise_id === exercise.logged_exercise_id && s.set_logged,
+      ).length;
+      const message =
+        loggedCount > 0
+          ? t('deleteExerciseWithLoggedSetsMessage', {
+              name: exercise.exercise_name,
+              count: loggedCount,
+              defaultValue: `Delete ${exercise.exercise_name} and its ${loggedCount} logged set${loggedCount === 1 ? '' : 's'}? This can't be undone.`,
+            })
+          : t('removeExerciseFromWorkoutMessage', {
+              name: exercise.exercise_name,
+              defaultValue: `Remove ${exercise.exercise_name} from this workout?`,
+            });
+      Alert.alert(
+        t('confirmRemoveExerciseTitle', { defaultValue: 'Remove exercise?' }),
+        message,
+        [
+          { text: t('Cancel'), style: 'cancel' },
+          {
+            text: t('Delete'),
+            style: 'destructive',
+            onPress: () => {
+              void removeLoggedExerciseFromInWorkoutModal(exercise.logged_exercise_id);
+            },
+          },
+        ],
+      );
+    },
+    [removeLoggedExerciseFromInWorkoutModal, t],
+  );
+
   const confirmRemoveExerciseFromOverview = useCallback(
     (exercise: Exercise) => {
       Alert.alert(
@@ -2898,9 +3503,6 @@ export default function StartedWorkoutInterface() {
   );
 
   const openAddExerciseModal = useCallback(() => {
-    setAddExerciseName('');
-    setAddExerciseSets('3');
-    setAddExerciseReps('10');
     setIsAddExerciseModalVisible(true);
   }, []);
 
@@ -2917,12 +3519,14 @@ export default function StartedWorkoutInterface() {
       shouldUseLogsForReps: boolean,
     ): ExerciseSet[] => {
       const chunk: ExerciseSet[] = [];
+      const timeBased = isTimeBasedExercise(exercise.reps, exercise.duration_seconds);
       for (let i = 1; i <= exercise.sets; i++) {
-        const weight = shouldAutoFill
-          ? weightMapRef.current.get(`${exercise.exercise_name}-${i}`) || ''
-          : '';
+        const weight =
+          timeBased || !shouldAutoFill
+            ? ''
+            : weightMapRef.current.get(`${exercise.exercise_name}-${i}`) || '';
         let reps_done = '';
-        if (shouldAutoFillReps) {
+        if (shouldAutoFillReps && !timeBased) {
           if (shouldUseLogsForReps) {
             reps_done =
               repsMapRef.current.get(`${exercise.exercise_name}-${i}`) || '';
@@ -2935,7 +3539,8 @@ export default function StartedWorkoutInterface() {
           exercise_id: exercise.logged_exercise_id,
           set_number: i,
           total_sets: exercise.sets,
-          reps_goal: exercise.reps ?? 0,
+          reps_goal: timeBased ? 0 : exercise.reps ?? 0,
+          duration_goal_seconds: timeBased ? exercise.duration_seconds ?? null : null,
           reps_done,
           weight,
           set_logged: false,
@@ -2949,97 +3554,112 @@ export default function StartedWorkoutInterface() {
     [],
   );
 
-  const saveManualExerciseToOverview = useCallback(async () => {
-    const trimmedName = addExerciseName.trim();
-    if (!trimmedName) {
-      Alert.alert(t('errorTitle'), t('exerciseNameRequired'));
-      return;
-    }
-    const setsNum = parseInt(addExerciseSets.trim(), 10);
-    if (Number.isNaN(setsNum) || setsNum < 1) {
-      Alert.alert(t('errorTitle'), t('invalidExerciseSets'));
-      return;
-    }
-    const isStrength = workoutLogTypeRef.current !== 'cardio';
-    let repsNum: number | null = null;
-    if (isStrength) {
-      const parsedReps = parseInt(addExerciseReps.trim(), 10);
-      if (Number.isNaN(parsedReps) || parsedReps < 1) {
-        Alert.alert(t('errorTitle'), t('invalidExerciseReps'));
+  const saveManualExerciseToSession = useCallback(
+    async (form: AddExerciseFormValues) => {
+      const trimmedName = form.name.trim();
+      if (!trimmedName) {
+        Alert.alert(t('errorTitle'), t('exerciseNameRequired'));
         return;
       }
-      repsNum = parsedReps;
-    }
-
-    setIsSavingAddExercise(true);
-    try {
-      const maxRows = await db.getAllAsync<{ max_sort: number | null }>(
-        'SELECT MAX(sort_order) AS max_sort FROM Logged_Exercises WHERE workout_log_id = ?;',
-        [workout_log_id],
-      );
-      const nextSort = (maxRows[0]?.max_sort ?? -1) + 1;
-
-      const insertResult = await db.runAsync(
-        `INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order)
-         VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?);`,
-        [workout_log_id, trimmedName, setsNum, repsNum, nextSort],
-      );
-      const loggedExerciseId = Number(insertResult.lastInsertRowId);
-      if (!Number.isFinite(loggedExerciseId) || loggedExerciseId <= 0) {
-        throw new Error('Invalid logged_exercise_id after insert');
+      const setsNum = parseInt(form.sets.trim(), 10);
+      if (Number.isNaN(setsNum) || setsNum < 1) {
+        Alert.alert(t('errorTitle'), t('invalidExerciseSets'));
+        return;
+      }
+      const isStrength = workoutLogTypeRef.current !== 'cardio';
+      let repsNum: number | null = null;
+      let durationSeconds: number | null = null;
+      if (isStrength) {
+        const tracking = validateRepsOrDurationInput(form.reps, form.durationSeconds);
+        if (!tracking.ok) {
+          Alert.alert(t('errorTitle'), tracking.message);
+          return;
+        }
+        repsNum = tracking.reps;
+        durationSeconds = tracking.duration_seconds;
       }
 
-      const newExercise: Exercise = {
-        exercise_name: trimmedName,
-        sets: setsNum,
-        reps: repsNum ?? 0,
-        logged_exercise_id: loggedExerciseId,
-        exercise_fully_logged: false,
-        web_link: null,
-        muscle_group: null,
-        exercise_notes: null,
-        rest_seconds: null,
-      };
+      const preservedSetIndex = timerStateRef.current.currentSetIndex;
 
-      const newSets = buildSetsForLoggedExercise(
-        newExercise,
-        autoFillWeight,
-        autoFillReps,
-        useLogsForRepInput,
-      );
+      setIsSavingAddExercise(true);
+      try {
+        const maxRows = await db.getAllAsync<{ max_sort: number | null }>(
+          'SELECT MAX(sort_order) AS max_sort FROM Logged_Exercises WHERE workout_log_id = ?;',
+          [workout_log_id],
+        );
+        const nextSort = (maxRows[0]?.max_sort ?? -1) + 1;
 
-      setExercises((prev) => [...prev, newExercise]);
-      setAllSets((prev) => {
-        const merged = [...prev, ...newSets];
-        allSetsRef.current = merged;
-        return merged;
-      });
+        const insertResult = await db.runAsync(
+          `INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, duration_seconds)
+           VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?);`,
+          [workout_log_id, trimmedName, setsNum, repsNum, nextSort, durationSeconds],
+        ).catch(() =>
+          db.runAsync(
+            `INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order)
+             VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?);`,
+            [workout_log_id, trimmedName, setsNum, repsNum, nextSort],
+          ),
+        );
+        const loggedExerciseId = Number(insertResult.lastInsertRowId);
+        if (!Number.isFinite(loggedExerciseId) || loggedExerciseId <= 0) {
+          throw new Error('Invalid logged_exercise_id after insert');
+        }
 
-      setIsAddExerciseModalVisible(false);
-      setAddExerciseName('');
-      setAddExerciseSets('3');
-      setAddExerciseReps('10');
-    } catch (e) {
-      console.error('Failed to add manual exercise to overview:', e);
-      Alert.alert(
-        t('errorTitle'),
-        e instanceof Error ? e.message : 'Could not add exercise.',
-      );
-    } finally {
-      setIsSavingAddExercise(false);
-    }
-  }, [
-    addExerciseName,
-    addExerciseReps,
-    addExerciseSets,
-    autoFillReps,
-    autoFillWeight,
-    buildSetsForLoggedExercise,
-    db,
-    t,
-    useLogsForRepInput,
-    workout_log_id,
-  ]);
+        const newExercise: Exercise = {
+          exercise_name: trimmedName,
+          sets: setsNum,
+          reps: repsNum ?? 0,
+          duration_seconds: durationSeconds,
+          logged_exercise_id: loggedExerciseId,
+          exercise_fully_logged: false,
+          web_link: null,
+          muscle_group: null,
+          exercise_notes: null,
+          rest_seconds: null,
+        };
+
+        const newSets = buildSetsForLoggedExercise(
+          newExercise,
+          autoFillWeight,
+          autoFillReps,
+          useLogsForRepInput,
+        );
+
+        setExercises((prev) => [...prev, newExercise]);
+        setAllSets((prev) => {
+          const merged = [...prev, ...newSets];
+          allSetsRef.current = merged;
+          return merged;
+        });
+
+        setIsAddExerciseModalVisible(false);
+        await persistWorkoutTimerBlob();
+      } catch (e) {
+        console.error('Failed to add manual exercise to session:', e);
+        Alert.alert(
+          t('errorTitle'),
+          e instanceof Error ? e.message : 'Could not add exercise.',
+        );
+        if (timerStateRef.current.currentSetIndex !== preservedSetIndex) {
+          setTimerState((prev) =>
+            updateTimerState(prev, { currentSetIndex: preservedSetIndex }),
+          );
+        }
+      } finally {
+        setIsSavingAddExercise(false);
+      }
+    },
+    [
+      autoFillReps,
+      autoFillWeight,
+      buildSetsForLoggedExercise,
+      db,
+      persistWorkoutTimerBlob,
+      t,
+      useLogsForRepInput,
+      workout_log_id,
+    ],
+  );
   
   const renderExerciseListModal = () => {
     const currentExerciseNameFromSet = allSets[timerState.currentSetIndex]?.exercise_name;
@@ -3109,6 +3729,28 @@ export default function StartedWorkoutInterface() {
               activationDistance={12}
               containerStyle={styles.modalDraggableListContainer}
               contentContainerStyle={styles.exerciseListModalListContent}
+              ListFooterComponent={
+                <TouchableOpacity
+                  style={[
+                    styles.overviewAddExerciseButton,
+                    { borderColor: theme.buttonBackground, marginTop: 8 },
+                  ]}
+                  onPress={openAddExerciseModal}
+                  activeOpacity={0.85}
+                  accessibilityRole="button"
+                  accessibilityLabel={t('addExerciseFromDetails')}
+                >
+                  <Ionicons
+                    name="add-circle-outline"
+                    size={20}
+                    color={theme.buttonBackground}
+                    style={styles.buttonIcon}
+                  />
+                  <Text style={[styles.overviewAddExerciseText, { color: theme.buttonBackground }]}>
+                    {t('addExercise')}
+                  </Text>
+                </TouchableOpacity>
+              }
               renderItem={({ item, drag, isActive }) => {
                 const isCurrent = item.exercise_name === currentExerciseNameFromSet;
                 const muscleGroupInfo = muscleGroupData.find(mg => mg.value === item.muscle_group);
@@ -3173,7 +3815,7 @@ export default function StartedWorkoutInterface() {
                             style={styles.swipeDeleteAction}
                             onPress={() => {
                               modalExerciseSwipeRef?.close();
-                              void removeLoggedExerciseFromSession(item.logged_exercise_id);
+                              confirmRemoveExerciseFromInWorkoutModal(item);
                             }}
                           >
                             <Ionicons name="trash-outline" size={20} color="#fff" />
@@ -3229,7 +3871,12 @@ export default function StartedWorkoutInterface() {
                           <Text style={[detailStyle, { marginTop: 2 }]}>
                             {isCardioSetUI(item.exercise_name, workoutLogType)
                               ? `${t('durationMinutes') || 'Duration (minutes)'}: ${item.reps}`
-                              : `${item.sets} ${t('Sets')} × ${item.reps} ${t('Reps')}`}
+                              : formatExerciseSetsVolumeLine(
+                                  item.sets,
+                                  item.reps,
+                                  item.duration_seconds,
+                                  { sets: t('Sets'), reps: t('Reps') },
+                                )}
                           </Text>
                         </View>
                       </TouchableOpacity>
@@ -3245,136 +3892,6 @@ export default function StartedWorkoutInterface() {
     );
   };
   
-  const renderAddExerciseModal = () => {
-    const isStrength = workoutLogType !== 'cardio';
-
-    return (
-      <Modal
-        visible={isAddExerciseModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={closeAddExerciseModal}
-      >
-        {isAddExerciseModalVisible ? (
-          <StatusBar
-            backgroundColor={theme.type === 'light' ? 'rgba(0, 0, 0, 0.5)' : 'black'}
-            barStyle="light-content"
-          />
-        ) : null}
-        <TouchableOpacity
-          style={styles.modalOverlay}
-          activeOpacity={1}
-          onPressOut={closeAddExerciseModal}
-        >
-          <View
-            style={[styles.modalContainer, { backgroundColor: theme.card, borderColor: theme.border }]}
-            onStartShouldSetResponder={() => true}
-          >
-            <View style={[styles.modalHeader, { borderBottomColor: theme.border }]}>
-              <Text style={[styles.modalTitle, { color: theme.text }]}>
-                {t('addExerciseFromDetails')}
-              </Text>
-              <TouchableOpacity
-                onPress={closeAddExerciseModal}
-                style={styles.modalCloseButton}
-                disabled={isSavingAddExercise}
-                accessibilityLabel="Close"
-              >
-                <Ionicons name="close-outline" size={28} color={theme.text} />
-              </TouchableOpacity>
-            </View>
-            <View style={{ paddingVertical: 8, paddingHorizontal: 4 }}>
-              <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 6 }]}>
-                {t('exerciseNameLabel')}
-              </Text>
-              <TextInput
-                style={[
-                  styles.input,
-                  {
-                    backgroundColor: theme.card,
-                    color: theme.text,
-                    borderColor: theme.border,
-                    marginBottom: 12,
-                  },
-                ]}
-                value={addExerciseName}
-                onChangeText={setAddExerciseName}
-                placeholder={t('exerciseNameLabel')}
-                placeholderTextColor={
-                  theme.type === 'dark' ? 'rgba(255,255,255,0.45)' : 'rgba(0,0,0,0.35)'
-                }
-                autoCapitalize="words"
-                editable={!isSavingAddExercise}
-              />
-              <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 6 }]}>
-                {t('setsLabel')}
-              </Text>
-              <TextInput
-                style={[
-                  styles.input,
-                  {
-                    backgroundColor: theme.card,
-                    color: theme.text,
-                    borderColor: theme.border,
-                    marginBottom: isStrength ? 12 : 16,
-                  },
-                ]}
-                value={addExerciseSets}
-                onChangeText={setAddExerciseSets}
-                keyboardType="number-pad"
-                inputMode="numeric"
-                maxLength={3}
-                editable={!isSavingAddExercise}
-              />
-              {isStrength && (
-                <>
-                  <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 6 }]}>
-                    {t('repsLabel')}
-                  </Text>
-                  <TextInput
-                    style={[
-                      styles.input,
-                      {
-                        backgroundColor: theme.card,
-                        color: theme.text,
-                        borderColor: theme.border,
-                        marginBottom: 16,
-                      },
-                    ]}
-                    value={addExerciseReps}
-                    onChangeText={setAddExerciseReps}
-                    keyboardType="number-pad"
-                    inputMode="numeric"
-                    maxLength={4}
-                    editable={!isSavingAddExercise}
-                  />
-                </>
-              )}
-              <TouchableOpacity
-                style={[
-                  styles.completeButton,
-                  {
-                    backgroundColor: theme.buttonBackground,
-                    opacity: isSavingAddExercise ? 0.6 : 1,
-                  },
-                ]}
-                onPress={() => void saveManualExerciseToOverview()}
-                disabled={isSavingAddExercise}
-                activeOpacity={0.85}
-              >
-                {isSavingAddExercise ? (
-                  <ActivityIndicator color={theme.buttonText} />
-                ) : (
-                  <Text style={[styles.buttonText, { color: theme.buttonText }]}>{t('Save')}</Text>
-                )}
-              </TouchableOpacity>
-            </View>
-          </View>
-        </TouchableOpacity>
-      </Modal>
-    );
-  };
-
   const renderNotesModal = () => {
     return (
       <Modal
@@ -3837,7 +4354,13 @@ export default function StartedWorkoutInterface() {
         {timerState.workoutStage === 'completed' && renderCompletedScreen()}
       </ScrollView>
       {renderExerciseListModal()}
-      {renderAddExerciseModal()}
+      <AddExerciseModal
+        visible={isAddExerciseModalVisible}
+        isStrength={workoutLogType !== 'cardio'}
+        isSaving={isSavingAddExercise}
+        onClose={closeAddExerciseModal}
+        onSave={saveManualExerciseToSession}
+      />
       {renderNotesModal()}
       {renderCardioModal()}
       {renderLogWorkoutModal()}
@@ -4167,6 +4690,43 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     paddingHorizontal: 12,
     fontSize: 16,
+  },
+  holdTimerBlock: {
+    marginTop: 12,
+    marginBottom: 4,
+    alignItems: 'center',
+  },
+  holdCountdownText: {
+    fontSize: 52,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+    marginBottom: 14,
+    letterSpacing: 1,
+  },
+  holdTimerActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    alignSelf: 'stretch',
+  },
+  holdTimerPrimaryBtn: {
+    flex: 1,
+    maxWidth: 220,
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  holdTimerPrimaryBtnText: {
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  holdTimerResetIconBtn: {
+    padding: 4,
+    borderRadius: 20,
+    borderWidth: 1,
   },
   controlsContainer: {
     marginTop: 4,

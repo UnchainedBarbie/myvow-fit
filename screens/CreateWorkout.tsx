@@ -24,6 +24,7 @@ import {
   ensureCardioExerciseName,
   formatCardioDistanceForDb,
 } from '../utils/cardioExerciseUtils';
+import { validateRepsOrDurationInput } from '../utils/exerciseTrackingUtils';
 
 type WorkoutListNavigationProp = StackNavigationProp<WorkoutStackParamList, 'WorkoutsList'>;
 
@@ -31,6 +32,7 @@ type DayExerciseForm = {
   exerciseName: string;
   sets: string;
   reps: string;
+  durationSeconds: string;
   muscle_groups: string[];
   restSeconds: string;
   durationMinutes: string;
@@ -46,13 +48,14 @@ async function insertStrengthExerciseRow(
     exerciseName: string;
     sets: number;
     reps: number;
+    duration_seconds: number | null;
     muscle_group: string | null;
     rest_seconds: number | null;
   },
 ) {
   try {
     await db.runAsync(
-      'INSERT INTO Exercises (day_id, exercise_name, sets, reps, muscle_group, rest_seconds, sort_order, exercise_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+      'INSERT INTO Exercises (day_id, exercise_name, sets, reps, muscle_group, rest_seconds, sort_order, exercise_type, duration_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);',
       [
         dayId,
         exercise.exerciseName,
@@ -62,20 +65,37 @@ async function insertStrengthExerciseRow(
         exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
         sortOrder,
         'strength',
+        exercise.duration_seconds,
       ],
     );
   } catch {
-    await db.runAsync(
-      'INSERT INTO Exercises (day_id, exercise_name, sets, reps, muscle_group, rest_seconds) VALUES (?, ?, ?, ?, ?, ?);',
-      [
-        dayId,
-        exercise.exerciseName,
-        exercise.sets,
-        exercise.reps,
-        exercise.muscle_group,
-        exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
-      ],
-    );
+    try {
+      await db.runAsync(
+        'INSERT INTO Exercises (day_id, exercise_name, sets, reps, muscle_group, rest_seconds, sort_order, exercise_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+        [
+          dayId,
+          exercise.exerciseName,
+          exercise.sets,
+          exercise.reps,
+          exercise.muscle_group,
+          exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
+          sortOrder,
+          'strength',
+        ],
+      );
+    } catch {
+      await db.runAsync(
+        'INSERT INTO Exercises (day_id, exercise_name, sets, reps, muscle_group, rest_seconds) VALUES (?, ?, ?, ?, ?, ?);',
+        [
+          dayId,
+          exercise.exerciseName,
+          exercise.sets,
+          exercise.reps,
+          exercise.muscle_group,
+          exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
+        ],
+      );
+    }
   }
 }
 
@@ -123,6 +143,7 @@ async function createWorkout(
       exerciseName: string;
       sets: number;
       reps: number;
+      duration_seconds?: number | null;
       muscle_group: string | null;
       rest_seconds: number | null;
       durationMinutes?: number;
@@ -184,7 +205,8 @@ function emptyExerciseForm(mode: 'strength' | 'cardio'): DayExerciseForm {
   return {
     exerciseName: '',
     sets: mode === 'strength' ? '' : '1',
-    reps: mode === 'strength' ? '' : '',
+    reps: mode === 'strength' ? '10' : '',
+    durationSeconds: '',
     muscle_groups: [],
     restSeconds: String(DEFAULT_REST_SECONDS_BETWEEN_SETS),
     durationMinutes: '',
@@ -313,19 +335,26 @@ export default function CreateWorkout() {
     }
 
     if (workoutType === 'strength') {
-      const strengthInvalid = days.some((day) =>
-        day.exercises.some(
-          (exercise) =>
-            !exercise.exerciseName.trim() ||
-            !exercise.sets ||
-            !exercise.reps ||
-            parseInt(exercise.sets, 10) === 0 ||
-            parseInt(exercise.reps, 10) === 0,
-        ),
-      );
-      if (strengthInvalid) {
-        Alert.alert(t('errorTitle'), t('fillExercisesErrorMessage'));
-        return;
+      for (const day of days) {
+        for (const exercise of day.exercises) {
+          if (!exercise.exerciseName.trim()) {
+            Alert.alert(t('errorTitle'), t('fillExercisesErrorMessage'));
+            return;
+          }
+          const setsN = parseInt(exercise.sets, 10);
+          if (!exercise.sets || !Number.isFinite(setsN) || setsN === 0) {
+            Alert.alert(t('errorTitle'), t('fillExercisesErrorMessage'));
+            return;
+          }
+          const tracking = validateRepsOrDurationInput(
+            exercise.reps,
+            exercise.durationSeconds,
+          );
+          if (!tracking.ok) {
+            Alert.alert(t('errorTitle'), tracking.message);
+            return;
+          }
+        }
       }
     }
 
@@ -374,12 +403,19 @@ export default function CreateWorkout() {
         }
         const restSec = exercise.restSeconds.trim();
         const setsN = parseInt(exercise.sets, 10);
-        const repsN = parseInt(exercise.reps, 10);
         const restParsed = restSec ? parseInt(restSec, 10) : NaN;
+        const tracking = validateRepsOrDurationInput(
+          exercise.reps,
+          exercise.durationSeconds,
+        );
+        const tracked = tracking.ok
+          ? tracking
+          : { ok: true as const, reps: 10, duration_seconds: null as number | null };
         return {
           exerciseName: exercise.exerciseName,
           sets: Number.isFinite(setsN) && setsN > 0 ? setsN : 1,
-          reps: Number.isFinite(repsN) && repsN > 0 ? repsN : 1,
+          reps: tracked.reps,
+          duration_seconds: tracked.duration_seconds,
           muscle_group: exercise.muscle_groups[0] ?? null,
           rest_seconds:
             Number.isFinite(restParsed) && restParsed > 0
@@ -672,7 +708,7 @@ export default function CreateWorkout() {
                           borderColor: theme.border,
                         },
                       ]}
-                      placeholder={t('repsPlaceholder') + " (> 0)"}
+                      placeholder={t('repsPlaceholder')}
                       placeholderTextColor={theme.text}
                       keyboardType="numeric"
                       value={exercise.reps}
@@ -680,6 +716,28 @@ export default function CreateWorkout() {
                         const sanitizedText = text.replace(/[^0-9]/g, '');
                         const updatedDays = [...days];
                         updatedDays[index].exercises[exerciseIndex].reps = sanitizedText;
+                        setDays(updatedDays);
+                      }}
+                    />
+                    <TextInput
+                      style={[
+                        styles.smallInput,
+                        {
+                          backgroundColor: theme.card,
+                          color: theme.text,
+                          borderWidth: 1,
+                          borderColor: theme.border,
+                        },
+                      ]}
+                      placeholder="Duration (sec)"
+                      placeholderTextColor={theme.text}
+                      keyboardType="numeric"
+                      value={exercise.durationSeconds}
+                      onChangeText={(text) => {
+                        const sanitizedText = text.replace(/[^0-9]/g, '');
+                        const updatedDays = [...days];
+                        updatedDays[index].exercises[exerciseIndex].durationSeconds =
+                          sanitizedText;
                         setDays(updatedDays);
                       }}
                     />

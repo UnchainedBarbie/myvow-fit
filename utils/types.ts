@@ -29,6 +29,8 @@ export interface Workout {
     exercise_name: string;
     sets: number;
     reps: number;
+    /** Hold duration per set (seconds) when time-based; NULL/0 with reps > 0 = rep-based. */
+    duration_seconds?: number | null;
     muscle_group: string | null;
     web_link: string | null;
     exercise_notes: string | null;
@@ -50,7 +52,9 @@ export interface LoggedExercise {
   workout_log_id: number; // Foreign Key to Workout_Log
   exercise_name: string; // Exercise name (copied at the time of logging)
   sets: number; // Sets count (copied at the time of logging)
-  reps: number; // Reps count (copied at the time of logging)
+  reps: number; // Reps count (copied at the time of logging); 0 when time-based
+  /** Hold duration per set (seconds), copied at log time; NULL/0 when rep-based. */
+  duration_seconds?: number | null;
   muscle_group: string | null; // Muscle group (copied at the time of logging)
   web_link: string | null; // Web link (copied at the time of logging)
   exercise_notes: string | null; // Exercise notes (copied at the time of logging)
@@ -67,6 +71,8 @@ export interface WeightLog {
   set_number: number; // Which set (e.g., 1st set, 2nd set, etc.)
   weight_logged: number; // Weight logged for that set
   reps_logged: number; // Reps performed for that set
+  /** Hold duration logged (seconds) for time-based sets; NULL when rep-based. */
+  duration_seconds?: number | null;
   muscle_group: string | null; // Muscle group (copied at the time of logging)
   web_link: string | null; // Web link (copied at the time of logging)
 }

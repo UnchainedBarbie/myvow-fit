@@ -19,6 +19,7 @@ import DraggableFlatList, { RenderItemParams } from 'react-native-draggable-flat
 import { RectButton, Swipeable } from 'react-native-gesture-handler';
 import { sortWorkoutPlanExercisesForDisplay } from '../utils/workoutDisplayUtils';
 import { initWorkoutDb } from '../utils/initWorkoutDb';
+import { validateRepsOrDurationInput } from '../utils/exerciseTrackingUtils';
 import {
   ensureCardioExerciseName,
   formatCardioDistanceForDb,
@@ -32,6 +33,7 @@ type Exercise = {
   exercise_name: string;
   sets: number;
   reps: number;
+  duration_seconds?: number | null;
   web_link: string | null;
   muscle_group: string | null;
   exercise_notes: string | null;
@@ -88,7 +90,7 @@ export default function EditWorkout() {
           const exercises = await db.getAllAsync<
             Exercise & { sort_order?: number | null }
           >(
-            'SELECT exercise_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, duration_minutes, cardio_distance, exercise_type FROM Exercises WHERE day_id = ? ORDER BY COALESCE(sort_order, 999999), exercise_id;',
+            'SELECT exercise_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, duration_minutes, cardio_distance, exercise_type, duration_seconds FROM Exercises WHERE day_id = ? ORDER BY COALESCE(sort_order, 999999), exercise_id;',
             [day.day_id]
           ).catch(async () =>
             db.getAllAsync<Exercise & { sort_order?: number | null }>(
@@ -211,17 +213,63 @@ export default function EditWorkout() {
         await db.runAsync('DELETE FROM Logged_Exercises WHERE workout_log_id = ?;', [log_id]);
   
         // 2. Fetch updated exercises for the day
-        const updatedExercises = await db.getAllAsync<{ exercise_name: string; sets: number; reps: number; web_link: string | null; muscle_group: string | null; exercise_notes: string | null; rest_seconds: number | null }>(
-          'SELECT exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds FROM Exercises WHERE day_id = ?;',
-          [day_id]
+        const updatedExercises = await db.getAllAsync<{
+          exercise_name: string;
+          sets: number;
+          reps: number;
+          duration_seconds?: number | null;
+          web_link: string | null;
+          muscle_group: string | null;
+          exercise_notes: string | null;
+          rest_seconds: number | null;
+        }>(
+          'SELECT exercise_name, sets, reps, duration_seconds, web_link, muscle_group, exercise_notes, rest_seconds FROM Exercises WHERE day_id = ?;',
+          [day_id],
+        ).catch(async () =>
+          db.getAllAsync<{
+            exercise_name: string;
+            sets: number;
+            reps: number;
+            web_link: string | null;
+            muscle_group: string | null;
+            exercise_notes: string | null;
+            rest_seconds: number | null;
+          }>(
+            'SELECT exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds FROM Exercises WHERE day_id = ?;',
+            [day_id],
+          ),
         );
   
         // 3. Insert updated exercises
         const insertExercisePromises = updatedExercises.map((exercise) =>
           db.runAsync(
-            'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
-            [log_id, exercise.exercise_name, exercise.sets, exercise.reps, exercise.web_link, exercise.muscle_group, exercise.exercise_notes, exercise.rest_seconds ?? null]
-          )
+            'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, duration_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);',
+            [
+              log_id,
+              exercise.exercise_name,
+              exercise.sets,
+              exercise.reps,
+              exercise.web_link,
+              exercise.muscle_group,
+              exercise.exercise_notes,
+              exercise.rest_seconds ?? null,
+              exercise.duration_seconds ?? null,
+            ],
+          ).catch(() =>
+            db.runAsync(
+              'INSERT INTO Logged_Exercises (workout_log_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+              [
+                log_id,
+                exercise.exercise_name,
+                exercise.sets,
+                exercise.reps,
+                exercise.web_link,
+                exercise.muscle_group,
+                exercise.exercise_notes,
+                exercise.rest_seconds ?? null,
+              ],
+            ),
+          ),
         );
   
         await Promise.all(insertExercisePromises);
@@ -273,13 +321,16 @@ export default function EditWorkout() {
               return;
             }
           } else {
-            if (
-              !exercise.sets ||
-              !exercise.reps ||
-              parseInt(exercise.sets.toString(), 10) === 0 ||
-              parseInt(exercise.reps.toString(), 10) === 0
-            ) {
+            if (!exercise.sets || parseInt(exercise.sets.toString(), 10) === 0) {
               setErrorMessage(t('fillExercisesErrorMessage'));
+              return;
+            }
+            const tracking = validateRepsOrDurationInput(
+              exercise.reps,
+              exercise.duration_seconds ?? 0,
+            );
+            if (!tracking.ok) {
+              setErrorMessage(tracking.message);
               return;
             }
           }
@@ -361,36 +412,61 @@ export default function EditWorkout() {
               );
             }
           } else {
+            const tracking = validateRepsOrDurationInput(
+              exercise.reps,
+              exercise.duration_seconds ?? 0,
+            );
+            const repsToSave = tracking.ok ? tracking.reps : exercise.reps;
+            const durationToSave = tracking.ok ? tracking.duration_seconds : null;
             try {
               await db.runAsync(
-                'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, exercise_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+                'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, exercise_type, duration_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
                 [
                   day.day_id,
                   nameTrim,
                   exercise.sets,
-                  exercise.reps,
+                  repsToSave,
                   exercise.web_link,
                   exercise.muscle_group,
                   exercise.exercise_notes,
                   exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
                   sortIdx,
                   'strength',
+                  durationToSave,
                 ],
               );
             } catch {
-              await db.runAsync(
-                'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
-                [
-                  day.day_id,
-                  nameTrim,
-                  exercise.sets,
-                  exercise.reps,
-                  exercise.web_link,
-                  exercise.muscle_group,
-                  exercise.exercise_notes,
-                  exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
-                ],
-              );
+              try {
+                await db.runAsync(
+                  'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds, sort_order, exercise_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+                  [
+                    day.day_id,
+                    nameTrim,
+                    exercise.sets,
+                    repsToSave,
+                    exercise.web_link,
+                    exercise.muscle_group,
+                    exercise.exercise_notes,
+                    exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
+                    sortIdx,
+                    'strength',
+                  ],
+                );
+              } catch {
+                await db.runAsync(
+                  'INSERT INTO Exercises (day_id, exercise_name, sets, reps, web_link, muscle_group, exercise_notes, rest_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?);',
+                  [
+                    day.day_id,
+                    nameTrim,
+                    exercise.sets,
+                    repsToSave,
+                    exercise.web_link,
+                    exercise.muscle_group,
+                    exercise.exercise_notes,
+                    exercise.rest_seconds ?? DEFAULT_REST_SECONDS_BETWEEN_SETS,
+                  ],
+                );
+              }
             }
           }
           sortIdx += 1;
@@ -425,6 +501,7 @@ export default function EditWorkout() {
       | 'exercise_name'
       | 'sets'
       | 'reps'
+      | 'duration_seconds'
       | 'rest_seconds'
       | '_cardioDistValue'
       | '_cardioDistUnit',
@@ -469,7 +546,7 @@ export default function EditWorkout() {
                 reps: Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0,
               };
             }
-            if (field === 'sets' || field === 'reps') {
+            if (field === 'sets' || field === 'reps' || field === 'duration_seconds') {
               const n = parseInt(String(value).replace(/\D/g, ''), 10);
               return {
                 ...exercise,
@@ -649,12 +726,26 @@ export default function EditWorkout() {
               />
               <TextInput
                 style={[styles.numberInput, { color: theme.text }]}
-                value={item.reps.toString()}
+                value={item.reps ? String(item.reps) : ''}
                 onChangeText={(text) =>
                   handleExerciseChange(day.day_id, index, 'reps', text)
                 }
                 keyboardType="numeric"
                 placeholder={t('repsPlaceholder')}
+                placeholderTextColor={theme.text}
+              />
+              <TextInput
+                style={[styles.numberInput, { color: theme.text }]}
+                value={
+                  item.duration_seconds != null && item.duration_seconds > 0
+                    ? String(item.duration_seconds)
+                    : ''
+                }
+                onChangeText={(text) =>
+                  handleExerciseChange(day.day_id, index, 'duration_seconds', text)
+                }
+                keyboardType="numeric"
+                placeholder="Duration (sec)"
                 placeholderTextColor={theme.text}
               />
               <TextInput
