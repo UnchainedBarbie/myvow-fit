@@ -43,6 +43,10 @@ import {
 import { runOnJS } from 'react-native-reanimated';
 import { formatWorkoutHeaderTitle } from '../utils/workoutDisplayUtils';
 import {
+  ChoiceListModal,
+  type ChoiceListOption,
+} from '../components/ChoiceListModal';
+import {
   CALENDAR_GRID_FIRST_WEEKDAY,
   daysToSubtractForMonthGrid,
   getWeekdayHeaderKeys,
@@ -149,6 +153,13 @@ export default function MyCalendar() {
   const [workoutToReschedule, setWorkoutToReschedule] = useState<WorkoutEntry | null>(null);
   const [rescheduleNewDate, setRescheduleNewDate] = useState<Date>(() => new Date());
   const [showRescheduleDatePicker, setShowRescheduleDatePicker] = useState(false);
+
+  const [calendarChoiceModal, setCalendarChoiceModal] = useState<{
+    title: string;
+    message?: string;
+    options: ChoiceListOption[];
+  } | null>(null);
+  const closeCalendarChoiceModal = () => setCalendarChoiceModal(null);
 
   const [scheduleWorkoutPickerVisible, setScheduleWorkoutPickerVisible] =
     useState(false);
@@ -829,14 +840,15 @@ export default function MyCalendar() {
     if (selectedDateWorkouts.length === 1) {
       confirmDeleteWorkout(selectedDateWorkouts[0]);
     } else {
-      Alert.alert(
-        t('deleteWorkoutPickTitle') || 'Which workout do you want to delete?',
-        '',
-        selectedDateWorkouts.map((entry) => ({
-          text: entry.workout.day_name.trim(),
+      setCalendarChoiceModal({
+        title:
+          t('deleteWorkoutPickTitle') || 'Which workout do you want to delete?',
+        options: selectedDateWorkouts.map((entry) => ({
+          key: String(entry.workout.workout_log_id),
+          label: entry.workout.day_name.trim(),
           onPress: () => confirmDeleteWorkout(entry),
-        })).concat([{ text: t('Cancel'), style: 'cancel' as const }]),
-      );
+        })),
+      });
     }
   };
 
@@ -1558,35 +1570,35 @@ export default function MyCalendar() {
                                 { borderBottomColor: theme.border },
                               ]}
                               onPress={() => {
-                                const startOne = (e: WorkoutEntry) => {
+                                const startOne = async (e: WorkoutEntry) => {
                                   setModalVisible(false);
+                                  const session = await getActiveWorkoutSession();
+                                  const resume =
+                                    session?.workoutLogId ===
+                                    e.workout.workout_log_id;
                                   navigation.navigate(
                                     'StartedWorkoutInterface',
                                     {
                                       workout_log_id:
                                         e.workout.workout_log_id,
+                                      resume,
                                     },
                                   );
                                 };
                                 if (selectedDateWorkouts.length === 1) {
                                   startOne(selectedDateWorkouts[0]);
                                 } else {
-                                  Alert.alert(
-                                    t('startWorkout') || 'Start Workout',
-                                    t('whichWorkoutToStart') ||
+                                  setCalendarChoiceModal({
+                                    title: t('startWorkout') || 'Start Workout',
+                                    message:
+                                      t('whichWorkoutToStart') ||
                                       'Which workout do you want to start?',
-                                    selectedDateWorkouts
-                                      .map((e) => ({
-                                        text: e.workout.day_name.trim(),
-                                        onPress: () => startOne(e),
-                                      }))
-                                      .concat([
-                                        {
-                                          text: t('Cancel'),
-                                          style: 'cancel' as const,
-                                        },
-                                      ]),
-                                  );
+                                    options: selectedDateWorkouts.map((e) => ({
+                                      key: String(e.workout.workout_log_id),
+                                      label: e.workout.day_name.trim(),
+                                      onPress: () => void startOne(e),
+                                    })),
+                                  });
                                 }
                               }}
                             >
@@ -1634,22 +1646,18 @@ export default function MyCalendar() {
                                 if (selectedDateWorkouts.length === 1) {
                                   openRescheduleFlow(selectedDateWorkouts[0]);
                                 } else {
-                                  Alert.alert(
-                                    t('rescheduleWorkout') || 'Reschedule',
-                                    t('reschedulePickWorkout') ||
+                                  setCalendarChoiceModal({
+                                    title:
+                                      t('rescheduleWorkout') || 'Reschedule',
+                                    message:
+                                      t('reschedulePickWorkout') ||
                                       'Which workout do you want to reschedule?',
-                                    selectedDateWorkouts
-                                      .map((e) => ({
-                                        text: e.workout.day_name.trim(),
-                                        onPress: () => openRescheduleFlow(e),
-                                      }))
-                                      .concat([
-                                        {
-                                          text: t('Cancel'),
-                                          style: 'cancel' as const,
-                                        },
-                                      ]),
-                                  );
+                                    options: selectedDateWorkouts.map((e) => ({
+                                      key: String(e.workout.workout_log_id),
+                                      label: e.workout.day_name.trim(),
+                                      onPress: () => openRescheduleFlow(e),
+                                    })),
+                                  });
                                 }
                               }}
                             >
@@ -2120,11 +2128,16 @@ export default function MyCalendar() {
                 styles.choiceButton,
                 { backgroundColor: theme.buttonBackground },
               ]}
-              onPress={() => {
+              onPress={async () => {
                 if (!selectedUntrackedWorkout) return;
+                const session = await getActiveWorkoutSession();
+                const resume =
+                  session?.workoutLogId ===
+                  selectedUntrackedWorkout.workout.workout_log_id;
                 navigation.navigate('StartedWorkoutInterface', {
                   workout_log_id:
                     selectedUntrackedWorkout.workout.workout_log_id,
+                  resume,
                 });
                 closeUntrackedModal();
               }}
@@ -2144,6 +2157,15 @@ export default function MyCalendar() {
           </View>
         </View>
       </Modal>
+
+      <ChoiceListModal
+        visible={calendarChoiceModal != null}
+        title={calendarChoiceModal?.title ?? ''}
+        message={calendarChoiceModal?.message}
+        options={calendarChoiceModal?.options ?? []}
+        cancelLabel={t('Cancel')}
+        onCancel={closeCalendarChoiceModal}
+      />
     </ScrollView>
   );
 }

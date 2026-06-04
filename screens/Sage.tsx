@@ -30,6 +30,7 @@ import { initMealPlansDb } from '../utils/initMealPlansDb';
 import { initNutritionDb } from '../utils/nutritionDb';
 import { initVowsDb } from '../utils/initVowsDb';
 import { CreateOwnVowModal, type CreateOwnVowSubmitPayload, CATEGORY_DISPLAY_LABELS } from '../components/CreateOwnVowModal';
+import { ChoiceListModal, type ChoiceListOption } from '../components/ChoiceListModal';
 import {
   SageMessage,
   saveConversation,
@@ -242,6 +243,50 @@ When generating a workout plan, all warmup exercises MUST have names that start 
 All cardio exercises within a workout MUST have names that start exactly with 'Cardio:' (e.g. 'Cardio: Treadmill Walk', 'Cardio: Jump Rope'). Never name a cardio exercise without this prefix. This is required for correct display in the app — cardio exercises show duration and distance instead of sets and reps.
 
 Each day_name must be unique within the workout. If multiple days train the same muscle group, differentiate them (e.g. 'Lower Body A' and 'Lower Body B', or 'Upper Push' and 'Upper Pull').
+
+WORKOUT PROGRAMMING:
+
+When the user asks for a workout, or you proactively suggest one, follow these rules:
+
+1. SEPARATE DISTINCT MODALITIES INTO SEPARATE WORKOUTS
+
+Different training modalities should be separate workouts, not combined into one session. The modalities are:
+- Strength (lifts, abs, bodybuilding work, calisthenics)
+- Cardio (running, cycling, HIIT, intervals)
+- Mobility / stretching / yoga / recovery flows
+
+If the user asks for multiple modalities on the same day (e.g., "abs and mobility", "strength and cardio", "lift and yoga"), create them as SEPARATE workouts that the user will save individually. Both can be scheduled on the same day.
+
+Brief example of explanation to give the user:
+"I'm creating two workouts for Friday: Abs (main work) and Mobility (separate flow). Save each one to add them to your calendar."
+
+Keep this explanation BRIEF — one or two sentences. Do not lecture about why separation is better.
+
+2. WARM-UPS AND COOL-DOWNS BELONG WITH THEIR WORKOUT
+
+The exception to rule 1: warm-up movements and short cool-down stretches belong WITHIN the workout they prep or finish, not as separate sessions. Specifically:
+- Warm-up exercises (mobility drills, light movement, activation work) at the start of a strength or cardio workout: keep them in the same workout.
+- Short cool-down stretches at the end of a strength or cardio workout (under ~10 minutes of cool-down content): keep them in the same workout.
+- A standalone mobility flow of 10+ minutes: separate workout.
+
+Rule of thumb: if the cool-down or warm-up is under 10 minutes, include it in the main workout. If it's longer or distinct enough to be its own session, separate it.
+
+3. STRUCTURE WITHIN A SINGLE WORKOUT
+
+When generating a single workout, structure exercises in a clear order:
+- Warm-up exercises FIRST (clearly named or noted as warm-up)
+- Main work in the middle, grouped by intent (all abs together, all push together, etc.)
+- Cool-down stretches LAST (clearly named or noted as cool-down)
+
+Do NOT intermingle mobility/recovery exercises into the middle of main work blocks UNLESS you are intentionally programming active recovery between sets — in which case, explicitly say so in the exercise notes (e.g., "Hip Openers — active recovery between ab sets").
+
+4. EXPLICIT OVERRIDES
+
+If the user explicitly asks for a combined workout (e.g., "just give me one workout combining abs and mobility", "I want it all in one session"), comply silently. Do not push back, do not explain the tradeoff, do not suggest separating. Just produce the combined workout per their request.
+
+5. WORKOUT TYPE FLAGS
+
+When you propose a workout, each one is one of: strength, cardio, or mobility/stretching. State the workout type clearly in your output so the user can save it with the correct type in their app.
 
 When the user is happy with a meal plan, output it wrapped in <mealplan> tags with this exact structure:
 <mealplan>
@@ -1080,6 +1125,12 @@ export default function Sage() {
     null,
   );
   const [menuVisible, setMenuVisible] = useState(false);
+  const [receiptSourcePickerVisible, setReceiptSourcePickerVisible] = useState(false);
+  const [prepPlanChoiceModal, setPrepPlanChoiceModal] = useState<{
+    title: string;
+    message?: string;
+    options: ChoiceListOption[];
+  } | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const speechTranscriptRef = useRef('');
@@ -2006,19 +2057,16 @@ export default function Sage() {
         );
         return;
       }
-      const buttons = [
-        ...plans.map((p) => ({
-          text: p.plan_name,
-          onPress: () => savePrepToPlan(p.meal_plan_id, prepGuideText, p.plan_name),
+      setPrepPlanChoiceModal({
+        title: 'Save prep guide to',
+        message: 'Choose a meal plan to attach this prep guide to:',
+        options: plans.map((p) => ({
+          key: String(p.meal_plan_id),
+          label: p.plan_name,
+          onPress: () =>
+            void savePrepToPlan(p.meal_plan_id, prepGuideText, p.plan_name),
         })),
-        { text: 'Cancel', style: 'cancel' as const },
-      ];
-      Alert.alert(
-        'Save prep guide to',
-        'Choose a meal plan to attach this prep guide to:',
-        buttons,
-        { cancelable: true },
-      );
+      });
     } catch (e) {
       console.error('Error loading meal plans for prep save:', e);
       Alert.alert('Error', 'Could not load meal plans.');
@@ -2295,15 +2343,7 @@ export default function Sage() {
         }
       );
     } else {
-      Alert.alert(
-        'Add receipt',
-        'Take a photo or choose from your library.',
-        [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'Take Photo', onPress: handleTakePhoto },
-          { text: 'Choose from Library', onPress: handleChooseFromLibrary },
-        ]
-      );
+      setReceiptSourcePickerVisible(true);
     }
   };
 
@@ -2878,6 +2918,31 @@ export default function Sage() {
           </TouchableOpacity>
         </View>
       )}
+      <ChoiceListModal
+        visible={receiptSourcePickerVisible}
+        title="Add receipt"
+        message="Take a photo or choose from your library."
+        options={[
+          {
+            key: 'camera',
+            label: 'Take Photo',
+            onPress: () => void handleTakePhoto(),
+          },
+          {
+            key: 'library',
+            label: 'Choose from Library',
+            onPress: () => void handleChooseFromLibrary(),
+          },
+        ]}
+        onCancel={() => setReceiptSourcePickerVisible(false)}
+      />
+      <ChoiceListModal
+        visible={prepPlanChoiceModal != null}
+        title={prepPlanChoiceModal?.title ?? ''}
+        message={prepPlanChoiceModal?.message}
+        options={prepPlanChoiceModal?.options ?? []}
+        onCancel={() => setPrepPlanChoiceModal(null)}
+      />
       <CreateOwnVowModal
         visible={sageCreateOwnModalVisible}
         initialVowText={sageCreateOwnPrefill}

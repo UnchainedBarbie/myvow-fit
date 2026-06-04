@@ -1384,7 +1384,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   copyScheduleCancelBtn: {
-    marginTop: 4,
+    marginTop: 14,
     paddingVertical: 14,
     borderRadius: 12,
     borderWidth: 1,

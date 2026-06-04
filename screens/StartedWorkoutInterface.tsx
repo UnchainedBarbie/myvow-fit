@@ -115,6 +115,50 @@ interface ExerciseSet {
   exercise_notes: string | null;
 }
 
+type PriorSetLog = {
+  reps_logged: number | null;
+  weight_logged: number | null;
+  duration_seconds: number | null;
+};
+
+function normalizeExerciseNameKey(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function lastTimeCacheKey(exerciseName: string, setNumber: number): string {
+  return `${normalizeExerciseNameKey(exerciseName)}-${setNumber}`;
+}
+
+function formatLastTimeDisplayLine(
+  row: PriorSetLog | undefined,
+  isTimeBased: boolean,
+  weightFormat: string,
+): string | null {
+  if (!row) return null;
+  const reps = row.reps_logged;
+  const weight = row.weight_logged;
+  const duration = row.duration_seconds;
+
+  if (isTimeBased) {
+    if (duration != null && duration > 0) {
+      return `Last: ${duration} sec`;
+    }
+    if (reps != null && reps > 0) {
+      if (weight != null && weight > 0) {
+        return `Last: ${reps} reps @ ${weight} ${weightFormat}`;
+      }
+      return `Last: ${reps} reps`;
+    }
+    return null;
+  }
+
+  if (reps == null || reps <= 0) return null;
+  if (weight != null && weight > 0) {
+    return `Last: ${reps} reps @ ${weight} ${weightFormat}`;
+  }
+  return `Last: ${reps} reps`;
+}
+
 function sortLoggedExercisesForWorkout<
   T extends { exercise_name: string; muscle_group: string | null }
 >(list: T[]): T[] {
@@ -321,6 +365,10 @@ export default function StartedWorkoutInterface() {
   // Sets data for tracking workout
   const [allSets, setAllSets] = useState<ExerciseSet[]>([]);
   const allSetsRef = useRef<ExerciseSet[]>([]);
+  /** Prior Weight_Log per normalized exercise + set_number (excludes current workout). */
+  const [lastTimeCache, setLastTimeCache] = useState<Map<string, PriorSetLog>>(
+    () => new Map(),
+  );
   useEffect(() => {
     allSetsRef.current = allSets;
   }, [allSets]);
@@ -785,6 +833,62 @@ export default function StartedWorkoutInterface() {
       Alert.alert(t('errorOpeningURL'));
     }
   };
+
+  const mergeLastTimeCache = useCallback(
+    async (exerciseNames: string[]) => {
+      const normalized = [
+        ...new Set(
+          exerciseNames.map((n) => normalizeExerciseNameKey(n)).filter(Boolean),
+        ),
+      ];
+      if (normalized.length === 0) return;
+      const placeholders = normalized.map(() => '?').join(',');
+      try {
+        const rows = await db.getAllAsync<{
+          exercise_name: string;
+          set_number: number;
+          weight_logged: number | null;
+          reps_logged: number | null;
+          duration_seconds: number | null;
+        }>(
+          `WITH ranked AS (
+             SELECT
+               wl.exercise_name,
+               wl.set_number,
+               wl.weight_logged,
+               wl.reps_logged,
+               wl.duration_seconds,
+               ROW_NUMBER() OVER (
+                 PARTITION BY LOWER(TRIM(wl.exercise_name)), wl.set_number
+                 ORDER BY wlog.workout_date DESC, wl.workout_log_id DESC
+               ) AS rn
+             FROM Weight_Log wl
+             INNER JOIN Workout_Log wlog ON wl.workout_log_id = wlog.workout_log_id
+             WHERE wl.workout_log_id != ?
+               AND LOWER(TRIM(wl.exercise_name)) IN (${placeholders})
+           )
+           SELECT exercise_name, set_number, weight_logged, reps_logged, duration_seconds
+           FROM ranked
+           WHERE rn = 1;`,
+          [workout_log_id, ...normalized],
+        );
+        setLastTimeCache((prev) => {
+          const merged = new Map(prev);
+          for (const row of rows) {
+            merged.set(lastTimeCacheKey(row.exercise_name, row.set_number), {
+              reps_logged: row.reps_logged,
+              weight_logged: row.weight_logged,
+              duration_seconds: row.duration_seconds,
+            });
+          }
+          return merged;
+        });
+      } catch (e) {
+        console.error('Error loading last-time set history:', e);
+      }
+    },
+    [db, workout_log_id],
+  );
   
   /**
    * Workout_Log rows are created when scheduling/logging (not in this screen):
@@ -963,6 +1067,8 @@ export default function StartedWorkoutInterface() {
                 weightMapRef.current.set(`${row.exercise_name}-${row.set_number}`, row.weight_logged.toString());
                 repsMapRef.current.set(`${row.exercise_name}-${row.set_number}`, row.reps_logged.toString());
               });
+
+            void mergeLastTimeCache(exerciseNames);
         }
         
         // Prepare all sets data structure
@@ -2369,6 +2475,15 @@ export default function StartedWorkoutInterface() {
       : isTimeBased
         ? canCompleteTimeBased
         : canCompleteStrength;
+    const lastTimeLine = !isCardio
+      ? formatLastTimeDisplayLine(
+          lastTimeCache.get(
+            lastTimeCacheKey(currentSet.exercise_name, currentSet.set_number),
+          ),
+          isTimeBased,
+          weightFormat,
+        )
+      : null;
     const showCardioWholeWorkoutControls =
       workoutLogType === 'cardio' && allSets.length > 0;
 
@@ -2611,6 +2726,17 @@ export default function StartedWorkoutInterface() {
               />
             </View>
           </View>
+          ) : null}
+
+          {lastTimeLine ? (
+            <Text
+              style={[
+                styles.lastTimeHint,
+                { color: theme.textSecondary },
+              ]}
+            >
+              {lastTimeLine}
+            </Text>
           ) : null}
 
           {currentSet.total_sets > 1 ? (
@@ -3631,6 +3757,7 @@ export default function StartedWorkoutInterface() {
           allSetsRef.current = merged;
           return merged;
         });
+        void mergeLastTimeCache([trimmedName]);
 
         setIsAddExerciseModalVisible(false);
         await persistWorkoutTimerBlob();
@@ -3654,6 +3781,7 @@ export default function StartedWorkoutInterface() {
       autoFillWeight,
       buildSetsForLoggedExercise,
       db,
+      mergeLastTimeCache,
       persistWorkoutTimerBlob,
       t,
       useLogsForRepInput,
@@ -4671,6 +4799,11 @@ const styles = StyleSheet.create({
     fontSize: 13,
     textAlign: 'center',
     marginBottom: 6,
+  },
+  lastTimeHint: {
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 6,
   },
   inputContainer: {
     flexDirection: 'row',
